@@ -1,0 +1,1 @@
+{"main-window":{"identifier":"main-window","description":"Minimum permissions for the ProjectOS main window bootstrap.","local":true,"windows":["main"],"permissions":["core:default"]}}

@@ -1,0 +1,6 @@
+# Pinned toolchain (m0-s01): every §18 number and every CI run uses exactly this.
+# MSRV = 1.95 (workspace.package.rust-version). Bumping is a deliberate PR that
+# updates both places and re-runs the gate campaign.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

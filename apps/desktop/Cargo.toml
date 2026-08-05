@@ -1,0 +1,21 @@
+[package]
+name = "pos-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+default-run = "pos-desktop"
+
+[lib]
+name = "pos_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+pos-api = { path = "../../crates/pos-api" }
+tauri.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true

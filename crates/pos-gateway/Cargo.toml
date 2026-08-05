@@ -1,0 +1,12 @@
+[package]
+name = "pos-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pos-foundation = { path = "../pos-foundation" }

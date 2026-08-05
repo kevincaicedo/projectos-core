@@ -1,0 +1,68 @@
+# cargo-deny (m0-s01): licenses, advisories, duplicates, sources.
+# Run: `just deny` / CI `rust` job. Policy changes are reviewed like code.
+
+[licenses]
+# Apache-2.0-compatible permissive set only. Unused allowances fail so the
+# policy is the dependency graph we actually ship, not speculative headroom.
+unused-allowed-license = "deny"
+unused-license-exception = "deny"
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+]
+# Tauri 2.11.5 transitively consumes these exact crates. MPL-2.0's file-level
+# terms and LLVM's Apache exception are accepted only for this reviewed set;
+# a crate/version change fails and requires a fresh review.
+exceptions = [
+    { crate = "cssparser@0.36.0", allow = ["MPL-2.0"] },
+    { crate = "cssparser-macros@0.6.1", allow = ["MPL-2.0"] },
+    { crate = "dtoa-short@0.3.5", allow = ["MPL-2.0"] },
+    { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
+    { crate = "selectors@0.36.1", allow = ["MPL-2.0"] },
+    { crate = "target-lexicon@0.12.16", allow = ["Apache-2.0 WITH LLVM-exception"] },
+]
+
+[bans]
+# Duplicate versions are compile-time weight and supply-chain surface. New
+# ProjectOS dependencies must stay singular. Tauri is a version-pinned upstream
+# graph we cannot unify locally; a Tauri version change makes this skip stale
+# and reopens the review instead of silently admitting new duplicates.
+multiple-versions = "deny"
+skip-tree = [
+    { crate = "tauri@2.11.5", reason = "reviewed Tauri platform graph" },
+    { crate = "tauri-build@2.6.3", reason = "reviewed Tauri build graph" },
+]
+
+[advisories]
+yanked = "deny"
+# These are unmaintained notices, not vulnerability or unsoundness findings.
+# Tauri 2.11.5's supported Linux WebKitGTK path currently owns each transitive
+# dependency; there is no safe in-graph upgrade. Any ignored ID disappearing
+# fails CI so the exception is removed on the next viable Tauri upgrade.
+unused-ignored-advisory = "deny"
+ignore = [
+    { id = "RUSTSEC-2024-0411", reason = "Tauri Linux GTK3 transitive; no maintained drop-in in Tauri 2.11.5" },
+    { id = "RUSTSEC-2024-0412", reason = "Tauri Linux GTK3 transitive; no maintained drop-in in Tauri 2.11.5" },
+    { id = "RUSTSEC-2024-0413", reason = "Tauri Linux GTK3 transitive; no maintained drop-in in Tauri 2.11.5" },
+    { id = "RUSTSEC-2024-0414", reason = "Tauri Linux GTK3 transitive; no maintained drop-in in Tauri 2.11.5" },
+    { id = "RUSTSEC-2024-0415", reason = "Tauri Linux GTK3 transitive; no maintained drop-in in Tauri 2.11.5" },
+    { id = "RUSTSEC-2024-0416", reason = "Tauri Linux GTK3 transitive; no maintained drop-in in Tauri 2.11.5" },
+    { id = "RUSTSEC-2024-0417", reason = "Tauri Linux GTK3 transitive; no maintained drop-in in Tauri 2.11.5" },
+    { id = "RUSTSEC-2024-0418", reason = "Tauri Linux GTK3 transitive; no maintained drop-in in Tauri 2.11.5" },
+    { id = "RUSTSEC-2024-0419", reason = "Tauri Linux GTK3 transitive; no maintained drop-in in Tauri 2.11.5" },
+    { id = "RUSTSEC-2024-0420", reason = "Tauri Linux GTK3 transitive; no maintained drop-in in Tauri 2.11.5" },
+    { id = "RUSTSEC-2024-0370", reason = "Tauri GTK macro transitive; no safe upgrade in Tauri 2.11.5" },
+    { id = "RUSTSEC-2025-0075", reason = "Tauri URL-pattern transitive; no safe upgrade in Tauri 2.11.5" },
+    { id = "RUSTSEC-2025-0080", reason = "Tauri URL-pattern transitive; no safe upgrade in Tauri 2.11.5" },
+    { id = "RUSTSEC-2025-0081", reason = "Tauri URL-pattern transitive; no safe upgrade in Tauri 2.11.5" },
+    { id = "RUSTSEC-2025-0098", reason = "Tauri URL-pattern transitive; no safe upgrade in Tauri 2.11.5" },
+    { id = "RUSTSEC-2025-0100", reason = "Tauri URL-pattern transitive; no safe upgrade in Tauri 2.11.5" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

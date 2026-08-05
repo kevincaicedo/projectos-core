@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Minimum permissions for the ProjectOS main window bootstrap.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

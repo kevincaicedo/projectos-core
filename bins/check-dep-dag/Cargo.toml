@@ -1,0 +1,15 @@
+[package]
+name = "check-dep-dag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+default-run = "check-dep-dag"
+
+[lints]
+workspace = true
+
+[dependencies]
+proc-macro2.workspace = true
+serde_json.workspace = true
+syn.workspace = true

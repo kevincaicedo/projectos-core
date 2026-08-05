@@ -1,0 +1,66 @@
+# ProjectOS core workspace — master plan §19 layout.
+# This directory is structured exactly as the future public `projectos-core`
+# repository; m0-s17 extracts it into its own repo + submodule.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/pos-foundation",
+    "crates/pos-store",
+    "crates/pos-log",
+    "crates/pos-domain",
+    "crates/pos-capabilities",
+    "crates/pos-gateway",
+    "crates/pos-ingest",
+    "crates/pos-connect",
+    "crates/pos-knowledge",
+    "crates/pos-agents",
+    "crates/pos-planning",
+    "crates/pos-exec",
+    "crates/pos-sched",
+    "crates/pos-api",
+    "crates/pos-sync",
+    "crates/pos-plugins",
+    "crates/pos-sdk",
+    "bins/pos-server",
+    "bins/pos",
+    "bins/check-dep-dag",
+    "apps/desktop",
+]
+
+[workspace.package]
+version = "0.1.0-dev"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.95"
+
+[workspace.dependencies]
+# Every entry here needs a DEPENDENCIES.md row (justification + owner + eject path).
+proc-macro2 = { version = "1", features = ["span-locations"] }
+serde_json = "1"
+syn = { version = "3", features = ["full", "visit"] }
+tauri = "=2.11.5"
+tauri-build = "=2.6.3"
+
+[workspace.lints.rust]
+# -D warnings everywhere (STYLE "Tooling as law"); never weaken to merge.
+warnings = "deny"
+# Forbid unsafe outside the audited FFI leaf modules; those crates opt out
+# explicitly with their own [lints] table + SAFETY.md (STYLE unsafe policy).
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Curated set, not the whole pedantic group: with `warnings = deny` above, every
+# warn-level lint is a CI failure, so each entry here is a deliberate rule.
+# Curation evolves via m0-s02 review; never weaken to merge (STYLE).
+dbg_macro = "deny"
+todo = "deny"
+# Sized-integer discipline at boundaries (STYLE "explicitly sized integers"):
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_lossless = "warn"
+# Honest errors (STYLE panic policy — the m0-s02 grep is the primary enforcement):
+fallible_impl_from = "warn"
+# Control-flow hygiene (STYLE "push ifs up, fors down"):
+needless_pass_by_value = "warn"
+semicolon_if_nothing_returned = "warn"

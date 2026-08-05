@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title description">
+  <title id="title">ProjectOS application icon</title>
+  <desc id="description">A continuous project loop connecting evidence, decision, and execution nodes.</desc>
+  <rect width="1024" height="1024" rx="224" fill="#14231B"/>
+  <path
+    d="M337 316h263c96 0 174 78 174 174s-78 174-174 174H424"
+    fill="none"
+    stroke="#D6EE9A"
+    stroke-linecap="round"
+    stroke-width="92"
+  />
+  <path
+    d="M426 708H316c-59 0-106-47-106-106V422c0-59 47-106 106-106h21"
+    fill="none"
+    stroke="#1E6B4B"
+    stroke-linecap="round"
+    stroke-width="92"
+  />
+  <circle cx="337" cy="316" r="74" fill="#F2F1EC"/>
+  <circle cx="424" cy="708" r="74" fill="#F2F1EC"/>
+  <circle cx="600" cy="490" r="74" fill="#1E6B4B" stroke="#F2F1EC" stroke-width="30"/>
+</svg>

@@ -1,0 +1,24 @@
+[package]
+name = "pos-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pos-foundation = { path = "../pos-foundation" }
+pos-store = { path = "../pos-store" }
+pos-log = { path = "../pos-log" }
+pos-domain = { path = "../pos-domain" }
+pos-capabilities = { path = "../pos-capabilities" }
+pos-gateway = { path = "../pos-gateway" }
+pos-ingest = { path = "../pos-ingest" }
+pos-connect = { path = "../pos-connect" }
+pos-knowledge = { path = "../pos-knowledge" }
+pos-agents = { path = "../pos-agents" }
+pos-planning = { path = "../pos-planning" }
+pos-exec = { path = "../pos-exec" }
+pos-sched = { path = "../pos-sched" }

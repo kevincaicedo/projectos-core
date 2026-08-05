@@ -1,0 +1,165 @@
+# CI spine (m0-s01). Wall-clock budget: the whole pipeline < 10 min (§18 / m0
+# exit gate) — enforced mechanically by the job-level timeout, tracked per run.
+# Never weaken a check to merge: change the law (ADR) or fix the code.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      elapsed_seconds: ${{ steps.elapsed.outputs.seconds }}
+    steps:
+      - id: started
+        name: Start wall-clock
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+        with:
+          just-version: "1.47.1"
+      - name: Toolchain (pinned by rust-toolchain.toml)
+        run: rustup show
+      - name: Tauri Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            wget
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Rust, policy, and public-build bootstrap through just
+        run: >-
+          just fmt-check clippy test dep-dag discipline core-boundaries
+          capability-catalog-check public-build-bootstrap
+      - name: Frozen capability seam (m0-s17)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: cargo run --quiet -p check-dep-dag --bin check-seam-freeze -- --root . --base "$BASE_SHA" --event "$GITHUB_EVENT_PATH"
+      - id: elapsed
+        name: Record wall-clock
+        env:
+          START_EPOCH: ${{ steps.started.outputs.epoch }}
+        run: echo "seconds=$(( $(date +%s) - START_EPOCH ))" >> "$GITHUB_OUTPUT"
+
+  rust-macos:
+    # Target-platform compile smoke. It is not binding reference-machine
+    # evidence; docs/reference-machines.md keeps that distinction explicit.
+    runs-on: macos-14
+    timeout-minutes: 10
+    outputs:
+      elapsed_seconds: ${{ steps.elapsed.outputs.seconds }}
+    steps:
+      - id: started
+        name: Start wall-clock
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup show
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+      - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+        with:
+          just-version: "1.47.1"
+      - name: pnpm via corepack
+        run: corepack enable pnpm
+      - name: Install UI and desktop tooling
+        run: pnpm install --frozen-lockfile
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: All-target compile and Tauri smoke through just
+        run: just public-build-bootstrap desktop-check
+      - id: elapsed
+        name: Record wall-clock
+        env:
+          START_EPOCH: ${{ steps.started.outputs.epoch }}
+        run: echo "seconds=$(( $(date +%s) - START_EPOCH ))" >> "$GITHUB_OUTPUT"
+
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      elapsed_seconds: ${{ steps.elapsed.outputs.seconds }}
+    steps:
+      - id: started
+        name: Start wall-clock
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - id: elapsed
+        name: Record wall-clock
+        env:
+          START_EPOCH: ${{ steps.started.outputs.epoch }}
+        run: echo "seconds=$(( $(date +%s) - START_EPOCH ))" >> "$GITHUB_OUTPUT"
+
+  ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      elapsed_seconds: ${{ steps.elapsed.outputs.seconds }}
+    steps:
+      - id: started
+        name: Start wall-clock
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+      - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+        with:
+          just-version: "1.47.1"
+      - name: pnpm via corepack
+        run: corepack enable pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Strict UI checks and production bundle through just
+        run: just ui-check ui-build
+      - id: elapsed
+        name: Record wall-clock
+        env:
+          START_EPOCH: ${{ steps.started.outputs.epoch }}
+        run: echo "seconds=$(( $(date +%s) - START_EPOCH ))" >> "$GITHUB_OUTPUT"
+
+  wall-clock-budget:
+    # Parallel CI duration is its slowest job. Runner queue latency is external
+    # capacity, so each timer starts only after its runner begins executing.
+    if: always()
+    needs: [rust, rust-macos, deny, ui]
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    env:
+      RUST_SECONDS: ${{ needs.rust.outputs.elapsed_seconds }}
+      MACOS_SECONDS: ${{ needs.rust-macos.outputs.elapsed_seconds }}
+      DENY_SECONDS: ${{ needs.deny.outputs.elapsed_seconds }}
+      UI_SECONDS: ${{ needs.ui.outputs.elapsed_seconds }}
+    steps:
+      - name: Enforce the 10-minute CI critical-path budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          durations=("$RUST_SECONDS" "$MACOS_SECONDS" "$DENY_SECONDS" "$UI_SECONDS")
+          longest_seconds=0
+          for duration_seconds in "${durations[@]}"; do
+            [[ "$duration_seconds" =~ ^[0-9]+$ ]] || {
+              echo "A CI job did not publish a wall-clock measurement." >&2
+              exit 1
+            }
+            (( duration_seconds > longest_seconds )) && longest_seconds="$duration_seconds"
+          done
+          echo "CI critical path: ${longest_seconds}s (budget: <600s)"
+          (( longest_seconds < 600 ))
