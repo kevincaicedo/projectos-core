@@ -4,7 +4,7 @@ default:
     @just --list
 
 # Everything CI runs. Green here before presenting any change as done (AGENTS.md).
-ci: node-version-check fmt-check clippy test deny dep-dag discipline core-boundaries capability-catalog-check public-build-bootstrap ui-check ui-build desktop-check
+ci: node-version-check fmt-check clippy test deny dep-dag discipline core-boundaries capability-catalog-check snapshot-fixture-check release-signing-check public-build-bootstrap ui-check ui-build e2e desktop-check
     @echo "ci: all green"
 
 node-version-check:
@@ -49,14 +49,39 @@ docs-mirror-check:
 capability-catalog-check:
     cargo run --quiet -p pos-api --bin export-capabilities -- --check apps/ui/src/api/gen/capabilities.ts
 
-# M0-E1 portion of public-builds-alone. m0-s16 extends this same gate with
-# signed installers and the full walking-skeleton e2e before its AC can close.
+# public-builds-alone: no cloud checkout, every target builds, the walking
+# skeleton runs (`e2e`), and release signing is proven on a seeded fixture
+# (`release-signing-check`). All four are wired into `ci` above.
 public-build-bootstrap:
     test ! -e cloud
     cargo build --workspace --all-targets
 
 generate-capabilities:
     cargo run --quiet -p pos-api --bin export-capabilities -- --write apps/ui/src/api/gen/capabilities.ts
+
+# The e2e fixture is the real runtime's own stdout, so UI/runtime wire drift
+# fails here instead of in front of a user.
+generate-snapshot-fixture:
+    cargo run --quiet -p pos -- capability-snapshot > apps/ui/e2e/fixtures/capability-snapshot.json
+
+snapshot-fixture-check:
+    cargo run --quiet -p pos -- capability-snapshot | diff --unified apps/ui/e2e/fixtures/capability-snapshot.json - \
+      || { echo "snapshot fixture is stale; run \`just generate-snapshot-fixture\`" >&2; exit 1; }
+
+# Proves the release-signing gate fires on a tampered artifact, a tampered
+# manifest, and an untrusted key. Ephemeral key; no secret required.
+release-signing-check:
+    @bash scripts/release-signing-fixture.sh
+
+# Builds the desktop bundles and signs their checksum manifest with the release
+# key. Founder-run or release-workflow-run; never part of the CI critical path,
+# which is why `desktop-check` above passes --no-bundle instead of reusing this.
+package key_path:
+    pnpm exec tauri build --config apps/desktop/tauri.conf.json --ci
+    @bash scripts/sign-release.sh target/release/bundle {{key_path}}
+
+verify-package identity allowed_signers:
+    @bash scripts/verify-release.sh target/release/bundle {{identity}} {{allowed_signers}}
 
 # UI checks: typecheck + lint + format. Requires `pnpm install` once (corepack).
 ui-check: node-version-check
@@ -67,6 +92,14 @@ ui-check: node-version-check
 
 ui-build: node-version-check
     pnpm --dir apps/ui build
+
+# Walking-skeleton e2e over the production bundle, with no server, no account,
+# and no cloud checkout. Needs `just e2e-install` once per machine.
+e2e: node-version-check
+    pnpm --dir apps/ui exec playwright test
+
+e2e-install: node-version-check
+    pnpm --dir apps/ui exec playwright install --with-deps chromium
 
 # Compile the native shell through the actual Tauri CLI/config path without
 # producing installers (packaging and signing remain m0-s07 work).
@@ -88,6 +121,18 @@ dev-desktop: node-version-check
 dev-ollama:
     @echo "gateway OpenAI-compatible adapter lands in m0-s10; start ollama separately (ollama serve)"
 
+# The m0-s04 crash-point harness: every fault point × kill -9, restart,
+# verify zero corruption. Runs inside `just test` per PR (it is fast at M0
+# scale) and as the dedicated nightly lane the milestone names.
+crash-matrix:
+    cargo test -p pos-store --test crash_matrix
+    cargo test -p pos-log --test log_crash
+
 # pos-bench lands in m0-s16.
 bench:
     @echo "pos-bench v0 lands in m0-s16 (cold-start, project-open, interaction scenarios)"
+
+# Emits the docs/reference-machines.md fingerprint for the current host. Run on
+# each binding machine and paste the output into its registry row (m0-s02).
+fingerprint-machine machine_id:
+    @bash scripts/fingerprint-machine.sh {{machine_id}}

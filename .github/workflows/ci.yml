@@ -21,7 +21,7 @@ jobs:
       - id: started
         name: Start wall-clock
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
       - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
@@ -46,7 +46,8 @@ jobs:
       - name: Rust, policy, and public-build bootstrap through just
         run: >-
           just fmt-check clippy test dep-dag discipline core-boundaries
-          capability-catalog-check public-build-bootstrap
+          capability-catalog-check snapshot-fixture-check release-signing-check
+          public-build-bootstrap
       - name: Frozen capability seam (m0-s17)
         if: github.event_name == 'pull_request'
         env:
@@ -69,7 +70,7 @@ jobs:
       - id: started
         name: Start wall-clock
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: rustup show
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -99,7 +100,7 @@ jobs:
       - id: started
         name: Start wall-clock
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
       - id: elapsed
         name: Record wall-clock
@@ -116,7 +117,7 @@ jobs:
       - id: started
         name: Start wall-clock
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: .node-version
@@ -129,6 +130,10 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Strict UI checks and production bundle through just
         run: just ui-check ui-build
+      - name: Walking-skeleton browser
+        run: just e2e-install
+      - name: Walking-skeleton e2e with no server, account, or cloud checkout
+        run: just e2e
       - id: elapsed
         name: Record wall-clock
         env:

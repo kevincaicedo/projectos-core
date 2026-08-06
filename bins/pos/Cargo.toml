@@ -10,3 +10,16 @@ workspace = true
 
 [dependencies]
 pos-api = { path = "../../crates/pos-api" }
+# Argument parsing for the v0 command set (long-form flags per STYLE).
+clap = { workspace = true }
+# Typed inputs are serialized through pos-api's one encoder; the bound on the
+# helper functions needs the trait in scope.
+serde = { workspace = true }
+# Shells may DECODE results to render exit codes and human summaries; they
+# never reshape the bytes they forward (L12).
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The e2e corruption fixtures mutate project files behind the CLI's back.
+rusqlite = { workspace = true }
+tempfile = { workspace = true }

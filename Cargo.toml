@@ -36,11 +36,22 @@ rust-version = "1.95"
 
 [workspace.dependencies]
 # Every entry here needs a DEPENDENCIES.md row (justification + owner + eject path).
+blake3 = "1"
+ciborium = "0.2"
+clap = { version = "4", features = ["derive"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
+proptest = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Pinned exactly: the vec0 module is storage-format-bearing, so upgrades are
+# deliberate. 0.1.9 is the newest stable; the 0.1.10 alphas ship a broken
+# C-source packaging (missing sqlite-vec-diskann.c) as of 2026-08.
+sqlite-vec = "=0.1.9"
 syn = { version = "3", features = ["full", "visit"] }
 tauri = "=2.11.5"
 tauri-build = "=2.6.3"
+tempfile = "3"
 
 [workspace.lints.rust]
 # -D warnings everywhere (STYLE "Tooling as law"); never weaken to merge.

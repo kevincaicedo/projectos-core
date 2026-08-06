@@ -1,0 +1,40 @@
+# Nightly heavy lanes (m0-s04): the crash-point kill -9 matrix on a clean
+# runner, plus a 1M-event synthetic round-trip that is too slow for the
+# per-PR wall-clock budget. PR CI runs the same crash suites at M0 scale;
+# this lane is the standing harness the milestone gate names, and it grows
+# the GB-corpus and chaos matrices in M1/M2.
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  crash-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+        with:
+          just-version: "1.47.1"
+      - name: Toolchain (pinned by rust-toolchain.toml)
+        run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Crash-point matrix (kill -9 × append/snapshot/CAS)
+        run: just crash-matrix
+      - name: 1M-event synthetic round-trip (create → seed → verify → export)
+        run: |
+          cargo build --release -p pos
+          BIN=target/release/pos
+          PROJECT="$RUNNER_TEMP/nightly.pos"
+          EXPORT="$RUNNER_TEMP/nightly-export.pos"
+          "$BIN" create "$PROJECT" --name "Nightly Corpus"
+          "$BIN" seed-synthetic "$PROJECT" --events 999999 --seed 20260806
+          "$BIN" verify "$PROJECT"
+          "$BIN" export "$PROJECT" --out "$EXPORT"
+          "$BIN" verify "$EXPORT"

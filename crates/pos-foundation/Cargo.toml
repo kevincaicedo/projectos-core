@@ -7,3 +7,8 @@ rust-version.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# Ids and event payloads serialize with stable byte-level shapes (event bodies
+# are versioned serde structs, STYLE); serde is the one serialization seam.
+serde = { workspace = true }

@@ -11,3 +11,11 @@ workspace = true
 [dependencies]
 pos-foundation = { path = "../pos-foundation" }
 pos-store = { path = "../pos-store" }
+# Refs and snapshots are CBOR (§7.1 body encoding is CBOR by design; one
+# serialization format across the log keeps the format spec small).
+ciborium = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }

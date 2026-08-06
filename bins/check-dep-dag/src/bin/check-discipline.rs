@@ -30,6 +30,23 @@ const LEDGER_FILE_SIZE_MAX: u64 = 1_048_576;
 const TARGET_COUNT_MAX: usize = 10_000;
 const INVARIANT_MARKER: &str = "// INVARIANT:";
 
+/// Audited FFI leaves (STYLE unsafe policy, m0-s04): the only target roots
+/// allowed to carry `#![deny(unsafe_code)]` instead of forbid, and for each,
+/// the only module files allowed to `#![allow(unsafe_code)]`. Every entry
+/// requires a SAFETY.md beside the crate manifest. Growing this table is a
+/// deliberate, reviewed amendment — the same bar as a dependency edge.
+const UNSAFE_FFI_LEAVES: [UnsafeFfiLeaf; 1] = [UnsafeFfiLeaf {
+    target_root: "crates/pos-store/src/lib.rs",
+    allowed_modules: &["crates/pos-store/src/extensions.rs"],
+    safety_document: "crates/pos-store/SAFETY.md",
+}];
+
+struct UnsafeFfiLeaf {
+    target_root: &'static str,
+    allowed_modules: &'static [&'static str],
+    safety_document: &'static str,
+}
+
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct Violation {
     policy: &'static str,
@@ -189,17 +206,53 @@ fn check_target_roots(root: &Path, metadata: &serde_json::Value) -> Result<Vec<V
                     .to_owned(),
             });
         }
-        if !explicitly_forbids_unsafe(&syntax) {
+        if let Some(message) = unsafe_policy_violation(root, &path, &syntax) {
             violations.push(Violation {
                 policy: "unsafe-policy",
                 path,
                 line: None,
-                message: "crate target needs an explicit `#![forbid(unsafe_code)]`; an audited FFI exception requires a checker amendment and SAFETY.md"
-                    .to_owned(),
+                message,
             });
         }
     }
     Ok(violations)
+}
+
+/// Forbid everywhere, except the audited FFI leaves, which must deny at the
+/// root (so their one allow-listed module can exist) and carry SAFETY.md.
+fn unsafe_policy_violation(root: &Path, path: &Path, syntax: &syn::File) -> Option<String> {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let Some(leaf) = UNSAFE_FFI_LEAVES
+        .iter()
+        .find(|leaf| Path::new(leaf.target_root) == relative)
+    else {
+        if explicitly_forbids_unsafe(syntax) {
+            return None;
+        }
+        return Some(
+            "crate target needs an explicit `#![forbid(unsafe_code)]`; an audited FFI \
+             exception requires a checker amendment and SAFETY.md"
+                .to_owned(),
+        );
+    };
+    if !explicitly_denies_unsafe(syntax) {
+        return Some(format!(
+            "audited FFI leaf must carry `#![deny(unsafe_code)]` at its root \
+             (see {})",
+            leaf.safety_document
+        ));
+    }
+    if !root.join(leaf.safety_document).is_file() {
+        return Some(format!(
+            "audited FFI leaf requires {} to exist",
+            leaf.safety_document
+        ));
+    }
+    None
+}
+
+fn explicitly_denies_unsafe(syntax: &syn::File) -> bool {
+    lint_level_names_unsafe_code(syntax, "deny")
 }
 
 fn has_crate_charter(source: &str) -> bool {
@@ -210,8 +263,12 @@ fn has_crate_charter(source: &str) -> bool {
 }
 
 fn explicitly_forbids_unsafe(syntax: &syn::File) -> bool {
+    lint_level_names_unsafe_code(syntax, "forbid")
+}
+
+fn lint_level_names_unsafe_code(syntax: &syn::File, level: &str) -> bool {
     syntax.attrs.iter().any(|attribute| {
-        if !attribute.path().is_ident("forbid") {
+        if !attribute.path().is_ident(level) {
             return false;
         }
         let syn::Meta::List(list) = &attribute.meta else {
@@ -223,6 +280,30 @@ fn explicitly_forbids_unsafe(syntax: &syn::File) -> bool {
             .into_iter()
             .any(|token| matches!(token, TokenTree::Ident(ident) if ident == "unsafe_code"))
     })
+}
+
+/// `allow(unsafe_code)` is legal only in the exact module files the FFI-leaf
+/// table names; anywhere else it is an attempted bypass of the unsafe policy.
+fn unsafe_allow_violation(root: &Path, path: &Path, syntax: &syn::File) -> Option<String> {
+    let allows_unsafe = lint_level_names_unsafe_code(syntax, "allow");
+    if !allows_unsafe {
+        return None;
+    }
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let allowed = UNSAFE_FFI_LEAVES.iter().any(|leaf| {
+        leaf.allowed_modules
+            .iter()
+            .any(|module| Path::new(module) == relative)
+    });
+    if allowed {
+        None
+    } else {
+        Some(
+            "`allow(unsafe_code)` outside the audited FFI-leaf table is a policy bypass; \
+             amend check-discipline and SAFETY.md deliberately or remove it"
+                .to_owned(),
+        )
+    }
 }
 
 fn source_files(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -279,16 +360,35 @@ fn check_rust_file(
     let source = read_bounded_text(path, SOURCE_FILE_SIZE_MAX, "Rust source")?;
     let syntax = syn::parse_file(&source)
         .map_err(|error| format!("parse Rust source {}: {error}", path.display()))?;
+    if let Some(message) = unsafe_allow_violation(root, path, &syntax) {
+        violations.push(Violation {
+            policy: "unsafe-policy",
+            path: path.to_path_buf(),
+            line: Some(1),
+            message,
+        });
+    }
     let lines: Vec<&str> = source.lines().collect();
     let mut visitor = PolicyVisitor {
         root,
         path,
         lines: &lines,
         projection_writes_allowed: projection_writes_allowed(root, path),
+        panic_policy_enforced: !is_integration_test_path(root, path),
         violations,
     };
     visitor.visit_file(&syntax);
     Ok(())
+}
+
+/// Files under a crate's `tests/` directory compile only into test binaries
+/// (Cargo's definition of integration tests), so the panic policy treats the
+/// whole file as test code — the same standing `#[test]` items already have.
+fn is_integration_test_path(root: &Path, path: &Path) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    relative
+        .components()
+        .any(|component| component.as_os_str() == OsStr::new("tests"))
 }
 
 fn check_sql_file(root: &Path, path: &Path, violations: &mut Vec<Violation>) -> Result<(), String> {
@@ -313,11 +413,15 @@ struct PolicyVisitor<'a> {
     path: &'a Path,
     lines: &'a [&'a str],
     projection_writes_allowed: bool,
+    panic_policy_enforced: bool,
     violations: &'a mut Vec<Violation>,
 }
 
 impl PolicyVisitor<'_> {
     fn check_panic_call(&mut self, method: &str, call_end_line: usize, call_end_column: usize) {
+        if !self.panic_policy_enforced {
+            return;
+        }
         let justified = self
             .lines
             .get(call_end_line.saturating_sub(1))
@@ -761,24 +865,50 @@ mod tests {
     use super::{
         PolicyVisitor, Violation, compare_dependency_sets, explicitly_forbids_unsafe,
         has_crate_charter, item_is_test_only, ledger_dependencies, projection_write,
+        unsafe_allow_violation, unsafe_policy_violation,
     };
     use std::collections::BTreeSet;
     use std::path::Path;
     use syn::visit::Visit;
 
     fn rust_violations(source: &str) -> Vec<Violation> {
+        rust_violations_at(source, "/workspace/crates/pos-store/src/lib.rs")
+    }
+
+    fn rust_violations_at(source: &str, path: &str) -> Vec<Violation> {
         let syntax = syn::parse_file(source).expect("fixture is valid Rust");
         let lines: Vec<&str> = source.lines().collect();
         let mut violations = Vec::new();
+        let root = Path::new("/workspace");
+        let path = Path::new(path);
         let mut visitor = PolicyVisitor {
-            root: Path::new("/workspace"),
-            path: Path::new("/workspace/crates/pos-store/src/lib.rs"),
+            root,
+            path,
             lines: &lines,
             projection_writes_allowed: false,
+            panic_policy_enforced: !super::is_integration_test_path(root, path),
             violations: &mut violations,
         };
         visitor.visit_file(&syntax);
         violations
+    }
+
+    /// Integration-test files are test code by Cargo's definition: the panic
+    /// policy exempts them wholesale, and only them.
+    #[test]
+    fn integration_test_files_are_test_code_for_the_panic_policy() {
+        let helper = "fn fixture_helper() { let _ = disk().unwrap(); }";
+        assert!(rust_violations_at(helper, "/workspace/crates/pos-log/tests/props.rs").is_empty());
+        assert_eq!(
+            rust_violations_at(helper, "/workspace/crates/pos-log/src/lib.rs").len(),
+            1,
+            "the same helper under src/ stays a violation"
+        );
+        assert_eq!(
+            rust_violations_at(helper, "/workspace/crates/pos-log/src/tests.rs").len(),
+            1,
+            "a module merely named tests.rs is not the tests directory"
+        );
     }
 
     #[test]
@@ -909,5 +1039,73 @@ fn empty_comment_is_not_a_reason() {
         assert!(has_crate_charter(comment_only));
         assert!(!explicitly_forbids_unsafe(&syntax));
         assert!(!has_crate_charter("#![forbid(unsafe_code)]\n"));
+    }
+
+    #[test]
+    fn audited_ffi_leaf_may_deny_but_every_other_target_must_forbid() {
+        let root = Path::new("/workspace");
+        let deny_root =
+            syn::parse_file("//! # store\n#![deny(unsafe_code)]\n").expect("fixture is valid Rust");
+        // The audited leaf accepts deny — but only with its SAFETY.md, which
+        // this fixture workspace does not have, so the violation names it.
+        let message = unsafe_policy_violation(
+            root,
+            Path::new("/workspace/crates/pos-store/src/lib.rs"),
+            &deny_root,
+        )
+        .expect("missing SAFETY.md must be a violation");
+        assert!(message.contains("SAFETY.md"));
+
+        // A non-excepted crate carrying deny instead of forbid is a violation.
+        let message = unsafe_policy_violation(
+            root,
+            Path::new("/workspace/crates/pos-log/src/lib.rs"),
+            &deny_root,
+        )
+        .expect("deny outside the FFI-leaf table must be a violation");
+        assert!(message.contains("forbid(unsafe_code)"));
+
+        // The real workspace: the audited leaf with its SAFETY.md passes.
+        let real_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace root resolves");
+        assert_eq!(
+            unsafe_policy_violation(
+                &real_root,
+                &real_root.join("crates/pos-store/src/lib.rs"),
+                &deny_root,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn allow_unsafe_outside_the_ffi_leaf_table_is_a_bypass() {
+        let root = Path::new("/workspace");
+        let allowing =
+            syn::parse_file("//! # leaf\n#![allow(unsafe_code)]\n").expect("fixture is valid Rust");
+        assert!(
+            unsafe_allow_violation(
+                root,
+                Path::new("/workspace/crates/pos-store/src/extensions.rs"),
+                &allowing,
+            )
+            .is_none(),
+            "the audited extension module is allow-listed"
+        );
+        let message = unsafe_allow_violation(
+            root,
+            Path::new("/workspace/crates/pos-ingest/src/sneaky.rs"),
+            &allowing,
+        )
+        .expect("allow(unsafe_code) elsewhere must be flagged");
+        assert!(message.contains("policy bypass"));
+
+        let clean = syn::parse_file("//! # ordinary module\n").expect("fixture is valid Rust");
+        assert!(
+            unsafe_allow_violation(root, Path::new("/workspace/crates/x/src/lib.rs"), &clean)
+                .is_none()
+        );
     }
 }

@@ -12,3 +12,8 @@ workspace = true
 pos-foundation = { path = "../pos-foundation" }
 pos-store = { path = "../pos-store" }
 pos-log = { path = "../pos-log" }
+ciborium = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

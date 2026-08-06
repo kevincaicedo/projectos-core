@@ -66,3 +66,33 @@ export const capabilityCards = [
 export type CapabilityId = (typeof capabilityCards)[number]["id"];
 export type CapabilityState =
   { mode: "local" | "hosted" } | { mode: "unavailable"; reason: string };
+
+// The live runtime read surface. These shapes are the wire result of the
+// pos-api query named below; the UI never constructs runtime state itself.
+export const CAPABILITY_SNAPSHOT_QUERY = "capability.snapshot";
+export const CAPABILITY_TRAIT_VERSION = 1;
+
+export type CapabilityRow = {
+  readonly id: CapabilityId;
+  readonly provider: string;
+  readonly state: CapabilityState;
+};
+
+export type ConnectorHostTick = {
+  readonly hostAvailable: boolean;
+  readonly polledCount: number;
+  readonly nextCursor: number;
+};
+
+export type CapabilitySnapshot = {
+  readonly surfaceVersion: number;
+  readonly capabilityTraitVersion: number;
+  readonly capabilities: readonly CapabilityRow[];
+  readonly connectorHost: ConnectorHostTick | null;
+};
+
+export type ApiErrorEnvelope = {
+  readonly code: string;
+  readonly message: string;
+  readonly retriable: boolean;
+};

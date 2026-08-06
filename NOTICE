@@ -1,0 +1,16 @@
+ProjectOS Core
+Copyright 2026 Private AI Inc.
+
+This product includes software developed by Private AI Inc. and the ProjectOS
+contributors.
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+ProjectOS, the ProjectOS logo, and "ProjectOS Cloud" are trademarks of
+Private AI Inc. The Apache License does not grant permission to use these
+marks; see TRADEMARK.md for the permitted uses.
+
+Third-party dependencies retain their own copyright and license terms. The
+complete direct-dependency inventory, with the reason each one is present, is
+DEPENDENCIES.md; a machine check fails CI when that ledger and the resolved
+dependency graph disagree.

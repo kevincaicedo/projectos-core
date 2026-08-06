@@ -20,6 +20,25 @@ const DIRECTORY_DEPTH_MAX: usize = 64;
 const SOURCE_FILE_SIZE_MAX: u64 = 4 * 1_048_576;
 const POLICY_FILE_SIZE_MAX: u64 = 1_048_576;
 const MIRROR_FILE_SIZE_MAX: u64 = 16 * 1_048_576;
+const LEGAL_FILE_SIZE_MIN: usize = 200;
+
+/// The accepted ADR-0003 identity. These strings are public by design: they are
+/// the copyright holder and the single security intake the public repository
+/// promises. Keeping them here makes "the legal files agree with each other" a
+/// machine check instead of a review habit.
+const PUBLIC_COPYRIGHT_HOLDER: &str = "Private AI Inc.";
+const PUBLIC_SECURITY_INTAKE: &str = "ing.sys.kevincaicedo@gmail.com";
+
+/// ADR-0003 §Verification: each public legal file, plus the phrase that proves
+/// it is the accepted text rather than a placeholder that happens to exist.
+const REQUIRED_PUBLIC_LEGAL_FILES: [(&str, &str); 6] = [
+    ("LICENSE", "Apache License"),
+    ("NOTICE", PUBLIC_COPYRIGHT_HOLDER),
+    ("SECURITY.md", PUBLIC_SECURITY_INTAKE),
+    ("TRADEMARK.md", PUBLIC_COPYRIGHT_HOLDER),
+    ("CONTRIBUTING.md", "Signed-off-by"),
+    (".github/workflows/dco.yml", "Signed-off-by"),
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BoundaryViolation {
@@ -149,6 +168,9 @@ fn scan_repository(
     repository_kind: RepositoryKind,
 ) -> Result<Vec<BoundaryViolation>, String> {
     let mut violations = dependency_boundary_violations(root, repository_kind)?;
+    if matches!(repository_kind, RepositoryKind::Core) {
+        violations.extend(public_legal_file_violations(root)?);
+    }
     for path in rust_files(root)? {
         let source = read_bounded_text(&path, SOURCE_FILE_SIZE_MAX, "Rust source")?;
         let syntax = syn::parse_file(&source)
@@ -389,6 +411,59 @@ fn scan_umbrella(root: &Path) -> Result<Vec<BoundaryViolation>, String> {
 
     violations.extend(docs_mirror_violations(root)?);
     Ok(violations)
+}
+
+/// Reads the public legal files from a live checkout and applies the policy.
+///
+/// A missing file and an empty file are the same failure here on purpose: a
+/// zero-byte `LICENSE` satisfies a shell `test -f` and satisfies nobody else.
+fn public_legal_file_violations(root: &Path) -> Result<Vec<BoundaryViolation>, String> {
+    let mut files = Vec::with_capacity(REQUIRED_PUBLIC_LEGAL_FILES.len());
+    for (name, _) in REQUIRED_PUBLIC_LEGAL_FILES {
+        let path = root.join(name);
+        let text = if path.is_file() {
+            Some(read_bounded_text(
+                &path,
+                POLICY_FILE_SIZE_MAX,
+                "legal file",
+            )?)
+        } else {
+            None
+        };
+        files.push((name, text));
+    }
+    Ok(public_legal_violations(&files))
+}
+
+fn public_legal_violations(files: &[(&str, Option<String>)]) -> Vec<BoundaryViolation> {
+    let mut violations = Vec::new();
+    for (name, required_phrase) in REQUIRED_PUBLIC_LEGAL_FILES {
+        let found = files
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .and_then(|(_, text)| text.as_deref());
+        let Some(text) = found else {
+            violations.push(BoundaryViolation {
+                gate: "public-legal-files",
+                detail: format!("{name} is missing from the public repository"),
+            });
+            continue;
+        };
+        if text.len() < LEGAL_FILE_SIZE_MIN {
+            violations.push(BoundaryViolation {
+                gate: "public-legal-files",
+                detail: format!("{name} is too short to be the accepted text"),
+            });
+            continue;
+        }
+        if !text.contains(required_phrase) {
+            violations.push(BoundaryViolation {
+                gate: "public-legal-files",
+                detail: format!("{name} does not contain the accepted phrase {required_phrase:?}"),
+            });
+        }
+    }
+    violations
 }
 
 fn gitlink_mode(root: &Path, child: &str) -> Result<Option<String>, String> {
@@ -1007,6 +1082,56 @@ mod tests {
     fn docs_mirror_fresh_has_clean_and_seeded_failure() {
         assert!(docs_mirror_fresh(&[(b"same", b"same")]).is_empty());
         assert_eq!(docs_mirror_fresh(&[(b"source", b"stale")]).len(), 1);
+    }
+
+    #[test]
+    fn public_legal_files_have_clean_and_seeded_failures() {
+        assert!(public_legal_violations(&legal_fixture(&[])).is_empty());
+        let missing_license = public_legal_violations(&legal_fixture(&[("LICENSE", None)]));
+        assert_eq!(missing_license.len(), 1);
+        assert_eq!(missing_license[0].gate, "public-legal-files");
+
+        let stub_notice = public_legal_violations(&legal_fixture(&[(
+            "NOTICE",
+            Some(PUBLIC_COPYRIGHT_HOLDER.to_owned()),
+        )]));
+        assert_eq!(stub_notice.len(), 1, "a short stub must not satisfy NOTICE");
+
+        let wrong_intake = public_legal_violations(&legal_fixture(&[(
+            "SECURITY.md",
+            Some("x".repeat(LEGAL_FILE_SIZE_MIN)),
+        )]));
+        assert_eq!(
+            wrong_intake.len(),
+            1,
+            "a long file without the accepted intake address must fail"
+        );
+
+        let unsigned_dco = public_legal_violations(&legal_fixture(&[(
+            ".github/workflows/dco.yml",
+            Some(format!("name: dco{}", "\n#".repeat(LEGAL_FILE_SIZE_MIN))),
+        )]));
+        assert_eq!(
+            unsigned_dco.len(),
+            1,
+            "DCO enforcement must actually check the sign-off trailer"
+        );
+    }
+
+    /// Builds an otherwise-clean set of legal files, applying the named
+    /// overrides. `None` seeds a missing file.
+    fn legal_fixture(overrides: &[(&str, Option<String>)]) -> Vec<(&'static str, Option<String>)> {
+        REQUIRED_PUBLIC_LEGAL_FILES
+            .iter()
+            .map(|(name, phrase)| {
+                let clean = format!("{phrase}{}", " padding".repeat(LEGAL_FILE_SIZE_MIN));
+                let text = overrides
+                    .iter()
+                    .find(|(candidate, _)| candidate == name)
+                    .map_or(Some(clean), |(_, replacement)| replacement.clone());
+                (*name, text)
+            })
+            .collect()
     }
 
     fn source_violations(source: &str, repository_kind: RepositoryKind) -> Vec<BoundaryViolation> {

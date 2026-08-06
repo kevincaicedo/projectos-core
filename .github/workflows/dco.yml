@@ -1,0 +1,50 @@
+# Developer Certificate of Origin enforcement (ADR-0003, m0-s17).
+#
+# ADR-0003 accepts contributions under DCO 1.1 with no CLA. This workflow is the
+# enforcement half of that decision. It lives in the repository instead of a
+# third-party GitHub App so the rule is versioned, auditable, and forkable with
+# the code it governs.
+name: dco
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  sign-off:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+      - name: Every commit carries a matching Signed-off-by trailer
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          commits="$(git rev-list --no-merges "$BASE_SHA".."$HEAD_SHA")"
+          if [[ -z "$commits" ]]; then
+            echo "No non-merge commits to check."
+            exit 0
+          fi
+          unsigned=0
+          while read -r commit; do
+            author="$(git show --no-patch --format='%an <%ae>' "$commit")"
+            trailers="$(git show --no-patch --format='%(trailers:key=Signed-off-by,valueonly)' "$commit")"
+            if grep --fixed-strings --line-regexp --quiet "$author" <<<"$trailers"; then
+              continue
+            fi
+            unsigned=$(( unsigned + 1 ))
+            echo "::error::${commit} is not signed off by its author ${author}. Run 'git commit --amend --signoff' or 'git rebase --signoff'." >&2
+          done <<<"$commits"
+          if (( unsigned > 0 )); then
+            echo "${unsigned} commit(s) lack a Developer Certificate of Origin sign-off; see CONTRIBUTING.md." >&2
+            exit 1
+          fi
+          echo "All commits carry a Signed-off-by trailer matching their author."

@@ -1,3 +1,9 @@
+# pos-store is the audited unsafe exception (STYLE unsafe policy): SQLite
+# extension registration is FFI, so this crate replicates the workspace lint
+# table with `unsafe_code` lowered from `forbid` to `deny`. The one
+# `#![allow(unsafe_code)]` leaf is src/extensions.rs; `check-discipline` pins
+# that exact target root and requires SAFETY.md beside this manifest.
+
 [package]
 name = "pos-store"
 version.workspace = true
@@ -5,8 +11,27 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+warnings = "deny"
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_lossless = "warn"
+fallible_impl_from = "warn"
+needless_pass_by_value = "warn"
+semicolon_if_nothing_returned = "warn"
 
 [dependencies]
 pos-foundation = { path = "../pos-foundation" }
+blake3 = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlite-vec = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
