@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use ts_rs::TS;
 
 /// Synthetic events appended per transaction: large enough to amortize the
 /// FULL-sync commit, small enough to keep memory flat at 1M events.
@@ -39,7 +40,7 @@ impl RuntimeIdentity {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, TS)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProjectCreateInput {
     pub path: String,
@@ -53,81 +54,104 @@ fn default_template() -> String {
     "generic".to_owned()
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, TS)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProjectPathInput {
     pub path: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, TS)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProjectExportInput {
     pub path: String,
     pub out: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, TS)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProjectSeedInput {
     pub path: String,
+    #[ts(type = "number")]
     pub event_count: u64,
     #[serde(default)]
+    #[ts(type = "number")]
     pub seed: u64,
 }
 
-#[derive(Serialize)]
+// Wire counters are `u64` in Rust and `number` in TypeScript: JSON carries
+// them as plain numbers, and every counter here stays far below 2^53 at any
+// plausible project scale (the 1M-event §18 target is ~2^20).
+#[derive(Serialize, TS)]
 #[serde(rename_all = "camelCase")]
-struct ProjectCreateReport {
+pub(crate) struct ProjectCreateReport {
     path: String,
     project_id: String,
     name: String,
     template: String,
+    #[ts(type = "number")]
     head_seq: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 #[serde(rename_all = "camelCase")]
-struct ProjectInspectReport {
+pub(crate) struct ProjectInspectReport {
     path: String,
     project_id: String,
     format_version: u32,
     template: String,
+    #[ts(type = "number")]
     created_ts_ms: u64,
     name: Option<String>,
+    #[ts(type = "number")]
     event_count: u64,
+    #[ts(type = "number")]
     head_seq: u64,
+    #[ts(type = "number")]
     snapshot_count: u64,
+    #[ts(type = "number | null")]
     latest_snapshot_seq: Option<u64>,
+    #[ts(type = "number")]
     snapshot_cadence_events: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 #[serde(rename_all = "camelCase")]
-struct ProjectVerifyReport {
+pub(crate) struct ProjectVerifyReport {
     clean: bool,
+    #[ts(type = "number")]
     events_replayed: u64,
+    #[ts(type = "number")]
     applied_seq: u64,
+    #[ts(type = "number")]
     head_seq: u64,
     mismatched_tables: Vec<String>,
+    #[ts(type = "number")]
     cas_blob_count: u64,
+    #[ts(type = "number")]
     cas_corrupt_count: u64,
+    #[ts(type = "number")]
     cas_misplaced_count: u64,
+    #[ts(type = "number")]
     cas_temp_leftover_count: u64,
     cas_defect_paths: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 #[serde(rename_all = "camelCase")]
-struct ProjectExportReport {
+pub(crate) struct ProjectExportReport {
     out: String,
+    #[ts(type = "number")]
     event_count: u64,
+    #[ts(type = "number")]
     blob_count: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 #[serde(rename_all = "camelCase")]
-struct ProjectSeedReport {
+pub(crate) struct ProjectSeedReport {
+    #[ts(type = "number")]
     appended: u64,
+    #[ts(type = "number")]
     head_seq: u64,
 }
 
@@ -344,6 +368,31 @@ pub(crate) fn seed_synthetic(
     let head = log.head().map_err(log_error)?;
     to_json(&ProjectSeedReport {
         appended,
+        head_seq: head.value(),
+    })
+}
+
+/// What `project.open` learns by actually opening the directory: identity and
+/// shape, no cached handle. The session table stores this; every later
+/// operation re-opens the store so writer discipline stays with SQLite.
+pub(crate) struct SessionOpen {
+    pub project_id: ProjectId,
+    pub name: Option<String>,
+    pub template: String,
+    pub format_version: u32,
+    pub head_seq: u64,
+}
+
+pub(crate) fn open_for_session(root: &Path) -> Result<SessionOpen, ApiError> {
+    let log = open_log(root)?;
+    let manifest = log.store().manifest().clone();
+    let head = log.head().map_err(log_error)?;
+    let name = read_project_name(&log, manifest.project_id)?;
+    Ok(SessionOpen {
+        project_id: manifest.project_id,
+        name,
+        template: manifest.template,
+        format_version: manifest.format_version,
         head_seq: head.value(),
     })
 }

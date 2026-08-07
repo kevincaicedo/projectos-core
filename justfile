@@ -4,7 +4,7 @@ default:
     @just --list
 
 # Everything CI runs. Green here before presenting any change as done (AGENTS.md).
-ci: node-version-check fmt-check clippy test deny dep-dag discipline core-boundaries capability-catalog-check snapshot-fixture-check release-signing-check public-build-bootstrap ui-check ui-build e2e desktop-check
+ci: node-version-check fmt-check clippy test deny dep-dag discipline core-boundaries capability-catalog-check api-types-check snapshot-fixture-check release-signing-check public-build-bootstrap ui-check ui-build e2e desktop-check
     @echo "ci: all green"
 
 node-version-check:
@@ -58,6 +58,15 @@ public-build-bootstrap:
 
 generate-capabilities:
     cargo run --quiet -p pos-api --bin export-capabilities -- --write apps/ui/src/api/gen/capabilities.ts
+
+# The UI API types are ts-rs-generated from the pos-api wire structs (m0-s06).
+# `--check` regenerates into a scratch tree and diffs, so CI fails on drift
+# without touching the checkout.
+generate-api-types:
+    cargo run --quiet -p pos-api --bin export-api-types -- --write apps/ui/src/api/gen/api
+
+api-types-check:
+    cargo run --quiet -p pos-api --bin export-api-types -- --check apps/ui/src/api/gen/api
 
 # The e2e fixture is the real runtime's own stdout, so UI/runtime wire drift
 # fails here instead of in front of a user.

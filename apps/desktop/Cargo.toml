@@ -17,5 +17,8 @@ workspace = true
 pos-api = { path = "../../crates/pos-api" }
 tauri.workspace = true
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [build-dependencies]
 tauri-build.workspace = true

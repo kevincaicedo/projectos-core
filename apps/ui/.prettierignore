@@ -1,0 +1,4 @@
+# Generated code is byte-controlled by its Rust generators and their CI
+# staleness checks (export-capabilities, export-api-types); prettier must not
+# introduce a second formatting authority over the same bytes.
+src/api/gen/

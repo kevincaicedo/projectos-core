@@ -9,4 +9,12 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-pos-api = { path = "../../crates/pos-api" }
+# The shell depends on pos-api only (L12); the HTTP+SSE transport itself
+# lives behind the pos-api `http` feature, so this binary is thin dispatch.
+pos-api = { path = "../../crates/pos-api", features = ["http"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros"] }
+
+[dev-dependencies]
+# The contract suite speaks HTTP/1.1 over a real socket with std TcpStream,
+# so no HTTP client joins the dependency tree for tests.
+tempfile = { workspace = true }

@@ -11,9 +11,20 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "http")]
+pub mod http;
 mod project_ops;
+mod session;
+mod stream;
+mod ts_export;
 
 pub use project_ops::{ProjectCreateInput, ProjectExportInput, ProjectPathInput, ProjectSeedInput};
+pub use session::{HealthReport, OPEN_PROJECT_COUNT_MAX, OpenProjectRow, ProjectListReport};
+pub use stream::{
+    ResumeWindow, SSE_RETRY_MS, STREAM_RESUME_WINDOW_LEN, StreamFrame, parse_resume_cursor,
+    sse_body,
+};
+pub use ts_export::{check_typescript_api, write_typescript_api};
 
 use pos_capabilities::{
     AccountId, CAPABILITY_TRAIT_VERSION, CapabilityMode, CapabilityRegistry, ConnectorHostRequest,
@@ -29,7 +40,9 @@ use std::task::{Context, Poll, Waker};
 /// Version of the query/command names and their result shapes. A shape change
 /// without a bump is what the m0-s06 contract suite exists to catch.
 /// v2: m0-s05 adds the project operations (create/inspect/verify/export/seed).
-pub const API_SURFACE_VERSION: u16 = 2;
+/// v3: m0-s06 adds the session surface (`project.open`/`project.list`/
+/// `health`), the run/job/cost registry entries, and the stream surface.
+pub const API_SURFACE_VERSION: u16 = 3;
 
 /// Bounded item budget for the M0 connector-host liveness tick (L8). The socket
 /// itself caps this at 32; the runtime asks for less than it is allowed.
@@ -52,14 +65,26 @@ pub enum QueryName {
     ProjectInspect,
     /// Re-derives projections against the log + CAS integrity sweep (m0-s05).
     ProjectVerify,
+    /// Projects this runtime session has opened (m0-s06).
+    ProjectList,
+    /// Job queue rows — registered now, implemented by pos-sched (m0-s14).
+    JobList,
+    /// Model-call cost rollup — implemented by the pos-gateway ledger (m0-s10).
+    CostRollup,
+    /// Liveness + version identity of this runtime process (m0-s06).
+    Health,
 }
 
 impl QueryName {
-    pub const COUNT: usize = 3;
+    pub const COUNT: usize = 7;
     pub const ALL: [Self; Self::COUNT] = [
         Self::CapabilitySnapshot,
         Self::ProjectInspect,
         Self::ProjectVerify,
+        Self::ProjectList,
+        Self::JobList,
+        Self::CostRollup,
+        Self::Health,
     ];
 
     #[must_use]
@@ -68,6 +93,10 @@ impl QueryName {
             Self::CapabilitySnapshot => "capability.snapshot",
             Self::ProjectInspect => "project.inspect",
             Self::ProjectVerify => "project.verify",
+            Self::ProjectList => "project.list",
+            Self::JobList => "job.list",
+            Self::CostRollup => "cost.rollup",
+            Self::Health => "health",
         }
     }
 
@@ -90,14 +119,27 @@ pub enum CommandName {
     /// Deterministic synthetic seeding — test/bench scaffolding shared with
     /// `pos-bench` (m0-s05/m0-s16), honest and documented, not a demo trick.
     ProjectSeedSynthetic,
+    /// Opens (validates) a project directory into the session table (m0-s06).
+    ProjectOpen,
+    /// Run lifecycle — registered now so the surface, contract rows, and
+    /// transports are frozen; implemented by the agent harness (m0-s12/s13).
+    RunStart,
+    RunCancel,
+    RunPause,
+    RunResume,
 }
 
 impl CommandName {
-    pub const COUNT: usize = 3;
+    pub const COUNT: usize = 8;
     pub const ALL: [Self; Self::COUNT] = [
         Self::ProjectCreate,
         Self::ProjectExport,
         Self::ProjectSeedSynthetic,
+        Self::ProjectOpen,
+        Self::RunStart,
+        Self::RunCancel,
+        Self::RunPause,
+        Self::RunResume,
     ];
 
     #[must_use]
@@ -106,6 +148,11 @@ impl CommandName {
             Self::ProjectCreate => "project.create",
             Self::ProjectExport => "project.export",
             Self::ProjectSeedSynthetic => "project.seed-synthetic",
+            Self::ProjectOpen => "project.open",
+            Self::RunStart => "run.start",
+            Self::RunCancel => "run.cancel",
+            Self::RunPause => "run.pause",
+            Self::RunResume => "run.resume",
         }
     }
 
@@ -117,9 +164,38 @@ impl CommandName {
     }
 }
 
+/// Every live item stream in the v0 surface. Streams share the command/query
+/// registry discipline: a new variant without a contract row fails the suite.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
+pub enum StreamName {
+    /// Live run steps over SSE — framing frozen here (m0-s06); items arrive
+    /// with the echo agent (m0-s13).
+    RunSteps,
+}
+
+impl StreamName {
+    pub const COUNT: usize = 1;
+    pub const ALL: [Self; Self::COUNT] = [Self::RunSteps];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RunSteps => "run.steps",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|stream| stream.as_str() == name)
+    }
+}
+
 /// The typed error envelope every transport returns unchanged.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, ts_rs::TS)]
+#[ts(rename = "ApiErrorEnvelope")]
 pub struct ApiError {
+    #[ts(type = "string")]
     pub code: &'static str,
     pub message: String,
     pub retriable: bool,
@@ -141,6 +217,29 @@ impl ApiError {
         Self {
             code: "unknown_command",
             message: format!("no command is registered under the name {name:?}"),
+            retriable: false,
+        }
+    }
+
+    #[must_use]
+    pub fn unknown_stream(name: &str) -> Self {
+        Self {
+            code: "unknown_stream",
+            message: format!("no stream is registered under the name {name:?}"),
+            retriable: false,
+        }
+    }
+
+    /// The honest answer for a surface entry whose engine lands in a later
+    /// story (capability-honesty pattern): registered, typed, and explicit
+    /// about what implements it — never a fake empty success.
+    #[must_use]
+    pub fn not_yet_supported(operation: &str, arrives_with: &str) -> Self {
+        Self {
+            code: "not_yet_supported",
+            message: format!(
+                "{operation} is registered but not implemented yet; it lands with {arrives_with}"
+            ),
             retriable: false,
         }
     }
@@ -186,6 +285,7 @@ pub struct LocalRuntime {
     capabilities: CapabilityRegistry,
     identity: project_ops::RuntimeIdentity,
     clock: SystemWallClock,
+    open_projects: session::OpenProjects,
 }
 
 impl LocalRuntime {
@@ -216,6 +316,19 @@ impl LocalRuntime {
             Some(QueryName::ProjectVerify) => {
                 project_ops::verify(&project_ops::parse_input(input_json)?)
             }
+            Some(QueryName::ProjectList) => self.open_projects.list(),
+            Some(QueryName::Health) => self.health_json(),
+            // Registered-but-later entries answer honestly instead of faking
+            // an empty success; their input contracts belong to the stories
+            // that implement the engines, so input is deliberately unparsed.
+            Some(QueryName::JobList) => Err(ApiError::not_yet_supported(
+                "job.list",
+                "the pos-sched job queue (m0-s14)",
+            )),
+            Some(QueryName::CostRollup) => Err(ApiError::not_yet_supported(
+                "cost.rollup",
+                "the pos-gateway cost ledger (m0-s10)",
+            )),
             None => Err(ApiError::unknown_query(name)),
         }
     }
@@ -234,8 +347,55 @@ impl LocalRuntime {
             Some(CommandName::ProjectSeedSynthetic) => {
                 project_ops::seed_synthetic(&self.clock, &project_ops::parse_input(input_json)?)
             }
+            Some(CommandName::ProjectOpen) => self.open_projects.open(
+                &self.identity,
+                &self.clock,
+                &project_ops::parse_input(input_json)?,
+            ),
+            Some(
+                CommandName::RunStart
+                | CommandName::RunCancel
+                | CommandName::RunPause
+                | CommandName::RunResume,
+            ) => Err(ApiError::not_yet_supported(
+                name,
+                "the agent harness (m0-s12/m0-s13)",
+            )),
             None => Err(ApiError::unknown_command(name)),
         }
+    }
+
+    /// Subscribes to a stream, optionally resuming after a client-presented
+    /// cursor, and returns the frames currently replayable. Live tailing
+    /// arrives with the first real stream producer (m0-s13); the framing and
+    /// resume semantics are frozen now so that story changes no transport.
+    pub fn stream_subscribe(
+        &self,
+        name: &str,
+        _input_json: &str,
+        resume_after: Option<u64>,
+    ) -> Result<Vec<StreamFrame>, ApiError> {
+        let _ = resume_after;
+        match StreamName::parse(name) {
+            Some(StreamName::RunSteps) => Err(ApiError::not_yet_supported(
+                "run.steps",
+                "the echo-agent run feed (m0-s13)",
+            )),
+            None => Err(ApiError::unknown_stream(name)),
+        }
+    }
+
+    /// Liveness with version identity — real values read from this process,
+    /// nothing hard-coded about runtime state.
+    fn health_json(&self) -> Result<String, ApiError> {
+        let count = u32::try_from(self.open_projects.count()).unwrap_or(u32::MAX); // INVARIANT: the session table is capped at OPEN_PROJECT_COUNT_MAX (64).
+        input_json(&HealthReport {
+            status: "ok",
+            api_surface_version: API_SURFACE_VERSION,
+            capability_trait_version: CAPABILITY_TRAIT_VERSION,
+            format_version: pos_store::FORMAT_VERSION,
+            open_project_count: count,
+        })
     }
 
     /// Renders the live registry state the UI renders (m0-s17 capability
@@ -387,6 +547,7 @@ pub fn bootstrap_local_runtime(config: LocalBootstrapConfig) -> LocalRuntime {
         }),
         identity: project_ops::RuntimeIdentity::bootstrap(),
         clock: SystemWallClock,
+        open_projects: session::OpenProjects::default(),
     }
 }
 

@@ -46,8 +46,8 @@ jobs:
       - name: Rust, policy, and public-build bootstrap through just
         run: >-
           just fmt-check clippy test dep-dag discipline core-boundaries
-          capability-catalog-check snapshot-fixture-check release-signing-check
-          public-build-bootstrap
+          capability-catalog-check api-types-check snapshot-fixture-check
+          release-signing-check public-build-bootstrap
       - name: Frozen capability seam (m0-s17)
         if: github.event_name == 'pull_request'
         env:
