@@ -4,6 +4,7 @@
 // server placement path handed out at sign-in.
 
 import { useRef, useState } from "react";
+import { isDesktopShell, pickProjectDirectory } from "../api/shell";
 import { apiCommand, type DispatchOutcome } from "../api/transport";
 
 interface ProjectActionsProps {
@@ -23,12 +24,24 @@ export function ProjectActions({ onChanged, focusToken }: ProjectActionsProps) {
     setTimeout(() => inputRef.current?.focus(), 0);
   }
 
-  const dispatch = (verb: "project.create" | "project.open") => {
-    const input = JSON.stringify({ path });
+  const dispatch = (verb: "project.create" | "project.open", chosen?: string) => {
+    const input = JSON.stringify({ path: chosen ?? path });
     void apiCommand(verb, input).then((result) => {
       setOutcome({ verb, result });
       if (result.kind === "ok") {
         onChanged();
+      }
+    });
+  };
+
+  // The native dialog feeds the same command as the typed path, so the two
+  // entry points cannot diverge. On web the picker returns null and the
+  // button is absent — the typed field is the browser's honest equivalent.
+  const browse = (verb: "project.create" | "project.open") => {
+    void pickProjectDirectory(verb === "project.create" ? "create" : "open").then((chosen) => {
+      if (chosen !== null) {
+        setPath(chosen);
+        dispatch(verb, chosen);
       }
     });
   };
@@ -70,7 +83,19 @@ export function ProjectActions({ onChanged, focusToken }: ProjectActionsProps) {
           }}
         >
           Open
-        </button>
+        </button>{" "}
+        {isDesktopShell() && (
+          <button
+            type="button"
+            className="button-outline"
+            data-native-browse
+            onClick={() => {
+              browse("project.open");
+            }}
+          >
+            Browse…
+          </button>
+        )}
       </p>
       {outcome !== null && <Outcome verb={outcome.verb} result={outcome.result} />}
     </section>

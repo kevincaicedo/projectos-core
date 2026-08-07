@@ -25,6 +25,11 @@ exceptions = [
     { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
     { crate = "selectors@0.36.1", allow = ["MPL-2.0"] },
     { crate = "target-lexicon@0.12.16", allow = ["Apache-2.0 WITH LLVM-exception"] },
+    # m0-s07's tray reaches libappindicator-sys → libloading. ISC is inside the
+    # policy's Apache-2.0-compatible permissive set (same standing as the
+    # BSD clauses above); it is pinned per-version rather than allow-listed
+    # blanket so a graph change reopens the review.
+    { crate = "libloading@0.7.4", allow = ["ISC"] },
 ]
 
 [bans]

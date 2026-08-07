@@ -19,6 +19,21 @@ declare global {
       readonly core?: {
         readonly invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>;
       };
+      // Native dialogs and menu events (m0-s07). Present only in the Tauri
+      // webview; `src/api/shell.ts` degrades to no-ops without them.
+      readonly dialog?: {
+        readonly open: (options: {
+          directory?: boolean;
+          multiple?: boolean;
+          title?: string;
+        }) => Promise<unknown>;
+      };
+      readonly event?: {
+        readonly listen: <T>(
+          name: string,
+          handler: (event: { payload: T }) => void,
+        ) => Promise<() => void>;
+      };
     };
   }
 }

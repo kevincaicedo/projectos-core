@@ -16,6 +16,12 @@ workspace = true
 [dependencies]
 pos-api = { path = "../../crates/pos-api" }
 tauri.workspace = true
+tauri-plugin-dialog.workspace = true
+tauri-plugin-single-instance.workspace = true
+# The shell's own config file (recent projects) and the menu/IPC payloads it
+# renders; no project data passes through these.
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

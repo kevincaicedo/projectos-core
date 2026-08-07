@@ -10,7 +10,11 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 const SOURCE_ROOT = "src";
-const TRANSPORT_MODULE = join("src", "api", "transport.ts");
+// The two allowlisted modules: transport selection and the desktop-shell
+// surface (native dialogs, menu events, app-config recents). Both are
+// *capability* access, not domain logic — everything they expose degrades to
+// an honest no-op on web, so no feature works in one shell and not the other.
+const PLATFORM_MODULES = [join("src", "api", "transport.ts"), join("src", "api", "shell.ts")];
 const GENERATED_PREFIX = join("src", "api", "gen");
 
 const PLATFORM_MARKERS = [/__TAURI__/, /\bisTauri\b/, /navigator\.userAgent/, /__POS_PLATFORM/];
@@ -18,7 +22,7 @@ const PLATFORM_MARKERS = [/__TAURI__/, /\bisTauri\b/, /navigator\.userAgent/, /_
 const defects = [];
 
 function audit(path, text) {
-  if (path === TRANSPORT_MODULE) {
+  if (PLATFORM_MODULES.includes(path)) {
     return;
   }
   for (const [index, line] of text.split("\n").entries()) {

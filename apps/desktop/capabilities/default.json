@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-window",
-  "description": "Minimum permissions for the ProjectOS main window bootstrap.",
+  "description": "Minimum permissions for the ProjectOS main window: core defaults plus the native directory picker the project create/open flow needs (m0-s07). No filesystem, shell, or HTTP permission is granted — every project operation goes through the pos-api IPC commands, which are the audited seam.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:allow-open"]
 }

@@ -58,8 +58,12 @@ serde_json = "1"
 # C-source packaging (missing sqlite-vec-diskann.c) as of 2026-08.
 sqlite-vec = "=0.1.9"
 syn = { version = "3", features = ["full", "visit"] }
-tauri = "=2.11.5"
+tauri = { version = "=2.11.5", features = ["tray-icon"] }
 tauri-build = "=2.6.3"
+# Desktop lifecycle plugins (m0-s07). Pinned exactly like the Tauri core they
+# version with.
+tauri-plugin-dialog = "=2.7.2"
+tauri-plugin-single-instance = "=2.4.3"
 tempfile = "3"
 # tokio is the §20 async-runtime decision; features stay minimal per consumer.
 tokio = { version = "1", default-features = false }

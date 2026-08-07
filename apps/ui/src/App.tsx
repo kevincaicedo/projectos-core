@@ -3,9 +3,11 @@
 // palette. View state only lives here (selection, palette, notices); domain
 // state arrives by query and is reconciled by refetching, never forked.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { asHealthReport, asProjectListReport } from "./api/projects";
 import { useApiQuery } from "./api/query";
+import { onShellCommand, shellRecents } from "./api/shell";
+import { apiCommand } from "./api/transport";
 import { Palette } from "./palette/Palette";
 import { paletteCommands, type PaletteActions } from "./palette/registry";
 import {
@@ -48,6 +50,10 @@ export function App() {
     projects.refetch();
     health.refetch();
   }, [projects, health]);
+  // The launch-restore effect runs once and must not re-subscribe whenever
+  // the query hooks re-create their callbacks; a ref keeps it stable.
+  const reconcileRef = useRef(reconcile);
+  reconcileRef.current = reconcile;
 
   const actions: PaletteActions = useMemo(
     () => ({
@@ -101,6 +107,40 @@ export function App() {
       window.removeEventListener("keydown", onKeyDown);
     };
   }, []);
+
+  // Relaunch restore (m0-s07): the desktop shell remembers the last project
+  // in its own app config; opening it goes through the same command any
+  // other entry point uses, so a project that no longer opens surfaces its
+  // typed error instead of a phantom selection. Web returns nothing here.
+  useEffect(() => {
+    void shellRecents().then((recents) => {
+      if (recents.lastOpen === null) {
+        return;
+      }
+      void apiCommand("project.open", JSON.stringify({ path: recents.lastOpen })).then(
+        (outcome) => {
+          if (outcome.kind === "ok") {
+            reconcileRef.current();
+          }
+        },
+      );
+    });
+  }, []);
+
+  // Native menu selections drive the same handlers the palette does.
+  useEffect(
+    () =>
+      onShellCommand((id) => {
+        if (id === "shell.palette") {
+          setPaletteOpen((open) => !open);
+        } else if (id === "shell.theme") {
+          setTheme(nextTheme);
+        } else if (id === "project.create" || id === "project.open") {
+          setFocusToken((token) => token + 1);
+        }
+      }),
+    [],
+  );
 
   return (
     <div className="shell">
