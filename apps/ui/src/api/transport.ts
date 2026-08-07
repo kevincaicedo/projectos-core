@@ -25,6 +25,112 @@ declare global {
 
 export type TransportName = "tauri-ipc" | "http";
 
+/// The generic dispatch result: raw registry bytes (already parsed) or the
+/// typed envelope. Screens narrow `value` through their own validators —
+/// an unrecognised shape renders as an error, never as content.
+export type DispatchOutcome =
+  | { readonly kind: "ok"; readonly transport: TransportName; readonly value: unknown }
+  | {
+      readonly kind: "failed";
+      readonly transport: TransportName;
+      readonly error: ApiErrorEnvelope;
+    };
+
+/// Dispatches a registry query over whichever transport this shell has.
+export async function apiQuery(name: string, inputJson?: string): Promise<DispatchOutcome> {
+  if (activeTransport() === "tauri-ipc") {
+    return invokeIpc("api_query", {
+      name,
+      ...(inputJson === undefined ? {} : { input: inputJson }),
+    });
+  }
+  const query = inputJson === undefined ? "" : `?input=${encodeURIComponent(inputJson)}`;
+  return fetchHttp(`/api/query/${name}${query}`, { headers: { accept: "application/json" } });
+}
+
+/// Dispatches a registry command. After a command resolves, callers refetch
+/// affected queries — reconciliation is re-reading the runtime's truth,
+/// never keeping a forked local copy of it (L1 in the browser).
+export async function apiCommand(name: string, inputJson: string): Promise<DispatchOutcome> {
+  if (activeTransport() === "tauri-ipc") {
+    return invokeIpc("api_command", { name, input: inputJson });
+  }
+  return fetchHttp(`/api/cmd/${name}`, {
+    method: "POST",
+    headers: { accept: "application/json", "content-type": "application/json" },
+    body: inputJson,
+  });
+}
+
+async function invokeIpc(command: string, args: Record<string, unknown>): Promise<DispatchOutcome> {
+  const invoke = window.__TAURI__?.core?.invoke;
+  if (invoke === undefined) {
+    return {
+      kind: "failed",
+      transport: "tauri-ipc",
+      error: {
+        code: "transport_unavailable",
+        message: "The IPC bridge disappeared.",
+        retriable: true,
+      },
+    };
+  }
+  try {
+    const raw = await invoke(command, args);
+    return decodeDispatch("tauri-ipc", typeof raw === "string" ? raw : null);
+  } catch (thrown: unknown) {
+    return decodeDispatchFailure("tauri-ipc", thrown);
+  }
+}
+
+async function fetchHttp(target: string, init: RequestInit): Promise<DispatchOutcome> {
+  let response: Response;
+  try {
+    response = await fetch(target, init);
+  } catch {
+    return {
+      kind: "failed",
+      transport: "http",
+      error: {
+        code: "transport_unavailable",
+        message: "No ProjectOS server answered this page.",
+        retriable: true,
+      },
+    };
+  }
+  const body = await response.text();
+  return response.ok ? decodeDispatch("http", body) : decodeDispatchFailure("http", body);
+}
+
+function decodeDispatch(transport: TransportName, raw: string | null): DispatchOutcome {
+  const value = raw === null ? null : parseJson(raw);
+  if (value === null) {
+    return {
+      kind: "failed",
+      transport,
+      error: {
+        code: "malformed_result",
+        message: "The runtime returned bytes this build does not recognise.",
+        retriable: false,
+      },
+    };
+  }
+  return { kind: "ok", transport, value };
+}
+
+function decodeDispatchFailure(transport: TransportName, raw: unknown): DispatchOutcome {
+  const envelope = asErrorEnvelope(parseJson(typeof raw === "string" ? raw : ""));
+  return {
+    kind: "failed",
+    transport,
+    error: envelope ?? {
+      code: "transport_failed",
+      message: "The runtime failed without a typed error envelope.",
+      retriable: true,
+    },
+  };
+}
+
 export type SnapshotOutcome =
   | {
       readonly kind: "ok";
@@ -37,80 +143,30 @@ export type SnapshotOutcome =
       readonly error: ApiErrorEnvelope;
     };
 
-// The HTTP transport lands with pos-server in m0-s08. Until then a browser
-// build reports the honest failure instead of rendering invented state.
-const QUERY_PATH = `/api/query/${CAPABILITY_SNAPSHOT_QUERY}`;
-
 export function activeTransport(): TransportName {
   return typeof window.__TAURI__?.core?.invoke === "function" ? "tauri-ipc" : "http";
 }
 
+/// The capability snapshot rides the same dispatcher as every other query;
+/// only its validator is specific. A shape the generated catalog does not
+/// know about becomes an error, never a card.
 export async function fetchCapabilitySnapshot(): Promise<SnapshotOutcome> {
-  return activeTransport() === "tauri-ipc" ? fetchOverIpc() : fetchOverHttp();
-}
-
-async function fetchOverIpc(): Promise<SnapshotOutcome> {
-  const invoke = window.__TAURI__?.core?.invoke;
-  if (invoke === undefined) {
-    return transportFailure("tauri-ipc", "transport_unavailable", "The IPC bridge disappeared.");
+  const outcome = await apiQuery(CAPABILITY_SNAPSHOT_QUERY);
+  if (outcome.kind === "failed") {
+    return outcome;
   }
-  try {
-    const raw = await invoke("api_query", { name: CAPABILITY_SNAPSHOT_QUERY });
-    return decodeSuccess("tauri-ipc", raw);
-  } catch (thrown: unknown) {
-    // A rejected Tauri command carries the pos-api error envelope as its value.
-    return decodeFailure("tauri-ipc", thrown);
-  }
-}
-
-async function fetchOverHttp(): Promise<SnapshotOutcome> {
-  let response: Response;
-  try {
-    response = await fetch(QUERY_PATH, { headers: { accept: "application/json" } });
-  } catch {
-    return transportFailure(
-      "http",
-      "transport_unavailable",
-      "No ProjectOS server answered this page; the web transport arrives with pos-server in m0-s08.",
-    );
-  }
-  const body = await response.text();
-  return response.ok ? decodeSuccess("http", body) : decodeFailure("http", body);
-}
-
-function decodeSuccess(transport: TransportName, raw: unknown): SnapshotOutcome {
-  if (typeof raw !== "string") {
-    return transportFailure(transport, "malformed_result", "The transport returned a non-string.");
-  }
-  const snapshot = asSnapshot(parseJson(raw));
-  if (snapshot === null) {
-    return transportFailure(
-      transport,
-      "malformed_result",
-      "The runtime returned a shape this build does not recognise.",
-    );
-  }
-  return { kind: "ok", transport, snapshot };
-}
-
-function decodeFailure(transport: TransportName, raw: unknown): SnapshotOutcome {
-  const envelope = asErrorEnvelope(parseJson(typeof raw === "string" ? raw : ""));
-  if (envelope === null) {
-    return transportFailure(
-      transport,
-      "transport_failed",
-      "The runtime failed without a typed error envelope.",
-    );
-  }
-  return { kind: "failed", transport, error: envelope };
-}
-
-function transportFailure(
-  transport: TransportName,
-  code: string,
-  message: string,
-): SnapshotOutcome {
-  return { kind: "failed", transport, error: { code, message, retriable: true } };
+  const snapshot = asSnapshot(outcome.value);
+  return snapshot === null
+    ? {
+        kind: "failed",
+        transport: outcome.transport,
+        error: {
+          code: "malformed_result",
+          message: "The runtime returned a shape this build does not recognise.",
+          retriable: false,
+        },
+      }
+    : { kind: "ok", transport: outcome.transport, snapshot };
 }
 
 function parseJson(raw: string): unknown {

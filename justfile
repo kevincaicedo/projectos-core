@@ -92,11 +92,14 @@ package key_path:
 verify-package identity allowed_signers:
     @bash scripts/verify-release.sh target/release/bundle {{identity}} {{allowed_signers}}
 
-# UI checks: typecheck + lint + format. Requires `pnpm install` once (corepack).
+# UI checks: typecheck + lint + format + the m0-s09 design/parity audits
+# (each ships its own seeded violation fixture). Requires `pnpm install` once.
 ui-check: node-version-check
     pnpm --dir apps/ui exec tsc --noEmit
     pnpm --dir apps/ui lint
     pnpm --dir apps/ui boundary:fixture
+    pnpm --dir apps/ui design:audit
+    pnpm --dir apps/ui parity:grep
     pnpm --dir apps/ui format:check
 
 ui-build: node-version-check

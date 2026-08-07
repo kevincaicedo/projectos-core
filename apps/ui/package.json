@@ -9,6 +9,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint src scripts",
     "boundary:fixture": "node scripts/check-generated-type-fixture.mjs",
+    "design:audit": "node scripts/check-design-tokens.mjs",
+    "parity:grep": "node scripts/check-shell-parity.mjs",
     "e2e": "playwright test",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\" \"scripts/**/*.mjs\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\" \"scripts/**/*.mjs\""

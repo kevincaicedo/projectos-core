@@ -1,0 +1,170 @@
+/*
+ * Design tokens (m0-s09) — the single source for every surface, implementing
+ * doc 06 §2 (color/type/shape) and §4 (motion). Components consume tokens
+ * only; a raw color or an unnamed animation elsewhere in src/ fails
+ * scripts/check-ui-discipline.mjs.
+ *
+ * Light is the reference theme (06 §2.1). The dark block below is the token
+ * swap the same roles derive to — shipped now so the manual toggle and
+ * prefers-color-scheme path exist from M0; the design-reviewed dark theme is
+ * owned by M3 (settings surface) and replaces only these values, never
+ * component styles.
+ */
+
+:root {
+  /* -- 06 §2.1 color ---------------------------------------------------- */
+  --surface-paper: #f2f1ec;
+  --surface-card: #ffffff;
+  --surface-raised: #fbfaf7;
+  --surface-raised-alt: #fcfbf8;
+  --ink-primary: #171a19;
+  --ink-deep: #14231b;
+  --ink-secondary: #3d423f;
+  --ink-secondary-soft: #5d6462;
+  --ink-muted: #8e9491;
+  --ink-muted-soft: #a8ada9;
+  --ink-muted-faint: #b0b4b1;
+  --accent-green: #1e6b4b;
+  --accent-green-tint: #e9f1ea;
+  --accent-green-tint-strong: #c7dfce;
+  --accent-green-tint-deep: #a9cdb4;
+  --accent-green-fill: #5c8c71;
+  --accent-live: #d6ee9a;
+  --signal-amber: #b87333;
+  --signal-amber-bg: #f6ebdd;
+  --signal-amber-bg-soft: #fbf7f1;
+  --signal-amber-border: #ebd9c2;
+  --signal-clay: #a9503c;
+  --signal-clay-bg: #f7e7e3;
+  --line-default: #eae8e1;
+  --line-soft: #efede7;
+  --line-strong: #e6e4dd;
+  --neutral-idle: #d8d5cc;
+  --neutral-idle-deep: #cbc8be;
+
+  /* -- 06 §2.2 typography ------------------------------------------------ */
+  /* Font asset files land with the design productization pass (M2/M3);   */
+  /* the stacks are the token contract and fall back per 06 §2.2.         */
+  --type-ui: "Instrument Sans", system-ui, sans-serif;
+  --type-data: "JetBrains Mono", ui-monospace, monospace;
+  --size-micro: 10px;
+  --size-meta: 12px;
+  --size-body: 14px;
+  --size-card-title: 15.5px;
+  --size-headline: 27px;
+  --leading-body: 1.6;
+  --leading-headline: 1.24;
+  --tracking-heading: -0.015em;
+  --tracking-micro: 0.12em;
+
+  /* -- 06 §2.3 shape, depth, spacing ------------------------------------ */
+  --radius-chip: 7px;
+  --radius-control: 10px;
+  --radius-card: 15px;
+  --radius-stage: 21px;
+  --shadow-card: 0 1px 2px rgb(20 35 27 / 0.05), 0 10px 30px rgb(20 35 27 / 0.06);
+  --shadow-lift: 0 1px 2px rgb(20 35 27 / 0.07), 0 14px 30px rgb(20 35 27 / 0.1);
+  /* Scrim behind overlays: deep ink at low alpha, so the paper reads through
+     rather than going black (06 §2.3 "soft depth"). */
+  --scrim: rgb(20 35 27 / 0.28);
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-7: 28px;
+
+  /* -- 06 §3 structural grammar ----------------------------------------- */
+  --rail-width: 64px;
+  --panel-width: 268px;
+  --inspector-width: 348px;
+
+  /* -- 06 §4 motion ------------------------------------------------------ */
+  --ease-standard: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* The M3-owned dark derivation: same roles, paper→deep-ink inversion.      */
+[data-theme="dark"] {
+  --surface-paper: #131715;
+  --surface-card: #1b201d;
+  --surface-raised: #171c19;
+  --surface-raised-alt: #181d1a;
+  --ink-primary: #edefec;
+  --ink-deep: #e9f1ea;
+  --ink-secondary: #c2c7c3;
+  --ink-secondary-soft: #a4aaa6;
+  --ink-muted: #7d837f;
+  --ink-muted-soft: #6a706c;
+  --ink-muted-faint: #5d635f;
+  --accent-green-tint: #1d2f26;
+  --accent-green-tint-strong: #27453a;
+  --accent-green: #4f9c77;
+  --line-default: #262b28;
+  --line-soft: #232826;
+  --line-strong: #2a2f2c;
+  --neutral-idle: #3a3f3c;
+  --neutral-idle-deep: #444946;
+  --signal-amber-bg: #2e2418;
+  --signal-amber-bg-soft: #292117;
+  --signal-amber-border: #4a3a26;
+  --signal-clay-bg: #33211d;
+  --shadow-card: 0 1px 2px rgb(0 0 0 / 0.4), 0 10px 30px rgb(0 0 0 / 0.35);
+  --shadow-lift: 0 1px 2px rgb(0 0 0 / 0.45), 0 14px 30px rgb(0 0 0 / 0.4);
+  --scrim: rgb(0 0 0 / 0.5);
+}
+
+/* -- 06 §4 motion grammar: the named set. Nothing else animates. -------- */
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slide {
+  from {
+    opacity: 0;
+    transform: translateX(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes stage {
+  from {
+    opacity: 0;
+    transform: translateY(18px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.04);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    /* The grammar's stated fallback: opacity fades only (06 §4). */
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
