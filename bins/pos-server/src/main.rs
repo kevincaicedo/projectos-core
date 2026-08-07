@@ -1,35 +1,50 @@
 //! # pos-server
 //!
-//! The web shell: axum server serving the apps/ui bundle and the pos-api
-//! HTTP+SSE transport; control.db (accounts, workspaces, RBAC), audit log.
-//!
-//! m0-s06 lands the API transport: this binary binds a listener and serves
-//! the `pos-api` router — thin dispatch, zero logic (L12). Static assets,
-//! auth v0, control.db, and the audit log land in m0-s08.
+//! The web shell binary: serves the apps/ui bundle and the pos-api HTTP+SSE
+//! transport behind auth v0, control.db RBAC, and the audit log (m0-s08).
+//! Composition lives in the library half (`web.rs`); this file is
+//! configuration, the listener, and signals.
 
 #![forbid(unsafe_code)]
 
-use pos_api::{LocalBootstrapConfig, bootstrap_local_runtime};
+use pos_server::web::{ServerConfig, ServerState, serve};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 
-/// Loopback by default: without auth (m0-s08) this process must not be
-/// reachable from another machine. The env override exists for CI harnesses,
-/// not for deployment.
+/// Loopback by default: TLS termination and non-local exposure are a reverse
+/// proxy's job (deploy story, with Litestream for control.db — documented,
+/// not built, in M0).
 const BIND_ADDR_DEFAULT: &str = "127.0.0.1:7420";
 
+/// Server state lives here unless overridden; one directory holds control.db
+/// and every workspace's project directories, so backup is one path.
+const DATA_ROOT_DEFAULT: &str = "pos-server-data";
+
 fn main() -> ExitCode {
-    let bind_addr = match resolve_bind_addr() {
+    let bind_addr: SocketAddr = match env_or("POS_SERVER_ADDR", BIND_ADDR_DEFAULT).parse() {
         Ok(addr) => addr,
-        Err(message) => {
-            eprintln!("pos-server: {message}");
+        Err(error) => {
+            eprintln!("pos-server: POS_SERVER_ADDR is not a socket address: {error}");
             return ExitCode::FAILURE;
         }
     };
-    let runtime = Arc::new(bootstrap_local_runtime(LocalBootstrapConfig::isolated(
-        "packs".into(),
-    )));
+    let config = ServerConfig {
+        data_root: PathBuf::from(env_or("POS_SERVER_DATA_DIR", DATA_ROOT_DEFAULT)),
+        ui_dist: std::env::var_os("POS_SERVER_UI_DIST")
+            .map(PathBuf::from)
+            .or_else(|| {
+                let default_dist = PathBuf::from("apps/ui/dist");
+                default_dist.is_dir().then_some(default_dist)
+            }),
+    };
+    let state = match ServerState::initialize(&config) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("pos-server: {}", error.to_json());
+            return ExitCode::FAILURE;
+        }
+    };
     let tokio_runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -47,8 +62,8 @@ fn main() -> ExitCode {
         let local = listener
             .local_addr()
             .map_err(|error| format!("local addr: {error}"))?;
-        eprintln!("pos-server: serving the pos-api transport on http://{local}");
-        pos_api::http::serve(listener, runtime, shutdown_signal())
+        eprintln!("pos-server: serving on http://{local} (auth v0, audit on)");
+        serve(listener, state, shutdown_signal())
             .await
             .map_err(|error| format!("serve: {error}"))
     });
@@ -64,10 +79,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn resolve_bind_addr() -> Result<SocketAddr, String> {
-    let text = std::env::var("POS_SERVER_ADDR").unwrap_or_else(|_| BIND_ADDR_DEFAULT.to_owned());
-    text.parse()
-        .map_err(|error| format!("POS_SERVER_ADDR {text:?} is not a socket address: {error}"))
+fn env_or(name: &str, fallback: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| fallback.to_owned())
 }
 
 /// Resolves on Ctrl-C/SIGTERM; axum then drains in-flight dispatch. A signal

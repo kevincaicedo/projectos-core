@@ -19,6 +19,9 @@ mod stream;
 mod ts_export;
 
 pub use project_ops::{ProjectCreateInput, ProjectExportInput, ProjectPathInput, ProjectSeedInput};
+// Shells construct runtimes and attribute actors through these foundation
+// types; re-exported so a shell needs no direct pos-foundation edge (L12).
+pub use pos_foundation::{SystemWallClock as FoundationClock, UserId, WallClock};
 pub use session::{HealthReport, OPEN_PROJECT_COUNT_MAX, OpenProjectRow, ProjectListReport};
 pub use stream::{
     ResumeWindow, SSE_RETRY_MS, STREAM_RESUME_WINDOW_LEN, StreamFrame, parse_resume_cursor,
@@ -266,17 +269,29 @@ impl fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
-/// Conservative local-process composition used until account/project startup
-/// configuration lands in m0-s06/m0-s08. Media and public ingress stay
+/// Conservative local-process composition. Media and public ingress stay
 /// unavailable unless a later typed configuration explicitly enables them.
 pub struct LocalBootstrapConfig {
     pack_root: PathBuf,
+    user: Option<pos_foundation::UserId>,
 }
 
 impl LocalBootstrapConfig {
     #[must_use]
     pub fn isolated(pack_root: PathBuf) -> Self {
-        Self { pack_root }
+        Self {
+            pack_root,
+            user: None,
+        }
+    }
+
+    /// Attributes appended events to this user instead of the process-local
+    /// bootstrap identity — the server shell passes each account's id so
+    /// `actor` in the log names who actually acted (m0-s08).
+    #[must_use]
+    pub fn with_user(mut self, user: pos_foundation::UserId) -> Self {
+        self.user = Some(user);
+        self
     }
 }
 
@@ -537,6 +552,10 @@ fn hex_digit(nibble: u32) -> char {
 /// startup surface before any project state exists.
 #[must_use]
 pub fn bootstrap_local_runtime(config: LocalBootstrapConfig) -> LocalRuntime {
+    let identity = match config.user {
+        Some(user) => project_ops::RuntimeIdentity::for_user(user),
+        None => project_ops::RuntimeIdentity::bootstrap(),
+    };
     LocalRuntime {
         capabilities: CapabilityRegistry::local(LocalCapabilityConfig {
             owner_account_id: AccountId::from_bytes([0; 16]),
@@ -545,7 +564,7 @@ pub fn bootstrap_local_runtime(config: LocalBootstrapConfig) -> LocalRuntime {
             ffmpeg_available: false,
             ingress_reachable: false,
         }),
-        identity: project_ops::RuntimeIdentity::bootstrap(),
+        identity,
         clock: SystemWallClock,
         open_projects: session::OpenProjects::default(),
     }

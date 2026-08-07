@@ -61,6 +61,8 @@ pub fn status_for_error_code(code: &str) -> StatusCode {
             StatusCode::NOT_FOUND
         }
         "invalid_input" => StatusCode::BAD_REQUEST,
+        "unauthenticated" => StatusCode::UNAUTHORIZED,
+        "forbidden" => StatusCode::FORBIDDEN,
         "already_exists" | "open_project_limit" | "resume_window_exceeded" | "state_mutated" => {
             StatusCode::CONFLICT
         }
@@ -84,8 +86,7 @@ async fn dispatch_command(
     State(runtime): State<Arc<LocalRuntime>>,
     body: String,
 ) -> Response {
-    let outcome = run_blocking(move || runtime.command(&name, &body)).await;
-    json_response(outcome)
+    respond_command(runtime, name, body).await
 }
 
 async fn dispatch_query(
@@ -93,9 +94,7 @@ async fn dispatch_query(
     Query(params): Query<ReadParams>,
     State(runtime): State<Arc<LocalRuntime>>,
 ) -> Response {
-    let input = params.input.unwrap_or_else(|| "{}".to_owned());
-    let outcome = run_blocking(move || runtime.query_with_input(&name, &input)).await;
-    json_response(outcome)
+    respond_query(runtime, name, params.input).await
 }
 
 async fn dispatch_stream(
@@ -111,7 +110,41 @@ async fn dispatch_stream(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
         .or(params.from);
-    let input = params.input.unwrap_or_else(|| "{}".to_owned());
+    respond_stream(runtime, name, params.input, last_event_id).await
+}
+
+/// Builds the one HTTP rendering of a command dispatch. Public so the
+/// authenticated `pos-server` routes (m0-s08) reuse the exact same bytes,
+/// statuses, and blocking discipline — transport glue exists once.
+pub async fn respond_command(
+    runtime: Arc<LocalRuntime>,
+    name: String,
+    input_json: String,
+) -> Response {
+    let outcome = run_blocking(move || runtime.command(&name, &input_json)).await;
+    json_response(outcome)
+}
+
+/// The one HTTP rendering of a query dispatch (`None` input dispatches `{}`).
+pub async fn respond_query(
+    runtime: Arc<LocalRuntime>,
+    name: String,
+    input_json: Option<String>,
+) -> Response {
+    let input = input_json.unwrap_or_else(|| "{}".to_owned());
+    let outcome = run_blocking(move || runtime.query_with_input(&name, &input)).await;
+    json_response(outcome)
+}
+
+/// The one HTTP rendering of a stream subscribe, including resume-cursor
+/// parsing and SSE framing.
+pub async fn respond_stream(
+    runtime: Arc<LocalRuntime>,
+    name: String,
+    input_json: Option<String>,
+    last_event_id: Option<String>,
+) -> Response {
+    let input = input_json.unwrap_or_else(|| "{}".to_owned());
     let outcome = run_blocking(move || {
         parse_resume_cursor(last_event_id.as_deref())
             .and_then(|cursor| runtime.stream_subscribe(&name, &input, cursor))
@@ -121,6 +154,13 @@ async fn dispatch_stream(
         Ok(frames) => response_with(StatusCode::OK, "text/event-stream", sse_body(&frames)),
         Err(error) => error_response(&error),
     }
+}
+
+/// Renders a typed envelope under its deliberate status — the shared error
+/// path for server-shell layers (auth, ACL) that refuse before dispatch.
+#[must_use]
+pub fn envelope_response(error: &ApiError) -> Response {
+    error_response(error)
 }
 
 /// Registry dispatch does file I/O, so it runs on the blocking pool. A
@@ -181,6 +221,8 @@ mod tests {
             ("unknown_stream", StatusCode::NOT_FOUND),
             ("not_a_project", StatusCode::NOT_FOUND),
             ("invalid_input", StatusCode::BAD_REQUEST),
+            ("unauthenticated", StatusCode::UNAUTHORIZED),
+            ("forbidden", StatusCode::FORBIDDEN),
             ("already_exists", StatusCode::CONFLICT),
             ("open_project_limit", StatusCode::CONFLICT),
             ("resume_window_exceeded", StatusCode::CONFLICT),

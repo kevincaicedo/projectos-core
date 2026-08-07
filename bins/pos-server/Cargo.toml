@@ -9,10 +9,19 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-# The shell depends on pos-api only (L12); the HTTP+SSE transport itself
-# lives behind the pos-api `http` feature, so this binary is thin dispatch.
+# The shell depends on pos-api only among internal crates (L12); the HTTP+SSE
+# transport itself lives behind the pos-api `http` feature, so this binary is
+# thin dispatch plus the deployment surface m0-s08 owns: auth v0, control.db,
+# RBAC, audit. Those are server-shell concerns, not domain logic.
 pos-api = { path = "../../crates/pos-api", features = ["http"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros"] }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+argon2 = { workspace = true }
+getrandom = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 # The contract suite speaks HTTP/1.1 over a real socket with std TcpStream,

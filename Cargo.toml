@@ -36,11 +36,16 @@ rust-version = "1.95"
 
 [workspace.dependencies]
 # Every entry here needs a DEPENDENCIES.md row (justification + owner + eject path).
+# The §20 auth decision: own argon2id + sessions, no auth SaaS (m0-s08).
+argon2 = { version = "0.5", features = ["std"] }
 # axum/tokio arrive with the m0-s06 HTTP+SSE transport (master plan §20 rows);
-# default-features off so the transport carries only the routing/JSON surface
-# it dispatches — the feature list is part of the reviewed supply chain.
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+# default-features off so the transport carries only the routing surface it
+# dispatches — the feature list is part of the reviewed supply chain.
+axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio"] }
 blake3 = "1"
+# OS-entropy session tokens for the server shell (m0-s08); the one blessed
+# randomness source outside test seeds.
+getrandom = "0.3"
 ciborium = "0.2"
 clap = { version = "4", features = ["derive"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }

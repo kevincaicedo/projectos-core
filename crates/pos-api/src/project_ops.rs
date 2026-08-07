@@ -38,6 +38,16 @@ impl RuntimeIdentity {
             user: UserId::from_bytes([0x01; 16]),
         }
     }
+
+    /// Server-shell identity: the authenticated account acts as the user;
+    /// the device stays the process-local bootstrap device (real device
+    /// identity is the m5 sync story).
+    pub(crate) fn for_user(user: UserId) -> Self {
+        Self {
+            device: DeviceId::from_bytes([0x01; 16]),
+            user,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, TS)]
