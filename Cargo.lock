@@ -2823,6 +2823,7 @@ name = "pos-api"
 version = "0.1.0-dev"
 dependencies = [
  "axum",
+ "blake3",
  "pos-agents",
  "pos-capabilities",
  "pos-connect",
@@ -2903,7 +2904,12 @@ dependencies = [
 name = "pos-gateway"
 version = "0.1.0-dev"
 dependencies = [
+ "blake3",
  "pos-foundation",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

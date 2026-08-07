@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+mod gateway_ops;
 #[cfg(feature = "http")]
 pub mod http;
 mod project_ops;
@@ -18,6 +19,10 @@ mod session;
 mod stream;
 mod ts_export;
 
+pub use gateway_ops::{
+    CostRollupInput, CostRollupReport, CostRollupRow, CostRollupTotals, EventCostLedger,
+    ModelsPullInput, ModelsPullReport,
+};
 pub use project_ops::{ProjectCreateInput, ProjectExportInput, ProjectPathInput, ProjectSeedInput};
 // Shells construct runtimes and attribute actors through these foundation
 // types; re-exported so a shell needs no direct pos-foundation edge (L12).
@@ -45,7 +50,9 @@ use std::task::{Context, Poll, Waker};
 /// v2: m0-s05 adds the project operations (create/inspect/verify/export/seed).
 /// v3: m0-s06 adds the session surface (`project.open`/`project.list`/
 /// `health`), the run/job/cost registry entries, and the stream surface.
-pub const API_SURFACE_VERSION: u16 = 3;
+/// v4: m0-s10/m0-s11 — `cost.rollup` answers with the real ledger rollup
+/// instead of `not_yet_supported`, and `models.pull` joins the commands.
+pub const API_SURFACE_VERSION: u16 = 4;
 
 /// Bounded item budget for the M0 connector-host liveness tick (L8). The socket
 /// itself caps this at 32; the runtime asks for less than it is allowed.
@@ -130,10 +137,12 @@ pub enum CommandName {
     RunCancel,
     RunPause,
     RunResume,
+    /// Checksummed, consent-gated model download (m0-s11).
+    ModelsPull,
 }
 
 impl CommandName {
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
     pub const ALL: [Self; Self::COUNT] = [
         Self::ProjectCreate,
         Self::ProjectExport,
@@ -143,6 +152,7 @@ impl CommandName {
         Self::RunCancel,
         Self::RunPause,
         Self::RunResume,
+        Self::ModelsPull,
     ];
 
     #[must_use]
@@ -156,6 +166,7 @@ impl CommandName {
             Self::RunCancel => "run.cancel",
             Self::RunPause => "run.pause",
             Self::RunResume => "run.resume",
+            Self::ModelsPull => "models.pull",
         }
     }
 
@@ -333,16 +344,16 @@ impl LocalRuntime {
             }
             Some(QueryName::ProjectList) => self.open_projects.list(),
             Some(QueryName::Health) => self.health_json(),
+            Some(QueryName::CostRollup) => gateway_ops::cost_rollup(
+                &self.open_projects,
+                &project_ops::parse_input(input_json)?,
+            ),
             // Registered-but-later entries answer honestly instead of faking
             // an empty success; their input contracts belong to the stories
             // that implement the engines, so input is deliberately unparsed.
             Some(QueryName::JobList) => Err(ApiError::not_yet_supported(
                 "job.list",
                 "the pos-sched job queue (m0-s14)",
-            )),
-            Some(QueryName::CostRollup) => Err(ApiError::not_yet_supported(
-                "cost.rollup",
-                "the pos-gateway cost ledger (m0-s10)",
             )),
             None => Err(ApiError::unknown_query(name)),
         }
@@ -367,6 +378,9 @@ impl LocalRuntime {
                 &self.clock,
                 &project_ops::parse_input(input_json)?,
             ),
+            Some(CommandName::ModelsPull) => {
+                gateway_ops::models_pull(&project_ops::parse_input(input_json)?)
+            }
             Some(
                 CommandName::RunStart
                 | CommandName::RunCancel

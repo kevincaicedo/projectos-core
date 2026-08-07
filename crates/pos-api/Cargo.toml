@@ -38,3 +38,8 @@ pos-sched = { path = "../pos-sched" }
 # Full dependency (not dev-only): the ts-rs staleness check generates into an
 # isolated scratch tree at check time.
 tempfile = { workspace = true }
+
+[dev-dependencies]
+# The transport-parity models.pull fixture pins its artifact with the same
+# hash the model manifest schema uses (m0-s11).
+blake3 = { workspace = true }

@@ -82,6 +82,18 @@ snapshot-fixture-check:
 release-signing-check:
     @bash scripts/release-signing-fixture.sh
 
+# m0-s10 release-qualification lane (NOT in `ci`): live Ollama profile
+# qualification against a running local daemon. LM Studio/vLLM run the same
+# lane with their env vars; cloud smokes join when the TLS transport lands
+# (visible debt: m0-s13/m1-s03).
+qualify-gateway-local base="http://127.0.0.1:11434" model="qwen3:0.6b":
+    POS_QUALIFY_OLLAMA_BASE={{base}} POS_QUALIFY_OLLAMA_MODEL={{model}} \
+      cargo test -p pos-gateway --test live_qualification -- --ignored qualify_live_ollama --nocapture
+
+# Regenerates prompts/prompts.lock after adding a prompt version (m0-s11).
+generate-prompt-lock:
+    cargo run --quiet -p pos-gateway --bin generate-prompt-lock -- prompts
+
 # Builds the desktop bundles and signs their checksum manifest with the release
 # key. Founder-run or release-workflow-run; never part of the CI critical path,
 # which is why `desktop-check` above passes --no-bundle instead of reusing this.

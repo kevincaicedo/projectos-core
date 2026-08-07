@@ -18,8 +18,8 @@ pub mod synthetic;
 
 pub use events::{
     AccountAuditedBody, DomainDecodeError, DomainEvent, JobCompletedBody, JobEnqueuedBody,
-    ProjectCreatedBody, ProjectRenamedBody, RunFinishedBody, RunOutcome, RunStartedBody,
-    RunStepCommittedBody,
+    ModelCallCompletedBody, ProjectCreatedBody, ProjectRenamedBody, RunFinishedBody, RunOutcome,
+    RunStartedBody, RunStepCommittedBody,
 };
 pub use projections::v0_registry;
 pub use synthetic::SyntheticEvents;

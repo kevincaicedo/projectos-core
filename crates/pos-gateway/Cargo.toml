@@ -10,3 +10,14 @@ workspace = true
 
 [dependencies]
 pos-foundation = { path = "../pos-foundation" }
+# Provider wire bodies (request JSON, SSE payloads) and the model manifest
+# are JSON; the prompt/eval shapes are serde types (m0-s10/m0-s11).
+serde = { workspace = true }
+serde_json = { workspace = true }
+# BLAKE3 pins prompts (prompts.lock) and verifies model artifacts — the same
+# hash the CAS already standardizes on (m0-s11).
+blake3 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }

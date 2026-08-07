@@ -155,6 +155,8 @@ fn input_free_queries_are_byte_identical_over_the_real_transport() {
     for query in [
         QueryName::CapabilitySnapshot,
         QueryName::ProjectList,
+        // Real since m0-s10: an empty session rolls up to zero rows.
+        QueryName::CostRollup,
         QueryName::Health,
     ] {
         let name = query.as_str();
@@ -167,16 +169,16 @@ fn input_free_queries_are_byte_identical_over_the_real_transport() {
         assert_eq!(content_type, "application/json");
         assert_eq!(body, direct, "{name} reshaped between transports");
     }
-    for query in [QueryName::JobList, QueryName::CostRollup] {
-        let name = query.as_str();
-        let direct = served
-            .runtime
-            .query_with_input(name, "{}")
-            .expect_err("the engine has not landed; success would be a lie");
-        let (status, _, body) = served.get(&format!("/api/query/{name}"));
-        assert_eq!(status, 501, "{name} maps not_yet_supported to 501");
-        assert_eq!(body, direct.to_json(), "{name} envelope reshaped");
-    }
+    // The one registered-but-later query left: its typed envelope is the
+    // contract until the m0-s14 scheduler lands the engine.
+    let name = QueryName::JobList.as_str();
+    let direct = served
+        .runtime
+        .query_with_input(name, "{}")
+        .expect_err("the engine has not landed; success would be a lie");
+    let (status, _, body) = served.get(&format!("/api/query/{name}"));
+    assert_eq!(status, 501, "{name} maps not_yet_supported to 501");
+    assert_eq!(body, direct.to_json(), "{name} envelope reshaped");
 }
 
 /// The full project lifecycle through the REAL transport, reads byte-compared

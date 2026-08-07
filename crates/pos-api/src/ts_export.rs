@@ -10,6 +10,10 @@
 //! output from the same enums the dispatcher matches on — one source of
 //! truth for names on both sides of the wire.
 
+use crate::gateway_ops::{
+    CostRollupInput, CostRollupReport, CostRollupRow, CostRollupTotals, ModelsPullInput,
+    ModelsPullReport,
+};
 use crate::project_ops::{
     ProjectCreateInput, ProjectCreateReport, ProjectExportInput, ProjectExportReport,
     ProjectInspectReport, ProjectPathInput, ProjectSeedInput, ProjectSeedReport,
@@ -40,7 +44,13 @@ macro_rules! for_each_exported_type {
             ProjectSeedReport,
             OpenProjectRow,
             ProjectListReport,
-            HealthReport
+            HealthReport,
+            CostRollupInput,
+            CostRollupRow,
+            CostRollupTotals,
+            CostRollupReport,
+            ModelsPullInput,
+            ModelsPullReport
         )
     };
 }

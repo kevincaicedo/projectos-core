@@ -407,7 +407,7 @@ pub(crate) fn open_for_session(root: &Path) -> Result<SessionOpen, ApiError> {
     })
 }
 
-fn open_log(root: &Path) -> Result<ProjectLog, ApiError> {
+pub(crate) fn open_log(root: &Path) -> Result<ProjectLog, ApiError> {
     let store = ProjectStore::open(root).map_err(|error| store_error(&error))?;
     open_log_over(store)
 }

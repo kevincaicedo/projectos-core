@@ -71,6 +71,32 @@ enum CliCommand {
     /// Print the live capability-registry snapshot (the walking-skeleton
     /// read; also the e2e fixture source).
     CapabilitySnapshot,
+    /// Aggregate the model-call cost ledger for one project (m0-s10).
+    CostRollup { directory: PathBuf },
+    /// Local model management (m0-s11): checksummed downloads, never
+    /// bundled, never fetched without consent.
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelsCommand {
+    /// Download a model named in the manifest, verify its BLAKE3, and land
+    /// it atomically in the models directory.
+    Pull {
+        name: String,
+        /// The reviewed model catalog.
+        #[arg(long, default_value = "models/manifest.json")]
+        manifest: PathBuf,
+        /// Where verified models land.
+        #[arg(long, default_value = "models/pulled")]
+        dest: PathBuf,
+        /// Consent to the download without the interactive prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -148,7 +174,54 @@ fn run(runtime: &LocalRuntime, command: CliCommand) -> Result<ExitCode, String> 
             println!("{report}");
             Ok(ExitCode::SUCCESS)
         }
+        CliCommand::CostRollup { directory } => {
+            let input = pos_api::CostRollupInput {
+                path: Some(path_text(&directory)?),
+            };
+            let report = dispatch_query(runtime, QueryName::CostRollup, &input)?;
+            println!("{report}");
+            Ok(ExitCode::SUCCESS)
+        }
+        CliCommand::Models {
+            command:
+                ModelsCommand::Pull {
+                    name,
+                    manifest,
+                    dest,
+                    yes,
+                },
+        } => {
+            // Consent is explicit, never implicit (m0-s11): `--yes`, or an
+            // interactive `y` on a terminal. A non-interactive run without
+            // `--yes` is refused by the registry with `consent_required`.
+            let consent = yes || prompt_for_consent(&name);
+            let input = pos_api::ModelsPullInput {
+                manifest_path: path_text(&manifest)?,
+                name,
+                dest_dir: path_text(&dest)?,
+                consent,
+            };
+            let report = dispatch_command(runtime, CommandName::ModelsPull, &input)?;
+            println!("{report}");
+            Ok(ExitCode::SUCCESS)
+        }
     }
+}
+
+/// Asks on stderr so stdout stays the machine-readable report. Anything but
+/// an explicit `y`/`yes` line — including a closed or non-interactive
+/// stdin — is a refusal.
+fn prompt_for_consent(name: &str) -> bool {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    eprint!("pull {name}? This downloads a model artifact. [y/N] ");
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 fn dispatch_command(

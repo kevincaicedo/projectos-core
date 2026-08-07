@@ -90,6 +90,20 @@ fn project_rows(directory: &tempfile::TempDir) -> Vec<(&'static str, String, boo
     let project = directory.path().join("parity.pos");
     let export = directory.path().join("parity-export.pos");
     let path = project.display().to_string();
+    // A complete models.pull fixture: manifest + artifact, file:// sourced,
+    // so the command row succeeds with zero network and full verification.
+    let artifact = directory.path().join("tiny.gguf");
+    std::fs::write(&artifact, b"tiny-model-bytes").expect("fixture artifact writes");
+    let manifest_path = directory.path().join("manifest.json");
+    std::fs::write(
+        &manifest_path,
+        format!(
+            r#"{{"models":[{{"name":"tiny.gguf","url":"file://{}","blake3":"{}","bytes":16}}]}}"#,
+            artifact.display(),
+            blake3::hash(b"tiny-model-bytes").to_hex()
+        ),
+    )
+    .expect("fixture manifest writes");
     vec![
         (
             CommandName::ProjectCreate.as_str(),
@@ -131,6 +145,17 @@ fn project_rows(directory: &tempfile::TempDir) -> Vec<(&'static str, String, boo
             input_json(&pos_api::ProjectExportInput {
                 path,
                 out: export.display().to_string(),
+            })
+            .expect("input serializes"),
+            true,
+        ),
+        (
+            CommandName::ModelsPull.as_str(),
+            input_json(&pos_api::ModelsPullInput {
+                manifest_path: manifest_path.display().to_string(),
+                name: "tiny.gguf".to_owned(),
+                dest_dir: directory.path().join("models").display().to_string(),
+                consent: true,
             })
             .expect("input serializes"),
             true,
@@ -406,7 +431,7 @@ fn the_snapshot_carries_live_state_rather_than_a_compile_time_claim() {
     // instead of quietly reporting themselves as local.
     assert!(snapshot.contains("\"mode\":\"unavailable\",\"reason\":\""));
     assert!(!snapshot.contains("\"reason\":\"\""));
-    assert!(snapshot.contains("\"surfaceVersion\":3"));
+    assert!(snapshot.contains("\"surfaceVersion\":4"));
 }
 
 #[test]

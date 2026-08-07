@@ -121,6 +121,16 @@ impl OpenProjects {
     pub fn count(&self) -> usize {
         lock_recovering(&self.rows).len()
     }
+
+    /// The tracked project paths in project-id order — the `cost.rollup`
+    /// session scope walks exactly this list.
+    #[must_use]
+    pub(crate) fn paths(&self) -> Vec<String> {
+        lock_recovering(&self.rows)
+            .values()
+            .map(|row| row.path.clone())
+            .collect()
+    }
 }
 
 /// A poisoned lock means some earlier caller panicked mid-insert; the map

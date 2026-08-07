@@ -111,6 +111,29 @@ pub enum AccountAuditedBody {
     },
 }
 
+/// One gateway model call (m0-s10): the honest cost ledger is a fact in the
+/// log, so the billing meter is a projection and `pos export` carries it.
+/// Money is integer micro-USD — floats accumulate error in projections
+/// (event-sourcing skill). `outcome` is the gateway weather code or `"ok"`;
+/// error paths are recorded calls too.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ModelCallCompletedBody {
+    V1 {
+        project_id: ProjectId,
+        feature: String,
+        agent: Option<String>,
+        provider: String,
+        credential_class: String,
+        model: String,
+        tokens_in: u64,
+        tokens_out: u64,
+        wall_ms: u64,
+        provider_cost_kind: String,
+        usd_micros: u64,
+        outcome: String,
+    },
+}
+
 /// The typed v0 vocabulary. The set grows additively; a tag, once shipped,
 /// never changes meaning.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -123,6 +146,7 @@ pub enum DomainEvent {
     JobEnqueued(JobEnqueuedBody),
     JobCompleted(JobCompletedBody),
     AccountAudited(AccountAuditedBody),
+    ModelCallCompleted(ModelCallCompletedBody),
 }
 
 impl DomainEvent {
@@ -137,6 +161,7 @@ impl DomainEvent {
             Self::JobEnqueued(_) => "JobEnqueued",
             Self::JobCompleted(_) => "JobCompleted",
             Self::AccountAudited(_) => "AccountAudited",
+            Self::ModelCallCompleted(_) => "ModelCallCompleted",
         }
     }
 
@@ -163,6 +188,9 @@ impl DomainEvent {
             Self::AccountAudited(AccountAuditedBody::V1 { account_id, .. }) => {
                 vec![entity_ref("account", account_id.into_bytes())]
             }
+            Self::ModelCallCompleted(ModelCallCompletedBody::V1 { project_id, .. }) => {
+                vec![entity_ref("project", project_id.into_bytes())]
+            }
         }
     }
 
@@ -179,6 +207,7 @@ impl DomainEvent {
             Self::JobEnqueued(inner) => ciborium::into_writer(inner, &mut body),
             Self::JobCompleted(inner) => ciborium::into_writer(inner, &mut body),
             Self::AccountAudited(inner) => ciborium::into_writer(inner, &mut body),
+            Self::ModelCallCompleted(inner) => ciborium::into_writer(inner, &mut body),
         };
         encoded.expect("CBOR encoding of typed bodies into a Vec cannot fail"); // INVARIANT: bodies contain only owned serde-friendly values and the writer is a Vec.
         body
@@ -206,6 +235,7 @@ impl DomainEvent {
             "JobEnqueued" => Self::JobEnqueued(read("JobEnqueued", body)?),
             "JobCompleted" => Self::JobCompleted(read("JobCompleted", body)?),
             "AccountAudited" => Self::AccountAudited(read("AccountAudited", body)?),
+            "ModelCallCompleted" => Self::ModelCallCompleted(read("ModelCallCompleted", body)?),
             _ => return Ok(None),
         };
         Ok(Some(decoded))

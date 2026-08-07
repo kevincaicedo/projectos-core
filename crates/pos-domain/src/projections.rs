@@ -7,8 +7,8 @@
 //! only pays decode cost once per projection that actually cares about it.
 
 use crate::events::{
-    AccountAuditedBody, DomainEvent, JobCompletedBody, JobEnqueuedBody, ProjectCreatedBody,
-    ProjectRenamedBody, RunFinishedBody, RunStartedBody, RunStepCommittedBody,
+    AccountAuditedBody, DomainEvent, JobCompletedBody, JobEnqueuedBody, ModelCallCompletedBody,
+    ProjectCreatedBody, ProjectRenamedBody, RunFinishedBody, RunStartedBody, RunStepCommittedBody,
 };
 use pos_log::{
     ApplyError, ColumnDef, ColumnKind, Event, LogError, Projection, ProjectionRegistry, RowWrite,
@@ -23,6 +23,7 @@ pub fn v0_registry() -> Result<ProjectionRegistry, LogError> {
         Box::new(RunStepsProjection),
         Box::new(JobsProjection),
         Box::new(AuditProjection),
+        Box::new(ModelCallsProjection),
     ])
 }
 
@@ -345,6 +346,121 @@ const AUDIT_TABLE: TableDef = TableDef {
         },
     ],
 };
+
+/// The honest cost ledger rows (m0-s10): one row per gateway model call,
+/// keyed by the event seq (the call's durable id). `cost.rollup` aggregates
+/// this table; the F23 cost ticker reads it live from m0-s13 on.
+struct ModelCallsProjection;
+
+const MODEL_CALLS_TABLE: TableDef = TableDef {
+    name: "proj_model_calls",
+    version: 1,
+    key_columns: &[ColumnDef {
+        name: "seq",
+        kind: ColumnKind::Integer,
+    }],
+    value_columns: &[
+        ColumnDef {
+            name: "project_id",
+            kind: ColumnKind::Blob,
+        },
+        ColumnDef {
+            name: "feature",
+            kind: ColumnKind::Text,
+        },
+        ColumnDef {
+            name: "agent",
+            kind: ColumnKind::Text,
+        },
+        ColumnDef {
+            name: "provider",
+            kind: ColumnKind::Text,
+        },
+        ColumnDef {
+            name: "credential_class",
+            kind: ColumnKind::Text,
+        },
+        ColumnDef {
+            name: "model",
+            kind: ColumnKind::Text,
+        },
+        ColumnDef {
+            name: "tokens_in",
+            kind: ColumnKind::Integer,
+        },
+        ColumnDef {
+            name: "tokens_out",
+            kind: ColumnKind::Integer,
+        },
+        ColumnDef {
+            name: "wall_ms",
+            kind: ColumnKind::Integer,
+        },
+        ColumnDef {
+            name: "provider_cost_kind",
+            kind: ColumnKind::Text,
+        },
+        ColumnDef {
+            name: "usd_micros",
+            kind: ColumnKind::Integer,
+        },
+        ColumnDef {
+            name: "outcome",
+            kind: ColumnKind::Text,
+        },
+        ColumnDef {
+            name: "ts_ms",
+            kind: ColumnKind::Integer,
+        },
+    ],
+};
+
+impl Projection for ModelCallsProjection {
+    fn table(&self) -> &TableDef {
+        &MODEL_CALLS_TABLE
+    }
+
+    fn apply(&self, event: &Event) -> Result<Vec<RowWrite>, ApplyError> {
+        if event.kind.as_str() != "ModelCallCompleted" {
+            return Ok(Vec::new());
+        }
+        let Some(DomainEvent::ModelCallCompleted(ModelCallCompletedBody::V1 {
+            project_id,
+            feature,
+            agent,
+            provider,
+            credential_class,
+            model,
+            tokens_in,
+            tokens_out,
+            wall_ms,
+            provider_cost_kind,
+            usd_micros,
+            outcome,
+        })) = decode_for(&MODEL_CALLS_TABLE, event)?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![RowWrite::Upsert {
+            key: vec![seq_value(event)],
+            values: vec![
+                SqlValue::Blob(project_id.into_bytes().to_vec()),
+                SqlValue::Text(feature),
+                agent.map_or(SqlValue::Null, SqlValue::Text),
+                SqlValue::Text(provider),
+                SqlValue::Text(credential_class),
+                SqlValue::Text(model),
+                SqlValue::Integer(i64::try_from(tokens_in).unwrap_or(i64::MAX)),
+                SqlValue::Integer(i64::try_from(tokens_out).unwrap_or(i64::MAX)),
+                SqlValue::Integer(i64::try_from(wall_ms).unwrap_or(i64::MAX)),
+                SqlValue::Text(provider_cost_kind),
+                SqlValue::Integer(i64::try_from(usd_micros).unwrap_or(i64::MAX)),
+                SqlValue::Text(outcome),
+                SqlValue::Integer(i64::try_from(event.ts_ms).unwrap_or(i64::MAX)),
+            ],
+        }])
+    }
+}
 
 impl Projection for AuditProjection {
     fn table(&self) -> &TableDef {
