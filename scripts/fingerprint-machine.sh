@@ -37,8 +37,22 @@ case "$(uname -s)" in
     os_name="macOS"
     os_version="$(sw_vers -productVersion) build $(sw_vers -buildVersion)"
     kernel="$(uname -r)"
-    filesystem="$(df -T 2>/dev/null | awk 'NR==2 {print $2}' || mount | awk '$3=="/" {print $4; exit}')"
-    storage="$(system_profiler SPNVMeDataType 2>/dev/null | awk -F': ' '/Medium Type/ {print $2; exit}')"
+    filesystem="$(diskutil info / 2>/dev/null | awk -F': *' '
+      /File System Personality/ {
+        value=$2
+        sub(/^ +/, "", value)
+        print value
+        exit
+      }
+    ')"
+    storage="$(system_profiler SPStorageDataType 2>/dev/null | awk -F': ' '
+      /Device Name/ && device == "" {device=$2}
+      /Medium Type/ && medium == "" {medium=$2}
+      END {
+        if (device != "" && medium != "") print device " (" medium ")"
+        else if (device != "") print device
+      }
+    ')"
     ;;
   Linux)
     model="$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || echo unknown)"
@@ -60,11 +74,23 @@ case "$(uname -s)" in
 esac
 
 memory_gib=$(( memory_bytes / 1024 / 1024 / 1024 ))
+core_root="$(git rev-parse --show-toplevel)"
+registry_root="$(git -C "$core_root/.." rev-parse --show-toplevel)"
+if [[ ! -f "$registry_root/docs/reference-machines.md" ]]; then
+  echo "reference-machine registry is missing beside the core checkout" >&2
+  exit 1
+fi
+registry_revision="$(git -C "$registry_root" rev-parse HEAD)"
+rust_version="$(version_of rustc --version)"
+cargo_version="$(version_of cargo --version)"
+node_version="$(version_of node --version)"
+pnpm_version="$(version_of pnpm --version)"
+just_version="$(version_of just --version)"
 
 cat <<FINGERPRINT
 schema_version: 1
 machine_id: ${machine_id}
-machine_registry_revision: $(git rev-parse HEAD)
+machine_registry_revision: ${registry_revision}
 recorded_at_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 hardware:
   model_identifier: ${model}
@@ -80,9 +106,9 @@ os:
   version: ${os_version}
   kernel: ${kernel}
 toolchain:
-  rust: $(version_of rustc --version)
-  cargo: $(version_of cargo --version)
-  node: $(version_of node --version)
-  pnpm: $(version_of pnpm --version)
-  just: $(version_of just --version)
+  rust: ${rust_version}
+  cargo: ${cargo_version}
+  node: ${node_version}
+  pnpm: ${pnpm_version}
+  just: ${just_version}
 FINGERPRINT

@@ -23,8 +23,11 @@ mod recents;
 
 pub use recents::{RECENT_PROJECT_COUNT_MAX, Recents};
 
-use pos_api::{LocalBootstrapConfig, LocalRuntime, bootstrap_local_runtime};
-use std::path::PathBuf;
+use pos_api::{
+    CommandName, LocalBootstrapConfig, LocalRuntime, ProjectCreateInput, ProjectPathInput,
+    QueryName, bootstrap_local_runtime, input_json,
+};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tauri::Manager;
@@ -44,6 +47,52 @@ pub struct ShellState {
     config_dir: PathBuf,
     recents: Mutex<Recents>,
     in_flight: AtomicUsize,
+}
+
+/// Exercises the packaged executable's real project path without starting a
+/// webview. The release smoke pairs this with a normal bundle launch: together
+/// they prove both native boot and the statically linked FTS5/sqlite-vec path.
+///
+/// # Errors
+///
+/// Returns a stable diagnostic when the harness supplies an unsafe path, the
+/// typed API refuses create/verify, or verification reports a dirty project.
+pub fn packaging_smoke(project_root: &Path) -> Result<(), String> {
+    if !project_root.is_absolute() {
+        return Err("packaging smoke requires an absolute project path".to_owned());
+    }
+    let project_path = project_root
+        .to_str()
+        .ok_or_else(|| "packaging smoke project path is not valid UTF-8".to_owned())?;
+    let pack_root = project_root
+        .parent()
+        .ok_or_else(|| "packaging smoke project path has no parent".to_owned())?
+        .join("packs");
+    let runtime = bootstrap_local_runtime(LocalBootstrapConfig::isolated(pack_root));
+
+    let create_input = input_json(&ProjectCreateInput {
+        path: project_path.to_owned(),
+        name: Some("Packaging Smoke".to_owned()),
+        template: "generic".to_owned(),
+    })
+    .map_err(|error| error.to_json())?;
+    runtime
+        .command(CommandName::ProjectCreate.as_str(), &create_input)
+        .map_err(|error| error.to_json())?;
+
+    let verify_input = input_json(&ProjectPathInput {
+        path: project_path.to_owned(),
+    })
+    .map_err(|error| error.to_json())?;
+    let report = runtime
+        .query_with_input(QueryName::ProjectVerify.as_str(), &verify_input)
+        .map_err(|error| error.to_json())?;
+    let report: serde_json::Value = serde_json::from_str(&report)
+        .map_err(|error| format!("packaging smoke verify report is invalid JSON: {error}"))?;
+    if report.get("clean").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("packaging smoke project verification reported a defect".to_owned());
+    }
+    Ok(())
 }
 
 impl ShellState {
@@ -337,7 +386,7 @@ impl<R: tauri::Runtime> EmitShellCommand for tauri::WebviewWindow<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShellState, dispatch_command, dispatch_query, path_from_input};
+    use super::{ShellState, dispatch_command, dispatch_query, packaging_smoke, path_from_input};
     use pos_api::{
         CommandName, LocalBootstrapConfig, LocalRuntime, ProjectCreateInput, ProjectPathInput,
         QueryName, bootstrap_local_runtime, input_json,
@@ -348,6 +397,21 @@ mod tests {
         bootstrap_local_runtime(LocalBootstrapConfig::isolated(PathBuf::from(
             "missing-desktop-pack-root",
         )))
+    }
+
+    #[test]
+    fn packaging_smoke_creates_and_verifies_through_the_typed_surface() {
+        let directory = tempfile::tempdir().expect("the test owns its temporary directory");
+        let project_root = directory.path().join("packaging-smoke.pos");
+        packaging_smoke(&project_root).expect("the packaged core path is healthy");
+        assert!(project_root.join("project.db").is_file());
+    }
+
+    #[test]
+    fn packaging_smoke_rejects_a_relative_path_before_state_changes() {
+        let error = packaging_smoke(PathBuf::from("relative.pos").as_path())
+            .expect_err("a harness path must be absolute");
+        assert_eq!(error, "packaging smoke requires an absolute project path");
     }
 
     #[test]

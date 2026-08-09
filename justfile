@@ -90,15 +90,27 @@ qualify-gateway-local base="http://127.0.0.1:11434" model="qwen3:0.6b":
     POS_QUALIFY_OLLAMA_BASE={{base}} POS_QUALIFY_OLLAMA_MODEL={{model}} \
       cargo test -p pos-gateway --test live_qualification -- --ignored qualify_live_ollama --nocapture
 
+qualify-gateway-lm-studio model base="http://127.0.0.1:1234":
+    POS_QUALIFY_LMSTUDIO_BASE={{base}} POS_QUALIFY_LMSTUDIO_MODEL={{model}} \
+      cargo test -p pos-gateway --test live_qualification -- --ignored qualify_live_lm_studio --nocapture
+
+qualify-gateway-vllm model base="http://127.0.0.1:8000":
+    POS_QUALIFY_VLLM_BASE={{base}} POS_QUALIFY_VLLM_MODEL={{model}} \
+      cargo test -p pos-gateway --test live_qualification -- --ignored qualify_live_vllm --nocapture
+
 # Regenerates prompts/prompts.lock after adding a prompt version (m0-s11).
 generate-prompt-lock:
     cargo run --quiet -p pos-gateway --bin generate-prompt-lock -- prompts
 
-# Builds the desktop bundles and signs their checksum manifest with the release
-# key. Founder-run or release-workflow-run; never part of the CI critical path,
-# which is why `desktop-check` above passes --no-bundle instead of reusing this.
-package key_path:
+# Builds real desktop bundles and exercises the packaged executable. This is
+# the public-builds-alone packaging row and needs no release secret.
+package-unsigned:
     pnpm exec tauri build --config apps/desktop/tauri.conf.json --ci
+    @bash scripts/package-smoke.sh target/release/bundle
+
+# Signs an already-smoked bundle with the release trust root. Founder-run or
+# release-workflow-run; the public PR lane uses `package-unsigned` above.
+package key_path: package-unsigned
     @bash scripts/sign-release.sh target/release/bundle {{key_path}}
 
 verify-package identity allowed_signers:
@@ -125,8 +137,8 @@ e2e: node-version-check
 e2e-install: node-version-check
     pnpm --dir apps/ui exec playwright install --with-deps chromium
 
-# Compile the native shell through the actual Tauri CLI/config path without
-# producing installers (packaging and signing remain m0-s07 work).
+# Fast local native-shell compile through the actual Tauri CLI/config path;
+# `package-unsigned` owns the release bundle and packaged-executable smoke.
 desktop-check: node-version-check
     pnpm exec tauri build --config apps/desktop/tauri.conf.json --debug --no-bundle --ci
 
@@ -158,5 +170,5 @@ bench:
 
 # Emits the docs/reference-machines.md fingerprint for the current host. Run on
 # each binding machine and paste the output into its registry row (m0-s02).
-fingerprint-machine machine_id:
+fingerprint-machine machine_id: node-version-check
     @bash scripts/fingerprint-machine.sh {{machine_id}}

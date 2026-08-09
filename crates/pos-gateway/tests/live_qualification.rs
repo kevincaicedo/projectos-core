@@ -1,7 +1,7 @@
 //! The m0-s10 release-qualification lane: live OpenAI-compatible endpoint
 //! profiles (Ollama, LM Studio, vLLM). Ignored in the PR lane — recorded
-//! fixtures own PR coverage — and run explicitly via `just qualify-gateway-local`,
-//! which sets the endpoint env vars. Each run prints the honest
+//! fixtures own PR coverage — and run explicitly via the matching
+//! `just qualify-gateway-*` recipe, which sets the endpoint env vars. Each run prints the honest
 //! [`pos_gateway::QualificationReport`]; the recorded result lands in
 //! `docs/progress.md` as the story's qualification evidence.
 //!
@@ -20,7 +20,7 @@ use pos_gateway::{CallAuth, EndpointServer, LoopbackHttpTransport, qualify_opena
 fn qualify(server: EndpointServer, base_env: &str, model_env: &str) {
     let Ok(base_url) = std::env::var(base_env) else {
         panic!(
-            "{base_env} is not set; run this lane via `just qualify-gateway-local` \
+            "{base_env} is not set; run this lane via the matching `just qualify-gateway-*` recipe \
              with the endpoint available"
         );
     };
