@@ -18,6 +18,7 @@ use pos_domain::{
     RunBudget, RunBudgetDimension, RunExecutor, RunPauseState, RunState, RunStatus, RunStepState,
     RunToolGrantMode, RunTrigger, RunUsage, read_run_step,
 };
+use pos_foundation::telemetry::{Span, SpanContext, SpanField, SpanValue};
 use pos_foundation::{ProjectId, RunId, SystemWallClock, WallClock};
 use pos_gateway::{
     CredentialClass, EndpointConfig, EndpointLocality, EndpointProfile, EndpointServer, Gateway,
@@ -568,6 +569,7 @@ pub(crate) fn start(
     clock: &dyn WallClock,
     supervisor: &EchoSupervisor,
     input: &RunStartInput,
+    span: &mut Span,
 ) -> Result<String, ApiError> {
     if matches!(input.worker, RunWorker::Echo) {
         supervisor.validate(*identity)?;
@@ -581,6 +583,14 @@ pub(crate) fn start(
     }
     let log = open_log(std::path::Path::new(&input.path))?;
     let run_id = mint_run_id(&log)?;
+    // The Run's trace is derived from ids this command itself mints, so the
+    // dispatch span adopts that identity now and becomes the trace root every
+    // later process — including one resuming after `kill -9` — computes
+    // independently (m0-s15).
+    let project_id = log.store().manifest().project_id;
+    span.adopt_root(SpanContext::for_run(project_id, run_id));
+    span.set(SpanField::Project, SpanValue::Id(project_id.into_bytes()));
+    span.set(SpanField::Run, SpanValue::Id(run_id.into_bytes()));
     let parent_run_id = input
         .parent_run_id
         .as_deref()

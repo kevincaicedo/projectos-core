@@ -2951,6 +2951,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pos-bench"
+version = "0.1.0-dev"
+dependencies = [
+ "clap",
+ "pos-api",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "pos-capabilities"
 version = "0.1.0-dev"
 dependencies = [
@@ -3004,6 +3014,7 @@ name = "pos-foundation"
 version = "0.1.0-dev"
 dependencies = [
  "serde",
+ "tracing",
 ]
 
 [[package]]

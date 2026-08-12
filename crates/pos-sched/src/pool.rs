@@ -25,6 +25,9 @@ use crate::job::{ClaimedJob, JobFailure, JobKind, WorkerName};
 use crate::metrics::SchedulerMetrics;
 use crate::queue::JobQueue;
 use pos_domain::JobClass;
+use pos_foundation::telemetry::{
+    Parent, Span, SpanContext, SpanDetail, SpanField, SpanName, SpanValue,
+};
 use pos_foundation::{ProjectId, WallClock};
 use pos_log::ProjectLog;
 use std::collections::BTreeMap;
@@ -383,6 +386,26 @@ async fn claim_round_robin(
 }
 
 async fn run_job(context: &Arc<PoolContext>, log: Arc<ProjectLog>, job: ClaimedJob) {
+    // `sched.job/:kind` (m0-s15), rooted on the *derived* job context so every
+    // attempt — including one retried in another process after a lease expiry
+    // — lands in the trace the first attempt started. Detached because this
+    // span crosses `await` points and may close on another worker thread.
+    // This is the one call site the discipline checker admits for
+    // `SpanDetail::from_registered_kind`.
+    let span = Span::open_detached(
+        SpanName::SchedJob,
+        SpanDetail::from_registered_kind(job.kind.as_str()),
+        Parent::Root(SpanContext::for_job(job.project_id, job.job_id)),
+    );
+    span.set(
+        SpanField::Project,
+        SpanValue::Id(job.project_id.into_bytes()),
+    );
+    span.set(SpanField::Job, SpanValue::Id(job.job_id.into_bytes()));
+    span.set(
+        SpanField::Attempt,
+        SpanValue::Count(u64::from(job.attempt_index)),
+    );
     let Some(handler) = context.handlers.get(job.kind.as_str()) else {
         // A queued job with no handler is a deployment mistake, not weather:
         // permanent, so it lands in the DLQ with a reason instead of
@@ -392,6 +415,7 @@ async fn run_job(context: &Arc<PoolContext>, log: Arc<ProjectLog>, job: ClaimedJ
             format!("no handler is registered for job kind {}", job.kind),
         );
         finish_job(context, log, job, Err(failure), 0).await;
+        span.finish("no_handler");
         return;
     };
     let started_ts_ms = context.clock.now_ms();
@@ -409,7 +433,17 @@ async fn run_job(context: &Arc<PoolContext>, log: Arc<ProjectLog>, job: ClaimedJ
             "the handler panicked; the attempt was recorded and will retry",
         ))
     });
+    span.set(SpanField::DurationMs, SpanValue::Millis(wall_ms));
+    // The outcome label is a closed set; the handler's own failure code is a
+    // runtime string, and it is already durable in the `JobAttemptFailed`
+    // fact. The span carries correlation, the log carries content.
+    let label = match &outcome {
+        Ok(()) => "ok",
+        Err(failure) if failure.permanent => "failed_permanent",
+        Err(_) => "failed",
+    };
     finish_job(context, log, job, outcome, wall_ms).await;
+    span.finish(label);
 }
 
 fn spawn_heartbeat(

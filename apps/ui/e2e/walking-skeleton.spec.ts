@@ -1,6 +1,44 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "@playwright/test";
+
+/// Where the in-page §18 measurements land for `pos-bench` to stamp into a
+/// machine-identified artifact (m0-s16). They are written from inside the
+/// page for a reason the m0-s09 finding records: a per-step Playwright call
+/// measures the WebDriver channel, not the interaction.
+const MEASUREMENTS_PATH = resolve(
+  fileURLToPath(new URL("../e2e-artifacts/ui-measurements.json", import.meta.url)),
+);
+
+function recordMeasurements(entries: Record<string, readonly number[]>) {
+  mkdirSync(dirname(MEASUREMENTS_PATH), { recursive: true });
+  let existing: Record<string, unknown> = {};
+  try {
+    existing = JSON.parse(readFileSync(MEASUREMENTS_PATH, "utf8")) as Record<string, unknown>;
+  } catch {
+    existing = {};
+  }
+  writeFileSync(
+    MEASUREMENTS_PATH,
+    `${JSON.stringify({ ...existing, ...entries }, null, 2)}\n`,
+    "utf8",
+  );
+}
+
+/// A fifty-project workspace: the corpus the §18 cold-start row names.
+const FIFTY_PROJECTS = JSON.stringify({
+  projects: Array.from({ length: 50 }, (_unused, index) => ({
+    projectId: index.toString(16).padStart(2, "0").repeat(16),
+    path: `/tmp/cold-start-${index}.pos`,
+    name: `Cold start ${index}`,
+    template: "generic",
+    formatVersion: 1,
+    headSeq: 200,
+    openedTsMs: 1_760_000_000_000 + index,
+  })),
+  openProjectCountMax: 64,
+});
 
 // The bytes below are produced by the real Rust runtime, not by this test:
 // `just generate-snapshot-fixture` runs the `pos` shell and captures its
@@ -361,6 +399,55 @@ test.describe("the M0 shell", () => {
         100,
       );
     }
+
+    // The raw samples go to pos-bench, which stamps them with the machine
+    // identity and protocol the §18 row requires. The gate assertion above
+    // stays here so a regression fails CI whether or not a bench was run.
+    recordMeasurements({ paletteOpenMs: samples.open, projectSwitchMs: samples.switched });
+  });
+
+  test("the app frame reaches interactive with fifty projects", async ({ page }) => {
+    // "Interactive" is defined once, here: navigation start → the project
+    // list is painted with resolved data. The observer is installed before
+    // navigation, so the measurement spans the whole load rather than
+    // whatever was left by the time a test could ask.
+    await page.addInitScript(() => {
+      const marked: { value: number | null } = { value: null };
+      (window as unknown as { __posInteractiveMs: typeof marked }).__posInteractiveMs = marked;
+      const ready = () => document.querySelector("[data-project-row]") !== null;
+      const observer = new MutationObserver(() => {
+        if (marked.value === null && ready()) {
+          marked.value = performance.now();
+          observer.disconnect();
+        }
+      });
+      document.addEventListener("DOMContentLoaded", () => {
+        observer.observe(document.body, { childList: true, subtree: true });
+        if (ready()) {
+          marked.value = performance.now();
+          observer.disconnect();
+        }
+      });
+    });
+    await installIpc(page, {
+      "project.list": FIFTY_PROJECTS,
+      health: HEALTH,
+      "capability.snapshot": SNAPSHOT_FIXTURE,
+    });
+
+    const samples: number[] = [];
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await page.goto("/");
+      await expect(page.locator("[data-project-row]")).toHaveCount(50);
+      const interactive = await page.evaluate(
+        () =>
+          (window as unknown as { __posInteractiveMs: { value: number | null } })
+            .__posInteractiveMs.value,
+      );
+      expect(interactive, "the interactive mark was never recorded").not.toBeNull();
+      samples.push(interactive ?? 0);
+    }
+    recordMeasurements({ timeToInteractiveMs: samples });
   });
 
   test("Echo refuses visibly until a project is selected", async ({ page }) => {

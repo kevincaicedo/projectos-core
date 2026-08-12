@@ -32,6 +32,12 @@ fn main() -> ExitCode {
     };
     #[cfg(not(debug_assertions))]
     let echo = None;
+    // Telemetry is opt-in and off by default (m0-s15); a server deployment
+    // sets `POS_TELEMETRY=file:/var/log/projectos/spans.jsonl` or `stderr`.
+    if let Err(error) = pos_api::install_telemetry(std::env::var("POS_TELEMETRY").ok().as_deref()) {
+        eprintln!("pos-server: {}", error.to_json());
+        return ExitCode::FAILURE;
+    }
     let bind_addr: SocketAddr = match env_or("POS_SERVER_ADDR", BIND_ADDR_DEFAULT).parse() {
         Ok(addr) => addr,
         Err(error) => {

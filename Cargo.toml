@@ -24,6 +24,7 @@ members = [
     "crates/pos-sdk",
     "bins/pos-server",
     "bins/pos",
+    "bins/pos-bench",
     "bins/check-dep-dag",
     "apps/desktop",
 ]
@@ -73,6 +74,10 @@ tempfile = "3"
 tokio = { version = "1", default-features = false }
 # Bounded adapter from Tokio channels to HTTP response streams; transport only.
 tokio-stream = { version = "0.1", default-features = false }
+# The §20 observability facade (m0-s15). Emission only: pos-foundation's
+# telemetry module is the single call site, and `attributes` stays off because
+# `#[instrument]` would pull syn/quote for sugar the typed facade replaces.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 # ts-rs generates the apps/ui API types from the Rust wire types (L12); the
 # serde-compat default keeps the emitted TS aligned with the serde wire names.
 ts-rs = "12"

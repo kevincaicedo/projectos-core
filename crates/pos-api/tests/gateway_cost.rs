@@ -291,3 +291,192 @@ fn the_secret_scan_finds_zero_key_material_in_log_export_and_debug_output() {
     scan_tree_for_secret(&project);
     scan_tree_for_secret(&export);
 }
+
+/// m0-s15 AC 2, arithmetic half: the rollup's totals — and every attribution
+/// group — equal an **independent** sum read straight from
+/// `proj_model_calls`. Summing the report's own rows would only prove the
+/// report is self-consistent; the point is that the answer matches the
+/// projection the ledger actually wrote.
+#[test]
+fn cost_rollup_totals_and_groups_equal_the_sum_of_the_model_call_rows() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let runtime = bootstrap_local_runtime(LocalBootstrapConfig::isolated(
+        directory.path().join("packs"),
+    ));
+    let project = directory.path().join("cost-groups.pos");
+    let path = project.display().to_string();
+    runtime
+        .command(
+            CommandName::ProjectCreate.as_str(),
+            &input_json(&ProjectCreateInput {
+                path: path.clone(),
+                name: Some("Cost groups".to_owned()),
+                template: "generic".to_owned(),
+            })
+            .expect("input serializes"),
+        )
+        .expect("create resolves");
+    dispatch_calls(&project, 5, true);
+
+    let report: serde_json::Value = serde_json::from_str(
+        &runtime
+            .query_with_input(
+                QueryName::CostRollup.as_str(),
+                &input_json(&pos_api::CostRollupInput {
+                    path: Some(path.clone()),
+                })
+                .expect("input serializes"),
+            )
+            .expect("rollup resolves"),
+    )
+    .expect("rollup is JSON");
+
+    let truth = model_call_truth(&project);
+    let totals = &report["totals"];
+    assert_eq!(totals["calls"].as_u64(), Some(truth.calls));
+    assert_eq!(totals["tokensIn"].as_u64(), Some(truth.tokens_in));
+    assert_eq!(totals["tokensOut"].as_u64(), Some(truth.tokens_out));
+    assert_eq!(totals["usdMicros"].as_u64(), Some(truth.usd_micros));
+    assert_eq!(
+        totals["projectosUsdMicros"].as_u64(),
+        Some(truth.projectos_usd_micros)
+    );
+
+    // Every dimension re-derives the same grand total, so a grouping bug
+    // cannot hide behind a correct sum at the top.
+    let groups = report["groups"].as_array().expect("groups is an array");
+    assert!(!groups.is_empty(), "the rollup answers with its groups");
+    for dimension in ["project", "feature", "agent"] {
+        let in_dimension: Vec<&serde_json::Value> = groups
+            .iter()
+            .filter(|group| group["dimension"] == dimension)
+            .collect();
+        assert!(
+            !in_dimension.is_empty(),
+            "{dimension} is one of the three attribution grains the story names"
+        );
+        let calls: u64 = in_dimension
+            .iter()
+            .map(|group| group["calls"].as_u64().unwrap_or_default())
+            .sum();
+        let tokens_in: u64 = in_dimension
+            .iter()
+            .map(|group| group["tokensIn"].as_u64().unwrap_or_default())
+            .sum();
+        assert_eq!(
+            calls, truth.calls,
+            "{dimension} groups lost or gained calls"
+        );
+        assert_eq!(tokens_in, truth.tokens_in, "{dimension} tokensIn drifted");
+    }
+}
+
+#[derive(Default)]
+struct LedgerTruth {
+    calls: u64,
+    tokens_in: u64,
+    tokens_out: u64,
+    usd_micros: u64,
+    projectos_usd_micros: u64,
+}
+
+/// Reads the projection directly — the independent side of the oracle.
+fn model_call_truth(project_root: &Path) -> LedgerTruth {
+    let store = pos_store::ProjectStore::open(project_root).expect("project store opens");
+    store
+        .db()
+        .with_reader("model call truth", |connection| {
+            let mut statement = connection.prepare(
+                "SELECT COUNT(*), COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0), \
+                        COALESCE(SUM(usd_micros), 0), \
+                        COALESCE(SUM(CASE WHEN provider_cost_kind <> 'customer_billed' \
+                                          THEN usd_micros ELSE 0 END), 0) \
+                 FROM proj_model_calls",
+            )?;
+            statement.query_row([], |row| {
+                Ok(LedgerTruth {
+                    calls: row.get::<_, i64>(0)?.max(0).unsigned_abs(),
+                    tokens_in: row.get::<_, i64>(1)?.max(0).unsigned_abs(),
+                    tokens_out: row.get::<_, i64>(2)?.max(0).unsigned_abs(),
+                    usd_micros: row.get::<_, i64>(3)?.max(0).unsigned_abs(),
+                    projectos_usd_micros: row.get::<_, i64>(4)?.max(0).unsigned_abs(),
+                })
+            })
+        })
+        .expect("the projection reads")
+}
+
+/// m0-s15 AC 2, content half: the secret scan now covers span output, which
+/// is the surface m0-s10 explicitly deferred to this story. The scan is the
+/// second line of defence — the first is that [`SpanValue`] has no `String`
+/// variant, so neither the planted key nor the marker below is *representable*
+/// in a span field.
+#[test]
+fn span_output_carries_no_key_material_or_project_content() {
+    const CONTENT_MARKER: &str = "CUSTOMER-SAID-WE-WILL-CHURN-IN-Q3";
+    let directory = tempfile::tempdir().expect("tempdir");
+    let span_log = directory.path().join("spans.jsonl");
+    pos_api::install_telemetry(Some(&format!("file:{}", span_log.display())))
+        .expect("the JSON-lines sink installs");
+
+    let runtime = bootstrap_local_runtime(LocalBootstrapConfig::isolated(
+        directory.path().join("packs"),
+    ));
+    // The marker rides in every place a careless implementation might reach
+    // for a name: the project directory name, the project's display name,
+    // and an unregistered query name a caller could hammer.
+    let project = directory.path().join(format!("{CONTENT_MARKER}.pos"));
+    let path = project.display().to_string();
+    runtime
+        .command(
+            CommandName::ProjectCreate.as_str(),
+            &input_json(&ProjectCreateInput {
+                path: path.clone(),
+                name: Some(format!("{CONTENT_MARKER} {PLANTED_SECRET}")),
+                template: "generic".to_owned(),
+            })
+            .expect("input serializes"),
+        )
+        .expect("create resolves");
+    dispatch_calls(&project, 2, true);
+    let _ = runtime.query_with_input(&format!("query.{CONTENT_MARKER}"), "{}");
+    let _ = runtime.command(&format!("cmd.{PLANTED_SECRET}"), "{}");
+    runtime
+        .query_with_input(
+            QueryName::CostRollup.as_str(),
+            &input_json(&pos_api::CostRollupInput { path: Some(path) }).expect("input serializes"),
+        )
+        .expect("rollup resolves");
+
+    let spans = std::fs::read_to_string(&span_log).expect("the span log exists");
+    assert!(
+        spans.lines().count() >= 4,
+        "the scan needs real span output to be evidence, got: {spans}"
+    );
+    // Every emitted line is well-formed JSON with only ids, numbers, and
+    // static labels — a truncated line would be corruption, so the sink drops
+    // instead, and it must not have had to.
+    for line in spans.lines() {
+        let value: serde_json::Value =
+            serde_json::from_str(line).expect("every span line is canonical JSON");
+        assert!(value["name"].is_string());
+        assert!(value["fields"].is_object());
+    }
+    for needle in [
+        CONTENT_MARKER,
+        PLANTED_SECRET,
+        "cited answer",
+        directory.path().to_string_lossy().as_ref(),
+    ] {
+        assert!(
+            !spans.contains(needle),
+            "span output leaked {needle:?}:\n{spans}"
+        );
+    }
+    let stats = pos_api::telemetry::stats();
+    assert_eq!(stats.lines_dropped, 0, "no span line was refused");
+    assert_eq!(stats.fields_dropped, 0, "no span field exceeded its budget");
+    // Leave the process as it was found, so a parallel test binary is not
+    // silently writing into a temporary directory that is about to vanish.
+    pos_api::install_telemetry(None).expect("telemetry returns to off");
+}

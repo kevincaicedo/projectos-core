@@ -35,6 +35,14 @@ use tauri::ipc::Channel;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::tray::TrayIconBuilder;
 
+/// Set by the `pos-bench` cold-start scenario (m0-s16). Present only when a
+/// measurement asked for it, so the shipped app has no probe behaviour.
+pub const STARTUP_PROBE_ENV: &str = "POS_STARTUP_PROBE";
+
+/// The single line the probe prints, parsed by `pos-bench`. A stable marker
+/// beats scraping a log format.
+pub const STARTUP_PROBE_MARKER: &str = "pos-desktop: startup_probe_ms";
+
 /// How long close waits for in-flight dispatches before exiting anyway. A
 /// dispatch that outlives this is either a bug or a pathological corpus; the
 /// wait exists so a normal operation is never cut mid-transaction, not to
@@ -329,6 +337,17 @@ fn shell_recents(shell: tauri::State<'_, ShellState>) -> String {
 /// native event loop fails.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() -> Result<(), tauri::Error> {
+    let launched = std::time::Instant::now();
+    // Telemetry is opt-in and **off by default on desktop** (L4 spirit): a
+    // local-only project produces zero bytes outside the machine unless its
+    // owner asked for them. A spec we cannot honour stops the shell rather
+    // than starting with export silently disabled.
+    if let Err(error) = pos_api::install_telemetry(std::env::var("POS_TELEMETRY").ok().as_deref()) {
+        eprintln!("pos-desktop: {}", error.to_json());
+        let boxed: Box<dyn std::error::Error> = Box::new(error);
+        return Err(tauri::Error::Setup(boxed.into()));
+    }
+    let startup_probe = std::env::var_os(STARTUP_PROBE_ENV).is_some();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         // Single instance must be registered first so a second launch is
@@ -375,7 +394,21 @@ pub fn run() -> Result<(), tauri::Error> {
             api_stream,
             shell_recents
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())?
+        .run(move |handle, event| {
+            // The `pos-bench` cold-start probe (m0-s16): `Ready` is the first
+            // instant the native window, its webview, and the in-process core
+            // runtime all exist, which is the shell half of "time to
+            // interactive". The UI half is measured in the page, and the gate
+            // adds them as a stated upper bound — the two phases overlap in
+            // reality, so their sum can only overstate the real cold start.
+            if startup_probe && matches!(event, tauri::RunEvent::Ready) {
+                let elapsed_ms = u64::try_from(launched.elapsed().as_millis()).unwrap_or(u64::MAX); // INVARIANT: saturation, matching the telemetry clock policy.
+                println!("{STARTUP_PROBE_MARKER} {elapsed_ms}");
+                handle.exit(0);
+            }
+        });
+    Ok(())
 }
 
 /// App/edit/view menus with standard platform shortcuts. Menu items emit
@@ -463,8 +496,9 @@ mod tests {
     };
     use pos_api::{
         CommandName, CostRollupInput, EchoRuntimeOptions, LocalBootstrapConfig, LocalRuntime,
-        ProjectCreateInput, ProjectPathInput, QueryName, RunBudgetWire, RunControlInput,
-        RunStartInput, RunStepsInput, RunWorker, StreamName, bootstrap_local_runtime, input_json,
+        ProjectCreateInput, ProjectId, ProjectPathInput, QueryName, RunBudgetWire, RunControlInput,
+        RunId, RunStartInput, RunStepsInput, RunWorker, StreamName, bootstrap_local_runtime,
+        input_json, telemetry,
     };
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -599,6 +633,130 @@ mod tests {
         assert_one_echo_cost(runtime.as_ref(), &path);
         model_thread.join().expect("Echo fixture exits");
         assert!(shell.drain_in_flight());
+    }
+
+    /// m0-s15 AC 1, desktop half: one Echo Run produces a single connected
+    /// span tree. The trace id is *derived* from the durable project and Run
+    /// ids, so the assertion computes its own key rather than scraping one
+    /// out of output — which is also why the worker thread's steps join the
+    /// tree the command opened without anything being handed between threads.
+    #[test]
+    fn one_echo_run_produces_a_single_connected_span_tree_on_desktop() {
+        let captured = telemetry::capture_any();
+        let (base_url, model_thread) = echo_endpoint();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = tempfile::tempdir().expect("config tempdir");
+        let path = directory
+            .path()
+            .join("echo-spans.pos")
+            .display()
+            .to_string();
+        let runtime = Arc::new(bootstrap_local_runtime(
+            LocalBootstrapConfig::isolated(directory.path().join("packs")).with_echo(
+                EchoRuntimeOptions::loopback(base_url, "echo-desktop-span-fixture"),
+            ),
+        ));
+        let shell = ShellState::new(config.path().to_path_buf());
+        dispatch_command(
+            runtime.as_ref(),
+            &shell,
+            CommandName::ProjectCreate.as_str(),
+            &input_json(&ProjectCreateInput {
+                path: path.clone(),
+                name: Some("Echo spans".to_owned()),
+                template: "generic".to_owned(),
+            })
+            .expect("create input serializes"),
+        )
+        .expect("create project over IPC path");
+        let started = dispatch_command(
+            runtime.as_ref(),
+            &shell,
+            CommandName::RunStart.as_str(),
+            &input_json(&RunStartInput {
+                path: path.clone(),
+                worker: RunWorker::Echo,
+                autonomy_level: 2,
+                budget: echo_budget(),
+                tool_grants: Vec::new(),
+                parent_run_id: None,
+            })
+            .expect("Run input serializes"),
+        )
+        .expect("start Echo over IPC path");
+        let report: serde_json::Value = serde_json::from_str(&started).expect("Run report parses");
+        let run_id = report["runId"].as_str().expect("Run report has runId");
+        let project_id = report["projectId"]
+            .as_str()
+            .expect("Run report has projectId");
+        let trace = telemetry::TraceId::for_run(
+            ProjectId::from_hex(project_id).expect("project id is hex"),
+            RunId::from_hex(run_id).expect("Run id is hex"),
+        );
+
+        // Drain the durable feed so the worker has finished all three steps.
+        let stream_input = input_json(&RunStepsInput {
+            path: path.clone(),
+            run_id: run_id.to_owned(),
+        })
+        .expect("stream input serializes");
+        let (message_tx, message_rx) = std::sync::mpsc::channel::<String>();
+        let channel = Channel::<String>::new(move |body| {
+            if let Ok(message) = body.deserialize::<String>() {
+                let _ = message_tx.send(message);
+            }
+            Ok(())
+        });
+        dispatch_stream(
+            Arc::clone(&runtime),
+            StreamName::RunSteps.as_str().to_owned(),
+            stream_input,
+            None,
+            channel,
+            shell.enter_dispatch(),
+        )
+        .expect("Tauri channel stream starts");
+        loop {
+            let message = message_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("channel receives the terminal Echo feed");
+            if message.starts_with("id:") && message.contains("\"terminal\":true") {
+                break;
+            }
+        }
+        model_thread.join().expect("Echo fixture exits");
+        assert!(shell.drain_in_flight());
+
+        captured
+            .assert_single_connected_tree(trace)
+            .expect("the Echo Run is one connected tree");
+        let spans = captured.spans_in(trace);
+        let root = captured.root(trace).expect("the trace has a root");
+        assert_eq!(root.taxonomy_name(), "api.cmd/run.start");
+        assert_eq!(root.outcome(), Some("ok"));
+        let steps: Vec<&telemetry::FinishedSpan> = spans
+            .iter()
+            .filter(|span| span.name == telemetry::SpanName::AgentsStep)
+            .collect();
+        assert_eq!(steps.len(), 3, "Echo has exactly three tool boundaries");
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.parent == Some(root.span) && step.outcome() == Some("ok"))
+        );
+        let gateway: Vec<&telemetry::FinishedSpan> = spans
+            .iter()
+            .filter(|span| span.name == telemetry::SpanName::GatewayCall)
+            .collect();
+        assert_eq!(gateway.len(), 1, "Echo makes exactly one model call");
+        assert_eq!(gateway[0].taxonomy_name(), "gateway.call/openai-compatible");
+        // The model call nests under the step that asked for it, not under
+        // the command — that nesting is the whole point of the tree.
+        assert!(
+            steps
+                .iter()
+                .any(|step| Some(step.span) == gateway[0].parent)
+        );
     }
 
     #[test]

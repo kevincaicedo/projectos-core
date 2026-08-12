@@ -14,9 +14,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use pos_api::{
-    CommandName, CostRollupInput, EchoRuntimeOptions, ProjectCreateInput, QueryName, RunBudgetWire,
-    RunControlInput, RunResumeInput, RunStartInput, RunStepsInput, RunWorker, StreamName,
-    input_json,
+    CommandName, CostRollupInput, EchoRuntimeOptions, ProjectCreateInput, ProjectId, QueryName,
+    RunBudgetWire, RunControlInput, RunId, RunResumeInput, RunStartInput, RunStepsInput, RunWorker,
+    StreamName, input_json, telemetry,
 };
 
 /// A served shell on an ephemeral loopback port with its own data root.
@@ -407,6 +407,121 @@ fn authenticated_echo_frames_stream_before_the_run_finishes() {
     assert!(cost.contains("\"calls\":1"));
     assert!(cost.contains("\"feature\":\"echo\""));
     assert!(cost.contains("\"agent\":\"echo\""));
+    endpoint.finish();
+}
+
+/// m0-s15 AC 1, server half. Identical assertion shape to the desktop test,
+/// against a real authenticated socket: one Echo Run is one connected tree,
+/// and the trace key is computed from the durable ids rather than scraped
+/// from output.
+#[test]
+fn one_echo_run_produces_a_single_connected_span_tree_on_the_server() {
+    let captured = telemetry::capture_any();
+    let endpoint = BlockingEchoEndpoint::start();
+    let shell = ServedShell::start_with_echo(Some(EchoRuntimeOptions::loopback(
+        &endpoint.base_url,
+        "echo-http-span-fixture",
+    )));
+    let client = shell.signup("echo-spans@example.com", "echo spans password 1");
+    let project = project_path(&client, "echo-spans");
+    let (status, created) = api(
+        &shell,
+        &client,
+        "cmd",
+        CommandName::ProjectCreate.as_str(),
+        &input_json(&ProjectCreateInput {
+            path: project.clone(),
+            name: Some("Echo spans".to_owned()),
+            template: "generic".to_owned(),
+        })
+        .expect("create input serializes"),
+    );
+    assert_eq!(status, 200, "create failed: {created}");
+    let (status, started) = api(
+        &shell,
+        &client,
+        "cmd",
+        CommandName::RunStart.as_str(),
+        &input_json(&RunStartInput {
+            path: project.clone(),
+            worker: RunWorker::Echo,
+            autonomy_level: 2,
+            budget: echo_budget(),
+            tool_grants: Vec::new(),
+            parent_run_id: None,
+        })
+        .expect("Run input serializes"),
+    );
+    assert_eq!(status, 200, "Echo start failed: {started}");
+    let run_id = json_field(&started, "runId");
+    let project_id = json_field(&started, "projectId");
+    let trace = telemetry::TraceId::for_run(
+        ProjectId::from_hex(&project_id).expect("project id is hex"),
+        RunId::from_hex(&run_id).expect("Run id is hex"),
+    );
+    endpoint.wait_for_request();
+    endpoint.release();
+
+    // Drain the feed so every boundary has closed before the assertion.
+    let input = input_json(&RunStepsInput {
+        path: project.clone(),
+        run_id,
+    })
+    .expect("stream input serializes");
+    let target = format!(
+        "/api/stream/{}?input={}",
+        StreamName::RunSteps.as_str(),
+        percent_encode(&input)
+    );
+    let mut stream = TcpStream::connect(shell.addr).expect("connect SSE client");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set SSE timeout");
+    let request = format!(
+        "GET {target} HTTP/1.1\r\nhost: {}\r\nconnection: close\r\ncookie: {}\r\n\r\n",
+        shell.addr, client.cookie
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("write SSE subscribe");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read the SSE feed");
+    assert!(String::from_utf8_lossy(&raw).contains("\"runStatus\":\"done\""));
+
+    captured
+        .assert_single_connected_tree(trace)
+        .expect("the Echo Run is one connected tree on the server too");
+    let spans = captured.spans_in(trace);
+    let root = captured.root(trace).expect("the trace has a root");
+    assert_eq!(root.taxonomy_name(), "api.cmd/run.start");
+    let steps: Vec<&telemetry::FinishedSpan> = spans
+        .iter()
+        .filter(|span| span.name == telemetry::SpanName::AgentsStep)
+        .collect();
+    assert_eq!(steps.len(), 3);
+    assert!(steps.iter().all(|step| step.parent == Some(root.span)));
+    let gateway: Vec<&telemetry::FinishedSpan> = spans
+        .iter()
+        .filter(|span| span.name == telemetry::SpanName::GatewayCall)
+        .collect();
+    assert_eq!(gateway.len(), 1);
+    assert!(
+        steps
+            .iter()
+            .any(|step| Some(step.span) == gateway[0].parent)
+    );
+    // No span field anywhere in the tree carries free text: the value type
+    // has no String variant, so this is a check that the *shape* held, not a
+    // scan hoping to find nothing.
+    for span in &spans {
+        for (_, value) in span.fields() {
+            assert!(
+                !matches!(value, telemetry::SpanValue::Label(label) if label.len() > 64),
+                "a span label grew past the closed vocabulary"
+            );
+        }
+        assert_eq!(span.dropped_field_count(), 0);
+    }
     endpoint.finish();
 }
 

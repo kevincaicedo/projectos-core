@@ -375,6 +375,8 @@ fn check_rust_file(
         lines: &lines,
         projection_writes_allowed: projection_writes_allowed(root, path),
         panic_policy_enforced: !is_integration_test_path(root, path),
+        telemetry_emission_allowed: telemetry_emission_allowed(root, path),
+        registered_kind_detail_allowed: registered_kind_detail_allowed(root, path),
         violations,
     };
     visitor.visit_file(&syntax);
@@ -414,6 +416,8 @@ struct PolicyVisitor<'a> {
     lines: &'a [&'a str],
     projection_writes_allowed: bool,
     panic_policy_enforced: bool,
+    telemetry_emission_allowed: bool,
+    registered_kind_detail_allowed: bool,
     violations: &'a mut Vec<Violation>,
 }
 
@@ -433,6 +437,46 @@ impl PolicyVisitor<'_> {
                 line: Some(call_end_line),
                 message: format!(
                     ".{method}() outside test code requires a trailing `{INVARIANT_MARKER} <why>` comment on the same line"
+                ),
+            });
+        }
+    }
+
+    /// The m0-s15 telemetry rule. `tracing` is reachable from exactly one
+    /// module, which is what keeps the span vocabulary closed: the typed
+    /// facade has no `String` field value and no runtime-`&str` span name, so
+    /// a direct macro call is the only way ingested content or key material
+    /// could reach a span. Same shape as the projection-write rule — one
+    /// chokepoint, mechanically pinned.
+    fn check_telemetry_path(&mut self, path: &syn::Path, line: usize) {
+        if self.telemetry_emission_allowed {
+            return;
+        }
+        let leading = path
+            .segments
+            .first()
+            .map(|segment| segment.ident.to_string());
+        if leading.as_deref() == Some("tracing") {
+            self.violations.push(Violation {
+                policy: "telemetry-vocabulary",
+                path: self.path.to_path_buf(),
+                line: Some(line),
+                message: TELEMETRY_EMISSION_MESSAGE.to_owned(),
+            });
+        }
+        if !self.registered_kind_detail_allowed
+            && path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == REGISTERED_KIND_DETAIL)
+        {
+            self.violations.push(Violation {
+                policy: "telemetry-vocabulary",
+                path: self.path.to_path_buf(),
+                line: Some(line),
+                message: format!(
+                    "SpanDetail::{REGISTERED_KIND_DETAIL} accepts a runtime string; it is admitted \
+                     only in {REGISTERED_KIND_DETAIL_OWNER}, where the value is a registered job kind"
                 ),
             });
         }
@@ -480,6 +524,26 @@ impl<'ast> Visit<'ast> for PolicyVisitor<'_> {
             self.check_panic_call(method, line, column);
         });
         syn::visit::visit_macro(self, mac);
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        self.check_telemetry_path(path, path.span().start().line);
+        syn::visit::visit_path(self, path);
+    }
+
+    fn visit_use_tree(&mut self, tree: &'ast syn::UseTree) {
+        if let syn::UseTree::Path(used) = tree
+            && !self.telemetry_emission_allowed
+            && used.ident == "tracing"
+        {
+            self.violations.push(Violation {
+                policy: "telemetry-vocabulary",
+                path: self.path.to_path_buf(),
+                line: Some(used.ident.span().start().line),
+                message: TELEMETRY_EMISSION_MESSAGE.to_owned(),
+            });
+        }
+        syn::visit::visit_use_tree(self, tree);
     }
 
     fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
@@ -572,6 +636,21 @@ fn flatten_tokens(stream: TokenStream, output: &mut Vec<TokenTree>) {
         }
         output.push(token);
     }
+}
+
+/// The one module that may name `tracing` (m0-s15).
+const TELEMETRY_EMISSION_OWNER: &str = "crates/pos-foundation/src/telemetry";
+const TELEMETRY_EMISSION_MESSAGE: &str = "`tracing` is reachable only from crates/pos-foundation/src/telemetry/; open a span through \
+     pos_foundation::telemetry::Span so its name and fields stay a closed, string-free vocabulary";
+const REGISTERED_KIND_DETAIL: &str = "from_registered_kind";
+const REGISTERED_KIND_DETAIL_OWNER: &str = "crates/pos-sched/src/pool.rs";
+
+fn telemetry_emission_allowed(root: &Path, path: &Path) -> bool {
+    path.starts_with(root.join(TELEMETRY_EMISSION_OWNER))
+}
+
+fn registered_kind_detail_allowed(root: &Path, path: &Path) -> bool {
+    telemetry_emission_allowed(root, path) || path == root.join(REGISTERED_KIND_DETAIL_OWNER)
 }
 
 fn projection_writes_allowed(root: &Path, path: &Path) -> bool {
@@ -887,10 +966,65 @@ mod tests {
             lines: &lines,
             projection_writes_allowed: false,
             panic_policy_enforced: !super::is_integration_test_path(root, path),
+            telemetry_emission_allowed: super::telemetry_emission_allowed(root, path),
+            registered_kind_detail_allowed: super::registered_kind_detail_allowed(root, path),
             violations: &mut violations,
         };
         visitor.visit_file(&syntax);
         violations
+    }
+
+    /// The m0-s15 telemetry rule, with its seeded violations. A checker that
+    /// has never been seen to fail is decoration.
+    #[test]
+    fn tracing_is_reachable_only_from_the_telemetry_module() {
+        let seeded = [
+            "fn emit() { tracing::info!(\"user said {}\", text); }",
+            "use tracing::Level;",
+            "fn emit() { let _span = tracing::span!(tracing::Level::INFO, \"api.cmd\"); }",
+        ];
+        for source in seeded {
+            let violations = rust_violations_at(source, "/workspace/crates/pos-api/src/lib.rs");
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.policy == "telemetry-vocabulary"),
+                "{source:?} must fail the telemetry rule"
+            );
+        }
+        // The owning module is admitted, and so is unrelated code that merely
+        // uses the typed facade.
+        assert!(
+            rust_violations_at(
+                seeded[2],
+                "/workspace/crates/pos-foundation/src/telemetry/emit.rs",
+            )
+            .is_empty()
+        );
+        assert!(
+            rust_violations_at(
+                "fn emit() { let s = Span::open(SpanName::ApiQuery, detail, Parent::Current); }",
+                "/workspace/crates/pos-api/src/lib.rs",
+            )
+            .is_empty()
+        );
+    }
+
+    /// The one constructor that accepts a runtime string is pinned to the one
+    /// call site whose value is a registered job kind.
+    #[test]
+    fn the_registered_kind_detail_is_pinned_to_the_scheduler_pool() {
+        let source = "fn detail() { let _ = SpanDetail::from_registered_kind(untrusted); }";
+        let violations = rust_violations_at(source, "/workspace/crates/pos-ingest/src/lib.rs");
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.policy == "telemetry-vocabulary")
+                .count(),
+            1,
+            "a runtime-string span name outside the pool must fail"
+        );
+        assert!(rust_violations_at(source, "/workspace/crates/pos-sched/src/pool.rs").is_empty());
     }
 
     /// Integration-test files are test code by Cargo's definition: the panic

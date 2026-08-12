@@ -100,6 +100,21 @@ pub enum ToolEffectClass {
     NonIdempotent,
 }
 
+impl ToolEffectClass {
+    /// The static label a trace carries for this step (m0-s15). The tool's
+    /// own id is a registered identifier rather than a literal, and it is
+    /// already in the durable step fact, so the span carries the class — the
+    /// L5/L6 question — and the log carries the name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Idempotent => "idempotent",
+            Self::NonIdempotent => "non_idempotent",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolDescriptor {
     pub id: ToolId,

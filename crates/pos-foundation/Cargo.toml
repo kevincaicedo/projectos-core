@@ -12,3 +12,7 @@ workspace = true
 # Ids and event payloads serialize with stable byte-level shapes (event bodies
 # are versioned serde structs, STYLE); serde is the one serialization seam.
 serde = { workspace = true }
+# The one crate in the workspace that may name `tracing` (m0-s15): the typed
+# telemetry facade is the only emission point, which is what keeps the span
+# vocabulary closed. `check-discipline` enforces the exclusivity.
+tracing = { workspace = true }

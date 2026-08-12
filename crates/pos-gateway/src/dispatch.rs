@@ -26,6 +26,7 @@ use crate::provider::{
 use crate::transport::HttpTransport;
 use crate::weather::Weather;
 use pos_foundation::WallClock;
+use pos_foundation::telemetry::{Parent, Span, SpanDetail, SpanField, SpanName, SpanValue};
 
 /// Default per-call transport deadline. Two minutes covers a long frontier
 /// synthesis stream; anything slower should be a job, not a blocking call.
@@ -111,17 +112,52 @@ impl<'runtime> Gateway<'runtime> {
         sink: &mut dyn CompletionSink,
     ) -> Result<CompletionUsage, Weather> {
         let choice = self.config.routing.choice(tier);
+        // `gateway.call/:provider` (m0-s15). The parent is whatever step is
+        // open on this thread, so a model call always lands under the agent
+        // step that asked for it. The model name is deliberately absent: a
+        // span field cannot hold a string, and the ledger row already carries
+        // it against the money.
+        let span = Span::open(
+            SpanName::GatewayCall,
+            SpanDetail::from_static(choice.family.as_str()),
+            Parent::Current,
+        );
+        span.set(
+            SpanField::Project,
+            SpanValue::Id(attribution.project.into_bytes()),
+        );
+        span.set(SpanField::Tier, SpanValue::Label(tier.as_str()));
+        span.set(
+            SpanField::CredentialClass,
+            SpanValue::Label(choice.credential.label()),
+        );
         let started_ts_ms = self.clock.now_ms();
         let outcome = self.run_call(choice, request, sink);
         let wall_ms = self.clock.now_ms().saturating_sub(started_ts_ms);
-        self.record_outcome(
+        span.set(SpanField::DurationMs, SpanValue::Millis(wall_ms));
+        match &outcome {
+            Ok(usage) => {
+                span.set(SpanField::TokensIn, SpanValue::Count(usage.tokens_in));
+                span.set(SpanField::TokensOut, SpanValue::Count(usage.tokens_out));
+            }
+            Err(weather) => span.set(SpanField::Outcome, SpanValue::Label(weather.code())),
+        }
+        let ledgered = self.record_outcome(
             attribution,
             choice,
             request,
             &outcome,
             wall_ms,
             started_ts_ms,
-        )?;
+        );
+        match &ledgered {
+            Ok(()) if outcome.is_ok() => span.finish("ok"),
+            // A ledger failure outranks a model success (invariant 4), so the
+            // span reports what the caller will actually receive.
+            Err(weather) => span.finish(weather.code()),
+            Ok(()) => drop(span),
+        }
+        ledgered?;
         outcome
     }
 

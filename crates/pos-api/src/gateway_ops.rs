@@ -13,6 +13,7 @@ use pos_gateway::{
 };
 use pos_log::{Actor, ProjectLog};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use ts_rs::TS;
 
@@ -125,6 +126,34 @@ pub struct CostRollupTotals {
     pub projectos_usd_micros: u64,
 }
 
+/// One attribution dimension's totals (m0-s15). The three dimensions the
+/// story names — project, feature, agent — are all computed in one pass over
+/// the same detail rows, so the cost surfaces F23/F32 will render never
+/// re-sum anything in TypeScript. Domain arithmetic stays in the core, which
+/// is also the only way two shells cannot disagree about a number (L12).
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CostGroupRow {
+    /// `project`, `feature`, or `agent`.
+    #[ts(type = "string")]
+    pub dimension: &'static str,
+    /// `null` only in the `agent` dimension, for spend a feature incurred
+    /// outside any Run — a real bucket, not a missing value.
+    pub key: Option<String>,
+    #[ts(type = "number")]
+    pub calls: u64,
+    #[ts(type = "number")]
+    pub tokens_in: u64,
+    #[ts(type = "number")]
+    pub tokens_out: u64,
+    #[ts(type = "number")]
+    pub wall_ms_total: u64,
+    #[ts(type = "number")]
+    pub usd_micros: u64,
+    #[ts(type = "number")]
+    pub projectos_usd_micros: u64,
+}
+
 #[derive(Debug, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CostRollupReport {
@@ -133,6 +162,8 @@ pub struct CostRollupReport {
     pub scope: &'static str,
     pub project_count: u32,
     pub rows: Vec<CostRollupRow>,
+    /// Per-project, per-feature, and per-agent rollups over the same rows.
+    pub groups: Vec<CostGroupRow>,
     pub totals: CostRollupTotals,
 }
 
@@ -185,6 +216,7 @@ pub(crate) fn cost_rollup(
             totals.projectos_usd_micros += row.usd_micros;
         }
     }
+    let groups = group_rows(&rows);
     project_ops::to_json(&CostRollupReport {
         scope: if input.path.is_some() {
             "project"
@@ -193,8 +225,46 @@ pub(crate) fn cost_rollup(
         },
         project_count: u32::try_from(targets.len()).unwrap_or(u32::MAX), // INVARIANT: the session table is capped at 64 projects.
         rows,
+        groups,
         totals,
     })
+}
+
+/// Folds the detail rows three ways in one pass. Deterministic order —
+/// dimension, then key — so both transports render byte-identical bytes.
+fn group_rows(rows: &[CostRollupRow]) -> Vec<CostGroupRow> {
+    let mut buckets: BTreeMap<(&'static str, Option<&str>), CostGroupRow> = BTreeMap::new();
+    for row in rows {
+        for (dimension, key) in [
+            ("project", Some(row.project_id.as_str())),
+            ("feature", Some(row.feature.as_str())),
+            ("agent", row.agent.as_deref()),
+        ] {
+            let bucket = buckets
+                .entry((dimension, key))
+                .or_insert_with(|| CostGroupRow {
+                    dimension,
+                    key: key.map(str::to_owned),
+                    calls: 0,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    wall_ms_total: 0,
+                    usd_micros: 0,
+                    projectos_usd_micros: 0,
+                });
+            bucket.calls += row.calls;
+            bucket.tokens_in += row.tokens_in;
+            bucket.tokens_out += row.tokens_out;
+            bucket.wall_ms_total += row.wall_ms_total;
+            bucket.usd_micros += row.usd_micros;
+            // The m0-s10 honesty rule holds at every grain: BYOK and
+            // device-session spend is the customer's, never ProjectOS cost.
+            if row.provider_cost_kind != "customer_billed" {
+                bucket.projectos_usd_micros += row.usd_micros;
+            }
+        }
+    }
+    buckets.into_values().collect()
 }
 
 fn rollup_one_project(root: &Path, rows: &mut Vec<CostRollupRow>) -> Result<(), ApiError> {

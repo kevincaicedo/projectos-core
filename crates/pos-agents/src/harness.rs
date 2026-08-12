@@ -40,11 +40,15 @@ use pos_domain::{
     RunToolEffectRecordedBody, RunTrigger, RunUsage, RunValidationRecordedBody, RunValidationRef,
     RunValidationStatus, read_run, read_run_step,
 };
+use pos_foundation::telemetry::{
+    Parent, Span, SpanContext, SpanDetail, SpanField, SpanName, SpanValue,
+};
 use pos_foundation::{
-    ArtifactId, CheckpointId, DeviceId, QuestionId, RunId, ToolCallId, UserId, ValidationId,
-    WallClock,
+    ArtifactId, CheckpointId, DeviceId, ProjectId, QuestionId, RunId, ToolCallId, UserId,
+    ValidationId, WallClock,
 };
 use pos_log::{Actor, LogError, ProjectLog};
+use std::cell::RefCell;
 use std::fmt;
 
 /// Head races should resolve in one retry under the single writer. Four lets
@@ -192,6 +196,33 @@ impl fmt::Display for HarnessError {
     }
 }
 
+impl HarnessError {
+    /// The stable label this failure carries into a span and into the
+    /// `pos-api` envelope. `pos-api` refines `log_failure` into the store's
+    /// own codes; every other variant maps one to one.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Log(_) => "log_failure",
+            Self::Read(_) => "state_corrupt",
+            Self::BudgetConfig(_)
+            | Self::Runtime(_)
+            | Self::ToolRegistry(_)
+            | Self::InvalidStepPlan { .. }
+            | Self::InvalidControlReason
+            | Self::InvalidQuestion
+            | Self::InvalidArtifact
+            | Self::InvalidValidation => "invalid_input",
+            Self::Authorization(_) => "policy_denied",
+            Self::RunNotFound { .. } => "run_not_found",
+            Self::ConditionalAppendContention { .. } => "state_changed",
+            Self::InvalidRunState { .. }
+            | Self::StepPlanChanged { .. }
+            | Self::EffectReportChanged { .. } => "run_conflict",
+        }
+    }
+}
+
 impl std::error::Error for HarnessError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -315,6 +346,30 @@ impl<'a> RunHarness<'a> {
         receipt: Option<&GateReceipt>,
     ) -> Result<StepPreparation, HarnessError> {
         validate_step_plan(plan)?;
+        // A boundary that opened and never reported back closes as abandoned
+        // rather than lingering into the next step's measurement (L8).
+        close_step_span(OUTCOME_STEP_ABANDONED);
+        let preparation = self.prepare_step_inner(run_id, plan, receipt);
+        // The step span opens here and closes in `record_effect`, because a
+        // step *is* the tool boundary: intent, outside effect, receipt. Only
+        // a preparation that authorizes an effect has a boundary to measure.
+        if let Ok(StepPreparation::Effect(call)) = &preparation {
+            open_step_span(
+                self.log.store().manifest().project_id,
+                run_id,
+                plan,
+                call.effect_class(),
+            );
+        }
+        preparation
+    }
+
+    fn prepare_step_inner(
+        &self,
+        run_id: RunId,
+        plan: &StepPlan,
+        receipt: Option<&GateReceipt>,
+    ) -> Result<StepPreparation, HarnessError> {
         for _ in 0..CONDITIONAL_APPEND_RETRY_MAX {
             let state = self.state_required(run_id)?;
             validate_run_counts(&state)?;
@@ -376,6 +431,19 @@ impl<'a> RunHarness<'a> {
     }
 
     pub fn record_effect(
+        &self,
+        call: &AuthorizedToolCall,
+        report: &ToolEffectReport,
+    ) -> Result<pos_domain::RunCheckpointState, HarnessError> {
+        let recorded = self.record_effect_inner(call, report);
+        match &recorded {
+            Ok(_) => close_step_span("ok"),
+            Err(error) => close_step_span(error.code()),
+        }
+        recorded
+    }
+
+    fn record_effect_inner(
         &self,
         call: &AuthorizedToolCall,
         report: &ToolEffectReport,
@@ -1076,6 +1144,47 @@ fn effect_events(
         }));
     }
     Ok(events)
+}
+
+thread_local! {
+    /// The open step span, when this thread is inside a tool boundary.
+    ///
+    /// One slot is enough because a step's intent and its receipt are
+    /// committed by the same worker thread — the §8 single-writer discipline
+    /// already requires it, and the m0-s13 Echo worker is exactly that shape.
+    /// The alternative, threading a span handle through `StepPreparation`,
+    /// would put a telemetry type in a durable-control enum that four call
+    /// sites and the whole resume property suite match on.
+    static STEP_SPAN: RefCell<Option<Span>> = const { RefCell::new(None) };
+}
+
+/// Outcome of a boundary whose effect was authorized but never reported.
+const OUTCOME_STEP_ABANDONED: &str = "abandoned";
+
+fn open_step_span(project_id: ProjectId, run_id: RunId, plan: &StepPlan, effect: ToolEffectClass) {
+    // `Parent::Of` on the *derived* Run context, never on a handed-down one:
+    // a Run resumed in another process after `kill -9` computes the same
+    // parent from the same durable ids, so its steps join the original trace.
+    let span = Span::open(
+        SpanName::AgentsStep,
+        SpanDetail::from_static(plan.phase.as_str()),
+        Parent::Of(SpanContext::for_run(project_id, run_id)),
+    );
+    span.set(SpanField::Project, SpanValue::Id(project_id.into_bytes()));
+    span.set(SpanField::Run, SpanValue::Id(run_id.into_bytes()));
+    span.set(
+        SpanField::StepIndex,
+        SpanValue::Count(u64::from(plan.step_index)),
+    );
+    span.set(SpanField::EffectClass, SpanValue::Label(effect.as_str()));
+    let _ = STEP_SPAN.try_with(|slot| slot.replace(Some(span)));
+}
+
+fn close_step_span(outcome: &'static str) {
+    let Ok(Some(span)) = STEP_SPAN.try_with(|slot| slot.borrow_mut().take()) else {
+        return;
+    };
+    span.finish(outcome);
 }
 
 fn checkpoint_id(call_id: ToolCallId) -> CheckpointId {

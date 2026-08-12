@@ -11,8 +11,8 @@
 //! truth for names on both sides of the wire.
 
 use crate::gateway_ops::{
-    CostRollupInput, CostRollupReport, CostRollupRow, CostRollupTotals, ModelsPullInput,
-    ModelsPullReport,
+    CostGroupRow, CostRollupInput, CostRollupReport, CostRollupRow, CostRollupTotals,
+    ModelsPullInput, ModelsPullReport,
 };
 use crate::project_ops::{
     ProjectCreateInput, ProjectCreateReport, ProjectExportInput, ProjectExportReport,
@@ -53,6 +53,7 @@ macro_rules! for_each_exported_type {
             HealthReport,
             CostRollupInput,
             CostRollupRow,
+            CostGroupRow,
             CostRollupTotals,
             CostRollupReport,
             ModelsPullInput,

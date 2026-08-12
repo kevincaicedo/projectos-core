@@ -1,0 +1,20 @@
+[package]
+name = "pos-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The harness drives the product through its own seam (L12): a scenario that
+# measured a private path would not be measuring what a user experiences.
+pos-api = { path = "../../crates/pos-api" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Registry fixtures for the classification rules.
+tempfile = { workspace = true }

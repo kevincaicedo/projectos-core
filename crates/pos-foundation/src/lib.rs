@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod clock;
+pub mod telemetry;
 
 pub use clock::{ManualWallClock, SystemWallClock, WallClock};
 

@@ -81,7 +81,10 @@ fn allowed_deps() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     let api_only: BTreeSet<&str> = ["pos-api"].into_iter().collect();
     map.insert("pos-server", api_only.clone());
     map.insert("pos", api_only.clone());
-    map.insert("pos-desktop", api_only);
+    map.insert("pos-desktop", api_only.clone());
+    // The gate harness is held to the shell rule on purpose: a bench that
+    // reached past `pos-api` would measure a path no user can take (m0-s16).
+    map.insert("pos-bench", api_only);
 
     // The checker itself uses no internal crates.
     map.insert("check-dep-dag", BTreeSet::new());

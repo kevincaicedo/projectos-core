@@ -101,6 +101,13 @@ enum ModelsCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Telemetry is opt-in and off by default (m0-s15). A spec we cannot honour
+    // stops the process: running with export silently disabled would let an
+    // empty collector read as "nothing happened".
+    if let Err(error) = pos_api::install_telemetry(telemetry_spec().as_deref()) {
+        eprintln!("{}", error.to_json());
+        return ExitCode::FAILURE;
+    }
     let runtime = bootstrap_local_runtime(LocalBootstrapConfig::isolated(PathBuf::from("packs")));
     match run(&runtime, cli.command) {
         Ok(exit) => exit,
@@ -109,6 +116,11 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The one telemetry configuration key every shell reads (m0-s15).
+fn telemetry_spec() -> Option<String> {
+    std::env::var("POS_TELEMETRY").ok()
 }
 
 /// Dispatches one subcommand. `Err` carries the typed error envelope JSON.

@@ -170,9 +170,25 @@ crash-matrix:
     cargo test -p pos-store --test crash_matrix
     cargo test -p pos-log --test log_crash
 
-# pos-bench lands in m0-s16.
-bench:
-    @echo "pos-bench v0 lands in m0-s16 (cold-start, project-open, interaction scenarios)"
+# The m0-s16 gate campaign. NOT in `ci`: §18 numbers are measured on a pinned
+# reference machine under the docs/reference-machines.md §4 protocol, and the
+# harness itself downgrades anything else to `early_warning`.
+#
+# Prerequisites for a binding run: a clean tree, release builds, AC power, and
+# `just e2e` first (the in-page measurements are two of the three scenarios'
+# inputs).
+bench: bench-build
+    ./target/release/pos-bench run --scenario ui-interaction-p95 --out ../docs/gates/m0
+    ./target/release/pos-bench run --scenario project-open1m --out ../docs/gates/m0
+    ./target/release/pos-bench run --scenario desktop-cold-start50 --out ../docs/gates/m0
+
+bench-build: node-version-check
+    pnpm --dir apps/ui build
+    cargo build --release -p pos-bench -p pos-desktop
+
+# One scenario, for iterating: `just bench-one project-open1m`.
+bench-one scenario:
+    ./target/release/pos-bench run --scenario {{scenario}} --out ../docs/gates/m0
 
 # Emits the docs/reference-machines.md fingerprint for the current host. Run on
 # each binding machine and paste the output into its registry row (m0-s02).

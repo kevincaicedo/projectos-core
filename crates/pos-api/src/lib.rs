@@ -22,8 +22,8 @@ mod stream;
 mod ts_export;
 
 pub use gateway_ops::{
-    CostRollupInput, CostRollupReport, CostRollupRow, CostRollupTotals, EventCostLedger,
-    ModelsPullInput, ModelsPullReport,
+    CostGroupRow, CostRollupInput, CostRollupReport, CostRollupRow, CostRollupTotals,
+    EventCostLedger, ModelsPullInput, ModelsPullReport,
 };
 pub use project_ops::{ProjectCreateInput, ProjectExportInput, ProjectPathInput, ProjectSeedInput};
 pub use run_ops::{
@@ -36,7 +36,10 @@ pub use sched_ops::{
 };
 // Shells construct runtimes and attribute actors through these foundation
 // types; re-exported so a shell needs no direct pos-foundation edge (L12).
-pub use pos_foundation::{SystemWallClock as FoundationClock, UserId, WallClock};
+pub use pos_foundation::{ProjectId, RunId, SystemWallClock as FoundationClock, UserId, WallClock};
+// The telemetry vocabulary shells configure and oracles assert against
+// (m0-s15); re-exported so a shell still depends on `pos-api` alone (L12).
+pub use pos_foundation::telemetry;
 pub use session::{HealthReport, OPEN_PROJECT_COUNT_MAX, OpenProjectRow, ProjectListReport};
 pub use stream::{
     ResumeWindow, SSE_RETRY_MS, STREAM_RESUME_WINDOW_LEN, StreamFrame, parse_resume_cursor,
@@ -49,6 +52,7 @@ use pos_capabilities::{
     ConnectorHostResponse, ConnectorId, LocalCapabilityConfig, ProviderFuture, WorkspaceId,
 };
 use pos_foundation::SystemWallClock;
+use pos_foundation::telemetry::{Parent, SpanDetail, SpanField, SpanName, SpanValue};
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
@@ -66,7 +70,9 @@ use std::task::{Context, Poll, Waker};
 /// v6: m0-s13 adds Echo and the durable `run.steps` item contract.
 /// v7: m0-s14 implements `job.list` over the real queue and adds
 /// `cron.preview`, the tz-aware next-runs answer a cron editor reads.
-pub const API_SURFACE_VERSION: u16 = 7;
+/// v8: m0-s15 adds the per-project/feature/agent `groups` to `cost.rollup`,
+/// so the cost surfaces re-sum nothing in a shell.
+pub const API_SURFACE_VERSION: u16 = 8;
 
 /// Bounded item budget for the M0 connector-host liveness tick (L8). The socket
 /// itself caps this at 32; the runtime asks for less than it is allowed.
@@ -363,6 +369,16 @@ impl LocalRuntime {
     /// accept (and ignore) an empty object so every transport can treat the
     /// pair `(name, input)` uniformly.
     pub fn query_with_input(&self, name: &str, input_json: &str) -> Result<String, ApiError> {
+        let span = api_span(
+            SpanName::ApiQuery,
+            QueryName::parse(name).map(QueryName::as_str),
+        );
+        let result = self.dispatch_query(name, input_json);
+        finish_api_span(span, result.as_ref().err());
+        result
+    }
+
+    fn dispatch_query(&self, name: &str, input_json: &str) -> Result<String, ApiError> {
         match QueryName::parse(name) {
             Some(QueryName::CapabilitySnapshot) => Ok(self.capability_snapshot_json()),
             Some(QueryName::ProjectInspect) => {
@@ -387,6 +403,21 @@ impl LocalRuntime {
 
     /// Dispatches a state-changing command with a JSON input document.
     pub fn command(&self, name: &str, input_json: &str) -> Result<String, ApiError> {
+        let mut span = api_span(
+            SpanName::ApiCommand,
+            CommandName::parse(name).map(CommandName::as_str),
+        );
+        let result = self.dispatch_command(name, input_json, &mut span);
+        finish_api_span(span, result.as_ref().err());
+        result
+    }
+
+    fn dispatch_command(
+        &self,
+        name: &str,
+        input_json: &str,
+        span: &mut pos_foundation::telemetry::Span,
+    ) -> Result<String, ApiError> {
         match CommandName::parse(name) {
             Some(CommandName::ProjectCreate) => project_ops::create(
                 &self.identity,
@@ -412,6 +443,7 @@ impl LocalRuntime {
                 &self.clock,
                 &self.echo_supervisor,
                 &project_ops::parse_input(input_json)?,
+                span,
             ),
             Some(CommandName::RunCancel) => run_ops::cancel(
                 &self.identity,
@@ -443,12 +475,24 @@ impl LocalRuntime {
         input_json: &str,
         resume_after: Option<u64>,
     ) -> Result<Vec<StreamFrame>, ApiError> {
-        match StreamName::parse(name) {
+        let span = api_span(
+            SpanName::ApiStream,
+            StreamName::parse(name).map(StreamName::as_str),
+        );
+        let result = match StreamName::parse(name) {
             Some(StreamName::RunSteps) => {
                 run_ops::stream_subscribe(&project_ops::parse_input(input_json)?, resume_after)
             }
             None => Err(ApiError::unknown_stream(name)),
+        };
+        if let Ok(frames) = &result {
+            span.set(
+                SpanField::Frames,
+                SpanValue::Count(frames.len().try_into().unwrap_or(u64::MAX)), // INVARIANT: the resume window caps a subscribe at 256 frames.
+            );
         }
+        finish_api_span(span, result.as_ref().err());
+        result
     }
 
     /// Replays durable frames after `resume_after`, then tails checkpoint
@@ -458,16 +502,27 @@ impl LocalRuntime {
         name: &str,
         input_json: &str,
         resume_after: Option<u64>,
-        consume: impl FnMut(StreamFrame) -> bool,
+        mut consume: impl FnMut(StreamFrame) -> bool,
     ) -> Result<(), ApiError> {
-        match StreamName::parse(name) {
+        let span = api_span(
+            SpanName::ApiStream,
+            StreamName::parse(name).map(StreamName::as_str),
+        );
+        let mut frame_count: u64 = 0;
+        let result = match StreamName::parse(name) {
             Some(StreamName::RunSteps) => run_ops::stream_follow(
                 &project_ops::parse_input(input_json)?,
                 resume_after,
-                consume,
+                |frame| {
+                    frame_count = frame_count.saturating_add(1);
+                    consume(frame)
+                },
             ),
             None => Err(ApiError::unknown_stream(name)),
-        }
+        };
+        span.set(SpanField::Frames, SpanValue::Count(frame_count));
+        finish_api_span(span, result.as_ref().err());
+        result
     }
 
     /// Liveness with version identity — real values read from this process,
@@ -546,6 +601,74 @@ impl LocalRuntime {
             }),
             _ => None,
         }
+    }
+}
+
+/// Installs the telemetry pipeline from one shell-supplied spec (m0-s15).
+///
+/// Every shell calls this with the value of its own configuration key, so the
+/// grammar is parsed once here rather than three times in three shells (L12).
+/// Absent means **off**: a desktop that was not asked to export telemetry
+/// writes none (L4 spirit).
+///
+/// Grammar: `off` · `stderr` · `file:<path>` · `otlp:<endpoint>`.
+///
+/// # Errors
+///
+/// A typed envelope for an unparseable spec, an unopenable file, or the
+/// registered-but-unimplemented OTLP target. A shell reports it and stops
+/// rather than starting with export silently disabled — an operator who asked
+/// for traces and got none would be reading an empty collector as evidence.
+pub fn install_telemetry(spec: Option<&str>) -> Result<(), ApiError> {
+    let config = match spec.map(str::trim) {
+        None | Some("") | Some("off") => pos_foundation::telemetry::TelemetryConfig::off(),
+        Some("stderr") => pos_foundation::telemetry::TelemetryConfig::stderr(),
+        Some(other) => match other.split_once(':') {
+            Some(("file", path)) if !path.is_empty() => {
+                pos_foundation::telemetry::TelemetryConfig::json_lines(PathBuf::from(path))
+            }
+            Some(("otlp", endpoint)) if !endpoint.is_empty() => {
+                pos_foundation::telemetry::TelemetryConfig {
+                    export: pos_foundation::telemetry::TelemetryExport::Otlp {
+                        endpoint: endpoint.to_owned(),
+                    },
+                }
+            }
+            _ => {
+                return Err(ApiError {
+                    code: "invalid_input",
+                    message: "telemetry must be one of: off, stderr, file:<path>, otlp:<endpoint>"
+                        .to_owned(),
+                    retriable: false,
+                });
+            }
+        },
+    };
+    pos_foundation::telemetry::install(config).map_err(|error| ApiError {
+        code: error.code,
+        message: error.message,
+        retriable: false,
+    })
+}
+
+/// Opens the dispatch span for one API name (m0-s15). An unregistered name
+/// still gets a span — a caller hammering a typo is exactly the thing a
+/// trace should show — under the static label `unknown`.
+fn api_span(name: SpanName, registered: Option<&'static str>) -> pos_foundation::telemetry::Span {
+    pos_foundation::telemetry::Span::open(
+        name,
+        SpanDetail::from_static(registered.unwrap_or("unknown")),
+        Parent::Current,
+    )
+}
+
+/// Closes a dispatch span with the code the caller will actually receive.
+/// `ApiError::code` is already `&'static str`, so the outcome vocabulary and
+/// the wire vocabulary are the same list by construction.
+fn finish_api_span(span: pos_foundation::telemetry::Span, error: Option<&ApiError>) {
+    match error {
+        Some(error) => span.finish(error.code),
+        None => span.finish("ok"),
     }
 }
 
