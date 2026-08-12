@@ -5,9 +5,17 @@
 
 use std::process::ExitCode;
 
+#[cfg(debug_assertions)]
+mod chaos_child;
+
 fn main() -> ExitCode {
     let mut arguments = std::env::args_os().skip(1);
-    if arguments.next().as_deref() == Some(std::ffi::OsStr::new("--packaging-smoke")) {
+    let first = arguments.next();
+    #[cfg(debug_assertions)]
+    if first.as_deref() == Some(std::ffi::OsStr::new("--echo-chaos-child")) {
+        return chaos_child::run(arguments);
+    }
+    if first.as_deref() == Some(std::ffi::OsStr::new("--packaging-smoke")) {
         let Some(project_root) = arguments.next() else {
             eprintln!("usage: pos-desktop --packaging-smoke <absolute-project-path>");
             return ExitCode::FAILURE;

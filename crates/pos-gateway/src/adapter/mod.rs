@@ -37,8 +37,13 @@ pub(crate) const ESTIMATE_CHARS_PER_TOKEN: u64 = 4;
 /// Request fields a compatible server most plausibly rejects; scanning the
 /// error message for them turns an opaque 400 into a typed
 /// [`Weather::UnsupportedField`] the capability profile can record.
-pub(crate) const KNOWN_REJECTABLE_FIELDS: [&str; 4] =
-    ["stream_options", "max_completion_tokens", "tools", "system"];
+pub(crate) const KNOWN_REJECTABLE_FIELDS: [&str; 5] = [
+    "stream_options",
+    "max_completion_tokens",
+    "reasoning_effort",
+    "tools",
+    "system",
+];
 
 pub(crate) fn estimate_tokens(chars: u64) -> u64 {
     chars.div_ceil(ESTIMATE_CHARS_PER_TOKEN)

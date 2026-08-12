@@ -14,7 +14,7 @@ use common::{FixtureOutcome, FixtureTransport};
 use pos_gateway::{
     AnthropicAdapter, CallAuth, ChatMessage, CompletionRequest, EndpointProfile, EndpointServer,
     GoogleAdapter, MessageRole, OpenAiAdapter, OpenAiCompatibleAdapter, OpenRouterAdapter,
-    Provider, ProviderFamily, SecretValue, TransportError, VecSink, Weather,
+    Provider, ProviderFamily, ReasoningEffort, SecretValue, TransportError, VecSink, Weather,
     qualify_openai_compatible,
 };
 use std::collections::BTreeSet;
@@ -37,6 +37,7 @@ fn request() -> CompletionRequest {
             content: "Say hello world.".to_owned(),
         }],
         tools_json: Some(r#"[{"name":"read_file"}]"#.to_owned()),
+        reasoning_effort: None,
         max_output_tokens: 128,
         timeout_ms: 5_000,
     }
@@ -190,6 +191,52 @@ fn google_plan_shape_model_in_path_key_in_header_roles_mapped() {
         "assistant turns map to Gemini's `model` role"
     );
     assert!(plan.body.contains("systemInstruction"));
+}
+
+#[test]
+fn ollama_reasoning_disable_is_explicit_and_unqualified_servers_refuse_it() {
+    let mut no_reasoning = request();
+    no_reasoning.reasoning_effort = Some(ReasoningEffort::Disabled);
+    let transport = FixtureTransport::respond(200, COMPATIBLE_STREAM_NO_USAGE);
+    let mut sink = VecSink::default();
+    OpenAiCompatibleAdapter {
+        base_url: "http://localhost:11434".to_owned(),
+        profile: EndpointProfile {
+            server: EndpointServer::Ollama,
+            supports_stream_usage: false,
+        },
+    }
+    .complete(&api_key(), &no_reasoning, &transport, &mut sink)
+    .expect("qualified Ollama accepts explicit reasoning disable");
+    assert!(
+        transport
+            .single_plan()
+            .body
+            .contains("\"reasoning_effort\":\"none\"")
+    );
+
+    let transport = FixtureTransport::respond(200, COMPATIBLE_STREAM_NO_USAGE);
+    let refused = OpenAiCompatibleAdapter {
+        base_url: "http://localhost:1234".to_owned(),
+        profile: EndpointProfile::conservative(),
+    }
+    .complete(
+        &api_key(),
+        &no_reasoning,
+        &transport,
+        &mut VecSink::default(),
+    )
+    .expect_err("an unqualified compatible server cannot silently ignore reasoning control");
+    assert_eq!(
+        refused,
+        Weather::UnsupportedField {
+            field: "reasoning_effort".to_owned()
+        }
+    );
+    assert!(
+        transport.plans.lock().expect("test mutex").is_empty(),
+        "unsupported reasoning control must fail before transport I/O"
+    );
 }
 
 // -------------------------------------------------------- streaming rows

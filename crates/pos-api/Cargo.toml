@@ -12,7 +12,7 @@ workspace = true
 # The axum HTTP+SSE transport (m0-s06). A feature rather than a default so the
 # desktop shell, which dispatches over Tauri IPC, does not link a web server.
 # This is transport selection, not a capability switch — no cfg(cloud) shape.
-http = ["dep:axum", "dep:tokio"]
+http = ["dep:axum", "dep:tokio", "dep:tokio-stream"]
 
 [dependencies]
 pos-foundation = { path = "../pos-foundation" }
@@ -26,7 +26,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ts-rs = { workspace = true }
 axum = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true, features = ["rt", "net"] }
+tokio = { workspace = true, optional = true, features = ["rt", "net", "sync"] }
+tokio-stream = { workspace = true, optional = true, features = ["sync"] }
 pos-gateway = { path = "../pos-gateway" }
 pos-ingest = { path = "../pos-ingest" }
 pos-connect = { path = "../pos-connect" }

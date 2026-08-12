@@ -7,16 +7,20 @@
 //! the SSE content type — both contract-tested against the IPC transport in
 //! `bins/pos-server/tests/http_contract.rs`.
 
-use crate::{ApiError, LocalRuntime, sse_body, stream::parse_resume_cursor};
+use crate::{
+    ApiError, LocalRuntime, SSE_RETRY_MS, STREAM_RESUME_WINDOW_LEN, stream::parse_resume_cursor,
+};
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
 use serde::Deserialize;
+use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
+use tokio_stream::wrappers::ReceiverStream;
 
 /// Command/query inputs are small typed JSON documents (paths, counts, ids).
 /// Blob and export payloads never travel this transport — they move through
@@ -145,15 +149,47 @@ pub async fn respond_stream(
     last_event_id: Option<String>,
 ) -> Response {
     let input = input_json.unwrap_or_else(|| "{}".to_owned());
+    let subscribed_runtime = Arc::clone(&runtime);
+    let subscribed_name = name.clone();
+    let subscribed_input = input.clone();
     let outcome = run_blocking(move || {
-        parse_resume_cursor(last_event_id.as_deref())
-            .and_then(|cursor| runtime.stream_subscribe(&name, &input, cursor))
+        let cursor = parse_resume_cursor(last_event_id.as_deref())?;
+        let frames =
+            subscribed_runtime.stream_subscribe(&subscribed_name, &subscribed_input, cursor)?;
+        Ok((cursor, frames))
     })
     .await;
-    match outcome {
-        Ok(frames) => response_with(StatusCode::OK, "text/event-stream", sse_body(&frames)),
-        Err(error) => error_response(&error),
-    }
+    let (cursor, frames) = match outcome {
+        Ok(subscribed) => subscribed,
+        Err(error) => return error_response(&error),
+    };
+
+    // One complete replay window plus the live slot. Backpressure can block
+    // only this subscriber's feeder thread; it never blocks the Run worker or
+    // grows an unbounded broker queue.
+    let queue_len = STREAM_RESUME_WINDOW_LEN.saturating_add(1);
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(queue_len);
+    let tail_cursor = frames.last().map_or(cursor, |frame| Some(frame.stream_seq));
+    let _stream_task = tokio::task::spawn_blocking(move || {
+        let send = |body: String| sender.blocking_send(Ok(Bytes::from(body))).is_ok();
+        if !send(format!("retry: {SSE_RETRY_MS}\n\n")) {
+            return;
+        }
+        for frame in frames {
+            if !send(frame.to_sse()) {
+                return;
+            }
+        }
+        let followed =
+            runtime.stream_follow(&name, &input, tail_cursor, |frame| send(frame.to_sse()));
+        if let Err(error) = followed {
+            let _ = send(format!(
+                "event: stream.error\ndata: {}\n\n",
+                error.to_json()
+            ));
+        }
+    });
+    stream_response(ReceiverStream::new(receiver))
 }
 
 /// Renders a typed envelope under its deliberate status — the shared error
@@ -204,6 +240,20 @@ fn response_with(status: StatusCode, content_type: &'static str, body: String) -
         // response is still answered, not dropped.
         Err(_) => Response::new(Body::from(
             "{\"code\":\"dispatch_failure\",\"message\":\"response assembly failed\",\"retriable\":true}",
+        )),
+    }
+}
+
+fn stream_response(stream: ReceiverStream<Result<Bytes, Infallible>>) -> Response {
+    let built = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream));
+    match built {
+        Ok(response) => response,
+        Err(_) => Response::new(Body::from(
+            "{\"code\":\"dispatch_failure\",\"message\":\"stream response assembly failed\",\"retriable\":true}",
         )),
     }
 }

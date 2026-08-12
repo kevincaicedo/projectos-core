@@ -27,6 +27,11 @@ fn generate_content_plan(
     auth: &CallAuth,
     request: &CompletionRequest,
 ) -> Result<HttpRequestPlan, Weather> {
+    if request.reasoning_effort.is_some() {
+        return Err(Weather::UnsupportedField {
+            field: "reasoning_effort".to_owned(),
+        });
+    }
     if request.messages.is_empty() {
         return Err(Weather::InvalidRequest {
             reason: "a completion needs at least one message".to_owned(),

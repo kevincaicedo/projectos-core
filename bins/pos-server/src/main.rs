@@ -22,6 +22,16 @@ const BIND_ADDR_DEFAULT: &str = "127.0.0.1:7420";
 const DATA_ROOT_DEFAULT: &str = "pos-server-data";
 
 fn main() -> ExitCode {
+    #[cfg(debug_assertions)]
+    let echo = match debug_echo_options(std::env::args_os().skip(1)) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("pos-server: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    #[cfg(not(debug_assertions))]
+    let echo = None;
     let bind_addr: SocketAddr = match env_or("POS_SERVER_ADDR", BIND_ADDR_DEFAULT).parse() {
         Ok(addr) => addr,
         Err(error) => {
@@ -37,6 +47,7 @@ fn main() -> ExitCode {
                 let default_dist = PathBuf::from("apps/ui/dist");
                 default_dist.is_dir().then_some(default_dist)
             }),
+        echo,
     };
     let state = match ServerState::initialize(&config) {
         Ok(state) => state,
@@ -77,6 +88,48 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Debug-only endpoint/fault override for the real-process m0-s13 chaos
+/// suite. Release servers expose no fault-injection configuration.
+#[cfg(debug_assertions)]
+fn debug_echo_options(
+    mut arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<Option<pos_api::EchoRuntimeOptions>, String> {
+    let Some(flag) = arguments.next() else {
+        return Ok(None);
+    };
+    if flag != std::ffi::OsStr::new("--echo-chaos-server") {
+        return Err(format!("unknown argument {flag:?}"));
+    }
+    let mut next = |name: &str| {
+        arguments
+            .next()
+            .ok_or_else(|| format!("missing {name}"))?
+            .into_string()
+            .map_err(|_| format!("{name} is not UTF-8"))
+    };
+    let base_url = next("Echo base URL")?;
+    let fault_kind = next("fault kind")?;
+    let step_index = next("fault step")?
+        .parse::<u32>()
+        .map_err(|error| format!("fault step is not u32: {error}"))?;
+    let marker = PathBuf::from(next("fault marker")?);
+    if arguments.next().is_some() {
+        return Err("unexpected trailing arguments".to_owned());
+    }
+    let mut options = pos_api::EchoRuntimeOptions::loopback(base_url, "echo-chaos-fixture");
+    options = match fault_kind.as_str() {
+        "none" => options,
+        "after-commit" => {
+            options.with_fault(pos_api::EchoFaultInjection::AfterCommit { step_index, marker })
+        }
+        "after-checkpoint" => {
+            options.with_fault(pos_api::EchoFaultInjection::AfterCheckpoint { step_index, marker })
+        }
+        other => return Err(format!("unknown fault kind {other:?}")),
+    };
+    Ok(Some(options))
 }
 
 fn env_or(name: &str, fallback: &str) -> String {

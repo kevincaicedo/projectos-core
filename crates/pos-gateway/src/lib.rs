@@ -52,7 +52,8 @@ pub use policy::{
 pub use prompts::{PROMPT_LOCK_FILE_NAME, PromptError, PromptFile, PromptRegistry};
 pub use provider::{
     ChatMessage, CompletionEvent, CompletionRequest, CompletionSink, CompletionUsage, EmbedRequest,
-    MessageRole, OUTPUT_TOKENS_REQUEST_MAX, Provider, ProviderFamily, SinkClosed, VecSink,
+    MessageRole, OUTPUT_TOKENS_REQUEST_MAX, Provider, ProviderFamily, ReasoningEffort, SinkClosed,
+    VecSink,
 };
 pub use sse::{SseDecoder, SseEvent, SseParseError};
 pub use transport::{

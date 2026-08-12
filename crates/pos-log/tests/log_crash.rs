@@ -34,6 +34,7 @@ const TALLY_TABLE: TableDef = TableDef {
         name: "count",
         kind: ColumnKind::Integer,
     }],
+    indexes: &[],
 };
 
 impl Projection for TallyProjection {

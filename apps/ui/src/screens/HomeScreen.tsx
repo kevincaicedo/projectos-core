@@ -8,6 +8,8 @@ import type { QueryView } from "../api/query";
 import { CapabilityRegistryView } from "../CapabilityRegistryView";
 import { ProjectActions } from "./ProjectActions";
 import type { SeamNotice } from "./seam";
+import { RunFeedPanel } from "../runs/RunFeedPanel";
+import type { EchoRunController } from "../runs/useEchoRun";
 
 interface HomeScreenProps {
   readonly projects: QueryView<readonly OpenProjectRow[]>;
@@ -15,9 +17,17 @@ interface HomeScreenProps {
   readonly notice: SeamNotice | null;
   readonly focusToken: number;
   readonly onChanged: () => void;
+  readonly echoRun: EchoRunController;
 }
 
-export function HomeScreen({ projects, selected, notice, focusToken, onChanged }: HomeScreenProps) {
+export function HomeScreen({
+  projects,
+  selected,
+  notice,
+  focusToken,
+  onChanged,
+  echoRun,
+}: HomeScreenProps) {
   return (
     <main className="stage">
       <header className="stage-header">
@@ -39,6 +49,7 @@ export function HomeScreen({ projects, selected, notice, focusToken, onChanged }
         <ProjectHome project={selected} />
       )}
 
+      <RunFeedPanel project={selected} controller={echoRun} />
       <ProjectActions onChanged={onChanged} focusToken={focusToken} />
       <section className="card">
         <CapabilityRegistryView />

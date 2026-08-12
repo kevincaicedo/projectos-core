@@ -18,8 +18,9 @@
 
 use crate::control::{ControlDb, Role};
 use pos_api::{
-    ApiError, CommandName, ProjectCreateInput, ProjectExportInput, ProjectPathInput,
-    ProjectSeedInput, QueryName,
+    ApiError, CommandName, CostRollupInput, ProjectCreateInput, ProjectExportInput,
+    ProjectPathInput, ProjectSeedInput, QueryName, RunControlInput, RunResumeInput, RunStartInput,
+    RunStepsInput, StreamName,
 };
 use std::path::Path;
 
@@ -81,20 +82,17 @@ pub fn authorize_command(
             let input: ProjectPathInput = parse(input_json)?;
             authorize_path(control, data_root, account, &input.path, Access::Read)
         }
-        // No typed workspace context until m0-s12: gate on the highest role
-        // held anywhere. A viewer-only account cannot mutate (RBAC matrix).
-        CommandName::RunStart
-        | CommandName::RunCancel
-        | CommandName::RunPause
-        | CommandName::RunResume => {
-            let max = control.max_role(account)?;
-            if max.is_some_and(|role| role >= Role::Member) {
-                Ok(())
-            } else {
-                Err(forbidden(
-                    "this command mutates state; role viewer is read-only",
-                ))
-            }
+        CommandName::RunStart => {
+            let input: RunStartInput = parse(input_json)?;
+            authorize_path(control, data_root, account, &input.path, Access::Mutate)
+        }
+        CommandName::RunCancel | CommandName::RunPause => {
+            let input: RunControlInput = parse(input_json)?;
+            authorize_path(control, data_root, account, &input.path, Access::Mutate)
+        }
+        CommandName::RunResume => {
+            let input: RunResumeInput = parse(input_json)?;
+            authorize_path(control, data_root, account, &input.path, Access::Mutate)
         }
         // A command name added to the registry without a policy arm must not
         // dispatch silently (deny-by-default at compile time via exhaustive
@@ -124,13 +122,39 @@ pub fn authorize_query(
             let input: ProjectPathInput = parse(input_json)?;
             authorize_path(control, data_root, account, &input.path, Access::Read)
         }
+        QueryName::CostRollup => {
+            let input: CostRollupInput = parse(input_json)?;
+            match input.path {
+                Some(path) => authorize_path(control, data_root, account, &path, Access::Read),
+                None => Ok(()),
+            }
+        }
         QueryName::CapabilitySnapshot
         | QueryName::ProjectList
         | QueryName::JobList
-        | QueryName::CostRollup
         | QueryName::Health => Ok(()),
         _ => Err(forbidden(
             "no authorization policy is registered for this query",
+        )),
+    }
+}
+
+/// Authorizes a live stream before its feeder opens the project directory.
+/// Every current stream is path-bearing, so no account-wide fallback exists.
+pub fn authorize_stream(
+    control: &ControlDb,
+    data_root: &Path,
+    account: [u8; 16],
+    stream: StreamName,
+    input_json: &str,
+) -> Result<(), ApiError> {
+    match stream {
+        StreamName::RunSteps => {
+            let input: RunStepsInput = parse(input_json)?;
+            authorize_path(control, data_root, account, &input.path, Access::Read)
+        }
+        _ => Err(forbidden(
+            "no authorization policy is registered for this stream",
         )),
     }
 }

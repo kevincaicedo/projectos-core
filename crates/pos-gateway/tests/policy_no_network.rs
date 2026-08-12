@@ -25,6 +25,7 @@ fn request() -> CompletionRequest {
             content: "Summarize the evidence.".to_owned(),
         }],
         tools_json: None,
+        reasoning_effort: None,
         max_output_tokens: 256,
         timeout_ms: 5_000,
     }

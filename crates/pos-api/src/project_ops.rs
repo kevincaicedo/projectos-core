@@ -26,6 +26,7 @@ const SEED_EVENT_COUNT_MAX: u64 = 2_000_000;
 /// account/device identity lands (m0-s07/m0-s08). Stable so per-device
 /// lamport chains stay monotonic across invocations; never all-zero so a
 /// zeroed row is visibly distinct from a real append.
+#[derive(Clone, Copy)]
 pub(crate) struct RuntimeIdentity {
     pub device: DeviceId,
     pub user: UserId,

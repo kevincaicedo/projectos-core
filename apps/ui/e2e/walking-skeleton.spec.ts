@@ -20,31 +20,60 @@ const CAPABILITY_COUNT = 10;
 async function installIpc(
   page: import("@playwright/test").Page,
   queries: Record<string, string>,
+  options: {
+    readonly commands?: Record<string, string>;
+    readonly streamFrames?: readonly string[];
+  } = {},
 ) {
-  await page.addInitScript((answers: Record<string, string>) => {
-    Object.defineProperty(window, "__TAURI__", {
-      value: {
-        core: {
-          invoke: (command: string, args?: Record<string, unknown>) => {
-            if (command !== "api_query" && command !== "api_command") {
-              return Promise.reject(new Error(`unexpected command ${command}`));
-            }
-            const name = String(args?.name ?? "");
-            const answer = answers[name];
-            return answer === undefined
-              ? Promise.reject(
-                  JSON.stringify({
-                    code: "unknown_query",
-                    message: `no query is registered under the name "${name}"`,
-                    retriable: false,
-                  }),
-                )
-              : Promise.resolve(answer);
+  await page.addInitScript(
+    (fixtures) => {
+      let callbackId = 0;
+      const callbacks = new Map<number, (message: unknown) => void>();
+      Object.defineProperty(window, "__TAURI_INTERNALS__", {
+        value: {
+          transformCallback: (callback: (message: unknown) => void) => {
+            callbackId += 1;
+            callbacks.set(callbackId, callback);
+            return callbackId;
+          },
+          unregisterCallback: (id: number) => callbacks.delete(id),
+        },
+      });
+      Object.defineProperty(window, "__TAURI__", {
+        value: {
+          core: {
+            invoke: (command: string, args?: Record<string, unknown>) => {
+              if (command === "api_stream") {
+                const channel = args?.channel as
+                  { onmessage?: (message: string) => void } | undefined;
+                if (channel?.onmessage === undefined) {
+                  return Promise.reject(new Error("api_stream received no Channel"));
+                }
+                for (const [index, frame] of (fixtures.streamFrames ?? []).entries()) {
+                  setTimeout(() => channel.onmessage?.(frame), 20 * (index + 1));
+                }
+                return Promise.resolve(null);
+              }
+              const name = String(args?.name ?? "");
+              const answers =
+                command === "api_query" ? fixtures.queries : (fixtures.commands ?? {});
+              const answer = answers[name];
+              return answer === undefined
+                ? Promise.reject(
+                    JSON.stringify({
+                      code: "unknown_query",
+                      message: `no query is registered under the name "${name}"`,
+                      retriable: false,
+                    }),
+                  )
+                : Promise.resolve(answer);
+            },
           },
         },
-      },
-    });
-  }, queries);
+      });
+    },
+    { queries, ...options },
+  );
 }
 
 const HEALTH = JSON.stringify({
@@ -71,6 +100,97 @@ const ONE_PROJECT = JSON.stringify({
   ],
   openProjectCountMax: 64,
 });
+
+const PROJECT_ID = "ab".repeat(16);
+const RUN_ID = "cd".repeat(16);
+const RUN_BUDGET = {
+  tokens: 4_096,
+  usdMicros: 0,
+  wallMs: 90_000,
+  storageBytes: 65_536,
+  toolCalls: 3,
+  retries: 0,
+  steps: 3,
+};
+const RUN_REPORT = JSON.stringify({
+  path: "/tmp/demo.pos",
+  runId: RUN_ID,
+  projectId: PROJECT_ID,
+  worker: "echo",
+  runtimeId: "projectos.native",
+  executor: "device",
+  status: "running",
+  autonomyLevel: 2,
+  committedStepCount: 0,
+  checkpointedStepCount: 0,
+  budget: RUN_BUDGET,
+  spent: {
+    tokens: 0,
+    usdMicros: 0,
+    wallMs: 0,
+    storageBytes: 0,
+    toolCalls: 0,
+    retries: 0,
+    steps: 0,
+  },
+  tainted: false,
+  toolGrants: [
+    { toolId: "echo.preflight", mode: "allow" },
+    { toolId: "echo.complete", mode: "allow" },
+    { toolId: "echo.report", mode: "allow" },
+  ],
+  parentRunId: null,
+  lineageDepth: 0,
+  pendingControl: null,
+  pause: null,
+});
+const STEP_FRAMES = [
+  stepFrame(1, "Local-only preflight passed", "echo.preflight", false),
+  stepFrame(2, "Marker echoed by the fast model", "echo.complete", false),
+  stepFrame(3, "Echo report stored and validated", "echo.report", true),
+];
+const SSE_FRAMES = STEP_FRAMES.map(
+  (frame) => `id: ${frame.streamSeq}\nevent: run.step\ndata: ${JSON.stringify(frame)}\n\n`,
+);
+const COST_ROLLUP = JSON.stringify({
+  scope: "project",
+  projectCount: 1,
+  rows: [
+    {
+      projectId: PROJECT_ID,
+      feature: "echo",
+      agent: "echo",
+      provider: "openai_compatible",
+      credentialClass: "device_session",
+      model: "echo-fixture",
+      providerCostKind: "customer_billed",
+      calls: 1,
+      tokensIn: 11,
+      tokensOut: 4,
+      wallMsTotal: 7,
+      usdMicros: 0,
+    },
+  ],
+  totals: { calls: 1, tokensIn: 11, tokensOut: 4, usdMicros: 0, projectosUsdMicros: 0 },
+});
+
+function stepFrame(streamSeq: number, summary: string, toolId: string, terminal: boolean) {
+  return {
+    runId: RUN_ID,
+    projectId: PROJECT_ID,
+    streamSeq,
+    stepIndex: streamSeq - 1,
+    phase: "checkpointed",
+    summary,
+    toolId,
+    committedSeq: streamSeq * 3,
+    checkpointSeq: streamSeq * 3 + 2,
+    spent: { ...RUN_BUDGET, tokens: streamSeq === 1 ? 0 : 15, steps: streamSeq },
+    runStatus: terminal ? "done" : "running",
+    terminal,
+    validationStatus: terminal ? "passed" : null,
+  };
+}
 
 test.describe("walking skeleton without a server, an account, or the cloud repository", () => {
   test("the public bundle boots and reports an absent transport honestly", async ({ page }) => {
@@ -222,9 +342,7 @@ test.describe("the M0 shell", () => {
           throw new Error("the palette registered no project-switch command");
         }
         target.click();
-        switched.push(
-          await settled(() => document.querySelector("[data-project-home]") !== null),
-        );
+        switched.push(await settled(() => document.querySelector("[data-project-home]") !== null));
         // Return to the workspace home so the next sample measures a real
         // switch rather than a no-op.
         document.querySelector<HTMLElement>(".rail-item[data-active='true']")?.click();
@@ -245,7 +363,7 @@ test.describe("the M0 shell", () => {
     }
   });
 
-  test("a registered-but-unimplemented command surfaces its typed refusal", async ({ page }) => {
+  test("Echo refuses visibly until a project is selected", async ({ page }) => {
     await installIpc(page, {
       "project.list": EMPTY_LIST,
       health: HEALTH,
@@ -257,11 +375,109 @@ test.describe("the M0 shell", () => {
     await page.getByLabel("Search commands").fill("echo");
     await page.locator("[data-command='run.echo']").click();
 
-    // The seam answers honestly; the UI shows the refusal rather than a
-    // fabricated success or a silent no-op.
+    // A Run cannot float outside a project. The palette gives a visible
+    // refusal without dispatching a malformed command.
     const notice = page.locator("[data-seam-notice='refused']");
     await expect(notice).toBeVisible();
-    await expect(notice).toContainText("unknown_query");
+    await expect(notice).toContainText("Select a project");
+  });
+
+  test("the Tauri Channel adapter renders durable Echo frames and ledger cost", async ({
+    page,
+  }) => {
+    await installIpc(
+      page,
+      {
+        "project.list": ONE_PROJECT,
+        health: HEALTH,
+        "capability.snapshot": SNAPSHOT_FIXTURE,
+        "cost.rollup": COST_ROLLUP,
+      },
+      { commands: { "run.start": RUN_REPORT }, streamFrames: SSE_FRAMES },
+    );
+    await page.goto("/");
+    await page.locator("[data-project-row]").click();
+    await page.getByRole("button", { name: "Run Echo" }).click();
+
+    await expect(page.locator("[data-run-feed-state='success']")).toBeVisible();
+    await expect(page.locator("[data-run-step]")).toHaveCount(3);
+    await expect(page.locator("[data-run-cost-state='success']")).toContainText(
+      "echo@echo-fixture",
+    );
+    await expect(page.locator("[data-run-terminal='true']")).toContainText("done");
+  });
+
+  test("the HTTP stream adapter renders the same generated Run frames", async ({ page }) => {
+    const calls: string[] = [];
+    await page.route("**/api/**", async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      calls.push(`${request.method()} ${url.pathname}`);
+      if (url.pathname === "/api/query/project.list") {
+        await route.fulfill({ contentType: "application/json", body: ONE_PROJECT });
+      } else if (url.pathname === "/api/query/health") {
+        await route.fulfill({ contentType: "application/json", body: HEALTH });
+      } else if (url.pathname === "/api/query/capability.snapshot") {
+        await route.fulfill({ contentType: "application/json", body: SNAPSHOT_FIXTURE });
+      } else if (url.pathname === "/api/query/cost.rollup") {
+        await route.fulfill({ contentType: "application/json", body: COST_ROLLUP });
+      } else if (url.pathname === "/api/cmd/run.start") {
+        expect(request.postDataJSON()).toMatchObject({ path: "/tmp/demo.pos", worker: "echo" });
+        await route.fulfill({ contentType: "application/json", body: RUN_REPORT });
+      } else if (url.pathname === "/api/stream/run.steps") {
+        expect(JSON.parse(url.searchParams.get("input") ?? "{}")).toEqual({
+          path: "/tmp/demo.pos",
+          runId: RUN_ID,
+        });
+        await route.fulfill({
+          contentType: "text/event-stream",
+          body: `retry: 2000\n\n${SSE_FRAMES.join("")}`,
+        });
+      } else {
+        await route.fulfill({ status: 404, contentType: "application/json", body: "{}" });
+      }
+    });
+
+    await page.goto("/");
+    await page.locator("[data-project-row]").click();
+    await page.getByRole("button", { name: "Run Echo" }).click();
+    await expect(page.locator("[data-run-step]")).toHaveCount(3);
+    await expect(page.locator("[data-run-cost-state='success']")).toContainText("1 model call");
+    expect(calls).toContain("GET /api/stream/run.steps");
+  });
+
+  test("a truncated HTTP stream fails closed instead of inventing a clean end", async ({
+    page,
+  }) => {
+    await page.route("**/api/**", async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      if (url.pathname === "/api/query/project.list") {
+        await route.fulfill({ contentType: "application/json", body: ONE_PROJECT });
+      } else if (url.pathname === "/api/query/health") {
+        await route.fulfill({ contentType: "application/json", body: HEALTH });
+      } else if (url.pathname === "/api/query/capability.snapshot") {
+        await route.fulfill({ contentType: "application/json", body: SNAPSHOT_FIXTURE });
+      } else if (url.pathname === "/api/query/cost.rollup") {
+        await route.fulfill({ contentType: "application/json", body: COST_ROLLUP });
+      } else if (url.pathname === "/api/cmd/run.start") {
+        await route.fulfill({ contentType: "application/json", body: RUN_REPORT });
+      } else if (url.pathname === "/api/stream/run.steps") {
+        await route.fulfill({
+          contentType: "text/event-stream",
+          body: SSE_FRAMES.join("").slice(0, -1),
+        });
+      } else {
+        await route.fulfill({ status: 404, contentType: "application/json", body: "{}" });
+      }
+    });
+
+    await page.goto("/");
+    await page.locator("[data-project-row]").click();
+    await page.getByRole("button", { name: "Run Echo" }).click();
+    const error = page.locator("[data-run-feed-state='error']");
+    await expect(error).toBeVisible();
+    await expect(error).toContainText("ended inside an SSE frame");
   });
 
   test("the theme toggle swaps tokens without reloading", async ({ page }) => {

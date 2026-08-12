@@ -10,12 +10,8 @@ import { onShellCommand, shellRecents } from "./api/shell";
 import { apiCommand } from "./api/transport";
 import { Palette } from "./palette/Palette";
 import { paletteCommands, type PaletteActions } from "./palette/registry";
-import {
-  dispatchCommandNotice,
-  dispatchQueryNotice,
-  runFeedNotice,
-  type SeamNotice,
-} from "./screens/seam";
+import { useEchoRun } from "./runs/useEchoRun";
+import { dispatchQueryNotice, runFeedNotice, type SeamNotice } from "./screens/seam";
 import { HomeScreen } from "./screens/HomeScreen";
 import { ContextPanel } from "./shell/ContextPanel";
 import { Rail } from "./shell/Rail";
@@ -45,6 +41,7 @@ export function App() {
 
   const openRows = projects.view.state === "success" ? projects.view.data : [];
   const selected = openRows.find((row) => row.projectId === selectedProjectId) ?? null;
+  const echoRun = useEchoRun(selected?.path ?? null);
 
   const reconcile = useCallback(() => {
     projects.refetch();
@@ -65,10 +62,19 @@ export function App() {
       },
       switchProject: setSelectedProjectId,
       runEchoAgent: () => {
-        void dispatchCommandNotice("run.start").then(setNotice);
+        if (selected === null) {
+          setNotice({
+            kind: "refused",
+            title: "Select a project",
+            detail: "Echo needs one open project for its durable Run ledger.",
+          });
+          return;
+        }
+        setNotice(null);
+        void echoRun.start();
       },
       cancelRun: () => {
-        void dispatchCommandNotice("run.cancel").then(setNotice);
+        void echoRun.cancel();
       },
       openRunFeed: () => {
         setNotice(runFeedNotice());
@@ -80,7 +86,7 @@ export function App() {
         setTheme(nextTheme);
       },
     }),
-    [],
+    [echoRun, selected],
   );
 
   const commands = useMemo(
@@ -162,6 +168,7 @@ export function App() {
         notice={notice}
         focusToken={focusToken}
         onChanged={reconcile}
+        echoRun={echoRun}
       />
       <div className="dock-placeholder" title="The voice dock arrives with M2" aria-hidden="true">
         ◦

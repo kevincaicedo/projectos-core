@@ -14,7 +14,8 @@
 
 use pos_api::{
     CommandName, LocalBootstrapConfig, ProjectCreateInput, ProjectExportInput, ProjectPathInput,
-    ProjectSeedInput, QueryName, StreamName, bootstrap_local_runtime, input_json,
+    ProjectSeedInput, QueryName, RunBudgetWire, RunControlInput, RunResumeInput, RunStartInput,
+    RunStepsInput, RunWorker, StreamName, bootstrap_local_runtime, input_json,
 };
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -169,16 +170,23 @@ fn input_free_queries_are_byte_identical_over_the_real_transport() {
         assert_eq!(content_type, "application/json");
         assert_eq!(body, direct, "{name} reshaped between transports");
     }
-    // The one registered-but-later query left: its typed envelope is the
-    // contract until the m0-s14 scheduler lands the engine.
-    let name = QueryName::JobList.as_str();
+    // `cron.preview` is a pure function of its input, so it is contract-tested
+    // here rather than in the project-scoped block below. A fixed origin
+    // instant keeps the comparison stable without freezing the clock.
+    let name = QueryName::CronPreview.as_str();
+    let input =
+        r#"{"expr":"0 3 * * *","tz":"America/New_York","afterTsMs":1772946000000,"count":10}"#;
     let direct = served
         .runtime
-        .query_with_input(name, "{}")
-        .expect_err("the engine has not landed; success would be a lie");
-    let (status, _, body) = served.get(&format!("/api/query/{name}"));
-    assert_eq!(status, 501, "{name} maps not_yet_supported to 501");
-    assert_eq!(body, direct.to_json(), "{name} envelope reshaped");
+        .query_with_input(name, input)
+        .expect("the cron engine resolves");
+    let (status, content_type, body) = served.get(&format!(
+        "/api/query/{name}?input={}",
+        percent_encode(input)
+    ));
+    assert_eq!(status, 200, "{name}: {body}");
+    assert_eq!(content_type, "application/json");
+    assert_eq!(body, direct, "{name} reshaped between transports");
 }
 
 /// The full project lifecycle through the REAL transport, reads byte-compared
@@ -250,6 +258,38 @@ fn the_project_surface_is_byte_identical_over_the_real_transport() {
         assert_eq!(body, direct, "{name} reshaped between transports");
     }
 
+    // `job.list` is project-scoped, so it belongs to this block: an empty
+    // queue must answer with real zeros over the socket, not an envelope.
+    let job_list_input = r#"{"path":"PATH","state":null,"rowCountMax":10}"#
+        .replace("PATH", &path.replace('\\', "\\\\"));
+    let name = QueryName::JobList.as_str();
+    let direct = served
+        .runtime
+        .query_with_input(name, &job_list_input)
+        .expect("job.list resolves against an open project");
+    let (status, _, body) = served.get(&format!(
+        "/api/query/{name}?input={}",
+        percent_encode(&job_list_input)
+    ));
+    assert_eq!(status, 200, "{name} failed: {body}");
+    assert_eq!(body, direct, "{name} reshaped between transports");
+    // The seeded corpus carries legacy `JobEnqueued`/`JobCompleted` V1 facts,
+    // so this row doubles as the eternal-events check over the real socket:
+    // V1 jobs project and render through the v2 read surface with the
+    // documented defaults rather than failing replay.
+    assert!(
+        body.contains("\"jobKind\":\"synthetic.tick\""),
+        "the seeded legacy job facts did not render: {body}"
+    );
+    assert!(
+        body.contains("\"class\":\"maintenance\"") && body.contains("\"priority\":\"normal\""),
+        "legacy V1 jobs must take the documented defaults: {body}"
+    );
+    assert!(
+        body.contains("\"rowCountMax\":10"),
+        "the honoured bound must travel in-band: {body}"
+    );
+
     let export_input = input_json(&ProjectExportInput {
         path,
         out: export.display().to_string(),
@@ -275,33 +315,103 @@ fn the_project_surface_is_byte_identical_over_the_real_transport() {
     assert!(body.contains("\"clean\":true"), "export dirty: {body}");
 }
 
-/// Run-lifecycle commands and the stream surface answer with their typed
-/// envelopes and deliberate statuses over the real transport.
+/// Run lifecycle and the durable step stream are real over the socket.
 #[test]
-fn later_story_surfaces_answer_honestly_over_the_real_transport() {
+fn run_lifecycle_is_real_and_the_later_stream_stays_honest() {
     let served = ServedApi::start();
-    for command in [
-        CommandName::RunStart,
-        CommandName::RunCancel,
-        CommandName::RunPause,
-        CommandName::RunResume,
-    ] {
-        let name = command.as_str();
-        let direct = served
-            .runtime
-            .command(name, "{}")
-            .expect_err("the run engine has not landed");
-        let (status, content_type, body) = served.post(&format!("/api/cmd/{name}"), "{}");
-        assert_eq!(status, 501, "{name} maps not_yet_supported to 501");
-        assert_eq!(content_type, "application/json");
-        assert_eq!(body, direct.to_json());
-    }
-    let name = StreamName::RunSteps.as_str();
-    let (status, content_type, body) = served.get(&format!("/api/stream/{name}"));
-    assert_eq!(status, 501);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory
+        .path()
+        .join("run-contract.pos")
+        .display()
+        .to_string();
+    let create = input_json(&ProjectCreateInput {
+        path: path.clone(),
+        name: Some("Run contract".to_owned()),
+        template: "generic".to_owned(),
+    })
+    .expect("create input serializes");
+    let (status, _, body) = served.post(
+        &format!("/api/cmd/{}", CommandName::ProjectCreate.as_str()),
+        &create,
+    );
+    assert_eq!(status, 200, "project.create failed: {body}");
+
+    let start = input_json(&RunStartInput {
+        path: path.clone(),
+        worker: RunWorker::Navigator,
+        autonomy_level: 2,
+        budget: RunBudgetWire {
+            tokens: 100,
+            usd_micros: 100,
+            wall_ms: 10_000,
+            storage_bytes: 1_024,
+            tool_calls: 4,
+            retries: 2,
+            steps: 4,
+        },
+        tool_grants: Vec::new(),
+        parent_run_id: None,
+    })
+    .expect("Run start input serializes");
+    let (status, content_type, started) = served.post(
+        &format!("/api/cmd/{}", CommandName::RunStart.as_str()),
+        &start,
+    );
+    assert_eq!(status, 200, "run.start failed: {started}");
     assert_eq!(content_type, "application/json");
-    assert!(body.contains("\"code\":\"not_yet_supported\""));
-    assert!(body.contains("m0-s13"));
+    assert!(started.contains("\"status\":\"preflight\""));
+    let run_id = serde_json::from_str::<serde_json::Value>(&started)
+        .expect("Run report parses")
+        .get("runId")
+        .and_then(serde_json::Value::as_str)
+        .expect("Run report has runId")
+        .to_owned();
+
+    let control = |reason: &str| {
+        input_json(&RunControlInput {
+            path: path.clone(),
+            run_id: run_id.clone(),
+            reason: reason.to_owned(),
+        })
+        .expect("control input serializes")
+    };
+    let (status, _, paused) = served.post(
+        &format!("/api/cmd/{}", CommandName::RunPause.as_str()),
+        &control("HTTP pause"),
+    );
+    assert_eq!(status, 200, "run.pause failed: {paused}");
+    assert!(paused.contains("\"kind\":\"requested\""));
+
+    let resume = input_json(&RunResumeInput {
+        path: path.clone(),
+        run_id: run_id.clone(),
+    })
+    .expect("resume input serializes");
+    let (status, _, resumed) = served.post(
+        &format!("/api/cmd/{}", CommandName::RunResume.as_str()),
+        &resume,
+    );
+    assert_eq!(status, 200, "run.resume failed: {resumed}");
+    assert!(resumed.contains("\"status\":\"running\""));
+
+    let (status, _, canceled) = served.post(
+        &format!("/api/cmd/{}", CommandName::RunCancel.as_str()),
+        &control("HTTP cancel"),
+    );
+    assert_eq!(status, 200, "run.cancel failed: {canceled}");
+    assert!(canceled.contains("\"status\":\"canceled\""));
+
+    let name = StreamName::RunSteps.as_str();
+    let stream_input =
+        input_json(&RunStepsInput { path, run_id }).expect("stream input serializes");
+    let (status, content_type, body) = served.get(&format!(
+        "/api/stream/{name}?input={}",
+        percent_encode(&stream_input)
+    ));
+    assert_eq!(status, 200);
+    assert_eq!(content_type, "text/event-stream");
+    assert!(body.contains("retry: 2000"));
 }
 
 /// Transport error behavior: unknown names, malformed input, malformed

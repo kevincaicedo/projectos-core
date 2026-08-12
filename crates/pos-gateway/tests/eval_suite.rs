@@ -59,6 +59,7 @@ fn dispatch_case(prompt: &PromptFile, case: &EvalCase) -> Result<String, pos_gat
             content: case.input.clone(),
         }],
         tools_json: None,
+        reasoning_effort: None,
         max_output_tokens: 128,
         timeout_ms: 5_000,
     };

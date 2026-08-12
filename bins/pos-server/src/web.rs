@@ -18,8 +18,8 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
 use pos_api::{
-    ApiError, CommandName, FoundationClock, LocalBootstrapConfig, LocalRuntime, QueryName,
-    StreamName, UserId, WallClock, bootstrap_local_runtime,
+    ApiError, CommandName, EchoRuntimeOptions, FoundationClock, LocalBootstrapConfig, LocalRuntime,
+    QueryName, StreamName, UserId, WallClock, bootstrap_local_runtime,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -45,6 +45,9 @@ pub struct ServerConfig {
     pub data_root: PathBuf,
     /// The built `apps/ui` bundle; `None` serves the API only (CI harnesses).
     pub ui_dist: Option<PathBuf>,
+    /// Test/deployment override for the local Echo endpoint. `None` uses the
+    /// product default (`127.0.0.1:11434`, gemma4:12b).
+    pub echo: Option<EchoRuntimeOptions>,
 }
 
 pub struct ServerState {
@@ -56,6 +59,7 @@ pub struct ServerState {
     /// instance. Keyed by account id bytes for deterministic iteration.
     runtimes: Mutex<BTreeMap<[u8; 16], Arc<LocalRuntime>>>,
     assets: StaticAssets,
+    echo: EchoRuntimeOptions,
 }
 
 impl ServerState {
@@ -80,6 +84,7 @@ impl ServerState {
             clock: FoundationClock,
             runtimes: Mutex::new(BTreeMap::new()),
             assets,
+            echo: config.echo.clone().unwrap_or_default(),
         }))
     }
 
@@ -110,7 +115,8 @@ impl ServerState {
         }
         let runtime = Arc::new(bootstrap_local_runtime(
             LocalBootstrapConfig::isolated(self.data_root.join("packs"))
-                .with_user(UserId::from_bytes(account)),
+                .with_user(UserId::from_bytes(account))
+                .with_echo(self.echo.clone()),
         ));
         runtimes.insert(account, Arc::clone(&runtime));
         Ok(runtime)
@@ -352,11 +358,15 @@ async fn api_stream(
         Ok(authenticated) => authenticated,
         Err(error) => return refuse(&error),
     };
-    if StreamName::parse(&name).is_none() {
+    let Some(stream) = StreamName::parse(&name) else {
         return refuse(&ApiError::unknown_stream(&name));
+    };
+    let input = params.input.clone().unwrap_or_else(|| "{}".to_owned());
+    if let Err(error) =
+        acl::authorize_stream(&state.control, &state.data_root, account, stream, &input)
+    {
+        return refuse(&error);
     }
-    // All v0 streams are reads with no typed workspace context (m0-s13 adds
-    // the run input, and with it a real per-workspace check).
     let runtime = match state.runtime_for_account(account) {
         Ok(runtime) => runtime,
         Err(error) => return refuse(&error),
@@ -364,7 +374,7 @@ async fn api_stream(
     let last_event_id = header_str(&headers, header::HeaderName::from_static("last-event-id"))
         .map(str::to_owned)
         .or(params.from.clone());
-    pos_api::http::respond_stream(runtime, name, params.input, last_event_id).await
+    pos_api::http::respond_stream(runtime, name, Some(input), last_event_id).await
 }
 
 // ---------------------------------------------------------------- static

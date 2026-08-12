@@ -87,6 +87,23 @@ Derived, deterministic, rebuildable. Byte-identical replay of the same log
 is a property-tested guarantee (§18 gate). Conforming tools must not write
 them directly; ProjectOS enforces this mechanically in CI.
 
+### 4.4 Node-local operational tables (`sched_*`)
+
+`sched_leases(job_id BLOB PK, worker TEXT, attempt_index INTEGER,
+claimed_ts_ms INTEGER, heartbeat_ts_ms INTEGER, lease_expires_ts_ms
+INTEGER)` records which worker on **this machine** currently holds which
+job (m0-s14).
+
+It is deliberately outside the portable contract, in the opposite direction
+from projections: a projection is derivable and therefore redundant, while a
+lease is *only* meaningful on the node that took it. A conforming tool may
+delete every row; the effect is that every unfinished job becomes claimable
+again, which is exactly what a crash already does. `pos export` does not
+carry it, and a copied project must not inherit another machine's leases.
+The durable half of the queue — what work exists, what it attempted, how it
+ended — lives in the log as `JobEnqueued` / `JobAttemptFailed` /
+`JobCompleted` / `JobDead` facts and travels normally.
+
 ## 5. Event bodies — CBOR versioning rules
 
 - Bodies are CBOR (RFC 8949) encodings of versioned structures: an

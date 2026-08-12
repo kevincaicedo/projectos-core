@@ -74,6 +74,7 @@ struct WireConfig {
     /// and every local server today).
     output_cap_field: &'static str,
     include_stream_usage: bool,
+    supports_reasoning_effort: bool,
 }
 
 fn chat_completions_plan(
@@ -101,6 +102,14 @@ fn chat_completions_plan(
     });
     if config.include_stream_usage {
         body["stream_options"] = json!({"include_usage": true});
+    }
+    if let Some(effort) = request.reasoning_effort {
+        if !config.supports_reasoning_effort {
+            return Err(Weather::UnsupportedField {
+                field: "reasoning_effort".to_owned(),
+            });
+        }
+        body["reasoning_effort"] = json!(effort.as_str());
     }
     if let Some(tools_json) = &request.tools_json {
         let tools: Value =
@@ -316,6 +325,7 @@ impl Provider for OpenAiAdapter {
                 base_url: self.base_url.clone(),
                 output_cap_field: "max_completion_tokens",
                 include_stream_usage: true,
+                supports_reasoning_effort: true,
             },
             auth,
             request,
@@ -348,6 +358,7 @@ impl Provider for OpenRouterAdapter {
                 base_url: self.base_url.clone(),
                 output_cap_field: "max_tokens",
                 include_stream_usage: true,
+                supports_reasoning_effort: false,
             },
             auth,
             request,
@@ -381,6 +392,7 @@ impl Provider for OpenAiCompatibleAdapter {
                 base_url: self.base_url.clone(),
                 output_cap_field: "max_tokens",
                 include_stream_usage: self.profile.supports_stream_usage,
+                supports_reasoning_effort: self.profile.server == EndpointServer::Ollama,
             },
             auth,
             request,
@@ -490,6 +502,7 @@ pub fn qualify_openai_compatible(
             content: "Reply with exactly: QUALIFY-OK".to_owned(),
         }],
         tools_json: None,
+        reasoning_effort: None,
         max_output_tokens: 64,
         timeout_ms,
     };

@@ -37,8 +37,8 @@
 pub mod apply;
 
 pub use apply::{
-    ApplyError, ColumnDef, ColumnKind, Projection, ProjectionRegistry, RowWrite, SqlValue,
-    TableDef, VerifyReport,
+    ApplyError, ColumnDef, ColumnKind, IndexDef, Projection, ProjectionRegistry, RowWrite,
+    SqlValue, TableDef, VerifyReport,
 };
 
 use pos_foundation::{DeviceId, EventSeq, JobId, RunId, UserId, WallClock};
@@ -216,6 +216,13 @@ pub enum LogError {
         applied: u64,
         head: u64,
     },
+    /// An optimistic caller prepared work against an older log head. The
+    /// caller must reload durable state; silently appending would let two
+    /// control/step transitions both claim the same boundary.
+    HeadChanged {
+        expected: EventSeq,
+        actual: EventSeq,
+    },
     /// Reserved seam (F4): time-travel reads arrive in M3; the signature
     /// exists now so nothing beneath it changes later.
     NotYetSupported {
@@ -254,6 +261,10 @@ impl fmt::Display for LogError {
                 formatter,
                 "projections claim seq {applied} but the log ends at {head}; \
                  the database has been mutated outside the log"
+            ),
+            Self::HeadChanged { expected, actual } => write!(
+                formatter,
+                "log head changed while preparing a conditional append: expected {expected}, actual {actual}"
             ),
             Self::NotYetSupported { feature, arrives } => {
                 write!(formatter, "{feature} is reserved and arrives in {arrives}")
@@ -344,10 +355,44 @@ impl ProjectLog {
             .expect("append_batch returns one seq per request")) // INVARIANT: a one-request batch yields exactly one seq.
     }
 
+    /// Appends one event only when the durable head still equals
+    /// `expected_head`. The comparison and append share the same IMMEDIATE
+    /// transaction, so concurrent Run controls cannot race a prepared step.
+    pub fn append_at_head(
+        &self,
+        expected_head: EventSeq,
+        request: AppendRequest,
+        clock: &dyn WallClock,
+    ) -> Result<EventSeq, LogError> {
+        let seqs = self.append_batch_at_head(expected_head, &[request], clock)?;
+        Ok(*seqs
+            .last()
+            .expect("conditional one-event append returns exactly one seq")) // INVARIANT: the request slice above contains exactly one item.
+    }
+
     /// Appends a batch in ONE transaction: events, projections, state, and
     /// any due snapshot commit atomically or not at all.
     pub fn append_batch(
         &self,
+        requests: &[AppendRequest],
+        clock: &dyn WallClock,
+    ) -> Result<Vec<EventSeq>, LogError> {
+        self.append_batch_inner(None, requests, clock)
+    }
+
+    /// Appends a batch only if the head still equals `expected_head`.
+    pub fn append_batch_at_head(
+        &self,
+        expected_head: EventSeq,
+        requests: &[AppendRequest],
+        clock: &dyn WallClock,
+    ) -> Result<Vec<EventSeq>, LogError> {
+        self.append_batch_inner(Some(expected_head), requests, clock)
+    }
+
+    fn append_batch_inner(
+        &self,
+        expected_head: Option<EventSeq>,
         requests: &[AppendRequest],
         clock: &dyn WallClock,
     ) -> Result<Vec<EventSeq>, LogError> {
@@ -373,6 +418,15 @@ impl ProjectLog {
                     head, applied,
                     "append found projections out of step with the log head"
                 );
+                if let Some(expected_head) = expected_head {
+                    let actual = EventSeq::new(head);
+                    if actual != expected_head {
+                        return Err(LogError::HeadChanged {
+                            expected: expected_head,
+                            actual,
+                        });
+                    }
+                }
                 let mut seqs = Vec::with_capacity(requests.len());
                 for request in requests {
                     let seq = EventSeq::new(head).next();
@@ -522,11 +576,24 @@ impl ProjectLog {
     /// Paired assertion (post-open/replay): durable state is internally
     /// consistent — projections track the head exactly.
     fn assert_consistent(&self) -> Result<(), LogError> {
-        let head = self.head()?.value();
-        let applied = self
-            .store
-            .db()
-            .with_reader("read applied seq", apply::read_applied_seq)?;
+        // Both values must come from one SQLite statement. Two autocommit
+        // reads can straddle another process's atomic append and falsely pair
+        // the old event head with the new applied seq during recovery.
+        let (head, applied_bytes) =
+            self.store
+                .db()
+                .with_reader("read log/projection consistency", |connection| {
+                    connection.query_row(
+                        "SELECT COALESCE((SELECT MAX(seq) FROM events), 0),
+                            (SELECT value FROM log_state WHERE key = 'applied_seq')",
+                        [],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+                    )
+                })?;
+        let head = u64::try_from(head).unwrap_or(0);
+        let applied = applied_bytes
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_slice()).ok())
+            .map_or(0, u64::from_be_bytes);
         if applied > head {
             return Err(LogError::StateAhead { applied, head });
         }

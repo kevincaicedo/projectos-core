@@ -129,6 +129,28 @@ fn cas_round_trips_dedups_and_stays_under_the_buffer_cap() {
 }
 
 #[test]
+fn reopening_a_project_cannot_sweep_an_active_same_process_blob_write() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("concurrent-open.pos");
+    let store = ProjectStore::create(&root, "generic", &ManualWallClock::starting_at(1_000))
+        .expect("create project store");
+    let mut writer = store.blobs().writer().expect("start active blob write");
+    writer
+        .append(b"content remains owned by the active writer")
+        .expect("buffer content");
+
+    // A live-feed/read handle opens the same project while the worker owns
+    // the CAS temp file. Recovery may sweep dead-process debris, not this
+    // process's active write.
+    let reopened = ProjectStore::open(&root).expect("concurrent read handle opens");
+    let hash = writer.finish().expect("active writer still publishes");
+    reopened
+        .blobs()
+        .verify_blob(hash)
+        .expect("published content verifies through the other handle");
+}
+
+#[test]
 fn verify_names_a_corrupted_blob_and_a_misplaced_file() {
     let directory = tempfile::tempdir().expect("tempdir");
     let store = created_store(&directory).expect("create project store");

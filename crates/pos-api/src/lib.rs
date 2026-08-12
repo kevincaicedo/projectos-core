@@ -15,6 +15,8 @@ mod gateway_ops;
 #[cfg(feature = "http")]
 pub mod http;
 mod project_ops;
+mod run_ops;
+mod sched_ops;
 mod session;
 mod stream;
 mod ts_export;
@@ -24,6 +26,14 @@ pub use gateway_ops::{
     ModelsPullInput, ModelsPullReport,
 };
 pub use project_ops::{ProjectCreateInput, ProjectExportInput, ProjectPathInput, ProjectSeedInput};
+pub use run_ops::{
+    EchoFaultInjection, EchoRuntimeOptions, RunBudgetDimensionWire, RunBudgetWire, RunControlInput,
+    RunPauseReport, RunReport, RunResumeInput, RunStartInput, RunStepFrame, RunStepsInput,
+    RunToolGrantInput, RunToolGrantModeWire, RunWorker,
+};
+pub use sched_ops::{
+    CronPreviewInput, CronPreviewReport, JobListInput, JobListReport, JobRow, job_live_state,
+};
 // Shells construct runtimes and attribute actors through these foundation
 // types; re-exported so a shell needs no direct pos-foundation edge (L12).
 pub use pos_foundation::{SystemWallClock as FoundationClock, UserId, WallClock};
@@ -52,7 +62,11 @@ use std::task::{Context, Poll, Waker};
 /// `health`), the run/job/cost registry entries, and the stream surface.
 /// v4: m0-s10/m0-s11 — `cost.rollup` answers with the real ledger rollup
 /// instead of `not_yet_supported`, and `models.pull` joins the commands.
-pub const API_SURFACE_VERSION: u16 = 4;
+/// v5: m0-s12 implements the typed Run start/pause/cancel/resume lifecycle.
+/// v6: m0-s13 adds Echo and the durable `run.steps` item contract.
+/// v7: m0-s14 implements `job.list` over the real queue and adds
+/// `cron.preview`, the tz-aware next-runs answer a cron editor reads.
+pub const API_SURFACE_VERSION: u16 = 7;
 
 /// Bounded item budget for the M0 connector-host liveness tick (L8). The socket
 /// itself caps this at 32; the runtime asks for less than it is allowed.
@@ -77,8 +91,10 @@ pub enum QueryName {
     ProjectVerify,
     /// Projects this runtime session has opened (m0-s06).
     ProjectList,
-    /// Job queue rows — registered now, implemented by pos-sched (m0-s14).
+    /// Job queue rows joined with this node's leases (m0-s14).
     JobList,
+    /// Next firings of a cron expression in its zone (m0-s14).
+    CronPreview,
     /// Model-call cost rollup — implemented by the pos-gateway ledger (m0-s10).
     CostRollup,
     /// Liveness + version identity of this runtime process (m0-s06).
@@ -86,13 +102,14 @@ pub enum QueryName {
 }
 
 impl QueryName {
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
     pub const ALL: [Self; Self::COUNT] = [
         Self::CapabilitySnapshot,
         Self::ProjectInspect,
         Self::ProjectVerify,
         Self::ProjectList,
         Self::JobList,
+        Self::CronPreview,
         Self::CostRollup,
         Self::Health,
     ];
@@ -105,6 +122,7 @@ impl QueryName {
             Self::ProjectVerify => "project.verify",
             Self::ProjectList => "project.list",
             Self::JobList => "job.list",
+            Self::CronPreview => "cron.preview",
             Self::CostRollup => "cost.rollup",
             Self::Health => "health",
         }
@@ -285,6 +303,7 @@ impl std::error::Error for ApiError {}
 pub struct LocalBootstrapConfig {
     pack_root: PathBuf,
     user: Option<pos_foundation::UserId>,
+    echo: EchoRuntimeOptions,
 }
 
 impl LocalBootstrapConfig {
@@ -293,6 +312,7 @@ impl LocalBootstrapConfig {
         Self {
             pack_root,
             user: None,
+            echo: EchoRuntimeOptions::default(),
         }
     }
 
@@ -304,6 +324,14 @@ impl LocalBootstrapConfig {
         self.user = Some(user);
         self
     }
+
+    /// Selects the loopback OpenAI-compatible endpoint used by Echo. The
+    /// worker still validates device locality and enforces `local_only`.
+    #[must_use]
+    pub fn with_echo(mut self, options: EchoRuntimeOptions) -> Self {
+        self.echo = options;
+        self
+    }
 }
 
 /// Process-owned runtime state exposed to thin shell transports.
@@ -312,6 +340,7 @@ pub struct LocalRuntime {
     identity: project_ops::RuntimeIdentity,
     clock: SystemWallClock,
     open_projects: session::OpenProjects,
+    echo_supervisor: run_ops::EchoSupervisor,
 }
 
 impl LocalRuntime {
@@ -348,13 +377,10 @@ impl LocalRuntime {
                 &self.open_projects,
                 &project_ops::parse_input(input_json)?,
             ),
-            // Registered-but-later entries answer honestly instead of faking
-            // an empty success; their input contracts belong to the stories
-            // that implement the engines, so input is deliberately unparsed.
-            Some(QueryName::JobList) => Err(ApiError::not_yet_supported(
-                "job.list",
-                "the pos-sched job queue (m0-s14)",
-            )),
+            Some(QueryName::JobList) => sched_ops::job_list(&project_ops::parse_input(input_json)?),
+            Some(QueryName::CronPreview) => {
+                sched_ops::cron_preview(&project_ops::parse_input(input_json)?)
+            }
             None => Err(ApiError::unknown_query(name)),
         }
     }
@@ -381,35 +407,65 @@ impl LocalRuntime {
             Some(CommandName::ModelsPull) => {
                 gateway_ops::models_pull(&project_ops::parse_input(input_json)?)
             }
-            Some(
-                CommandName::RunStart
-                | CommandName::RunCancel
-                | CommandName::RunPause
-                | CommandName::RunResume,
-            ) => Err(ApiError::not_yet_supported(
-                name,
-                "the agent harness (m0-s12/m0-s13)",
-            )),
+            Some(CommandName::RunStart) => run_ops::start(
+                &self.identity,
+                &self.clock,
+                &self.echo_supervisor,
+                &project_ops::parse_input(input_json)?,
+            ),
+            Some(CommandName::RunCancel) => run_ops::cancel(
+                &self.identity,
+                &self.clock,
+                &project_ops::parse_input(input_json)?,
+            ),
+            Some(CommandName::RunPause) => run_ops::pause(
+                &self.identity,
+                &self.clock,
+                &project_ops::parse_input(input_json)?,
+            ),
+            Some(CommandName::RunResume) => run_ops::resume(
+                &self.identity,
+                &self.clock,
+                &self.echo_supervisor,
+                &project_ops::parse_input(input_json)?,
+            ),
             None => Err(ApiError::unknown_command(name)),
         }
     }
 
     /// Subscribes to a stream, optionally resuming after a client-presented
-    /// cursor, and returns the frames currently replayable. Live tailing
-    /// arrives with the first real stream producer (m0-s13); the framing and
-    /// resume semantics are frozen now so that story changes no transport.
+    /// cursor, and returns the durable frames currently replayable. The m0-s13
+    /// Echo producer also follows this cursor through [`Self::stream_follow`];
+    /// both transports keep the same frozen framing and resume semantics.
     pub fn stream_subscribe(
         &self,
         name: &str,
-        _input_json: &str,
+        input_json: &str,
         resume_after: Option<u64>,
     ) -> Result<Vec<StreamFrame>, ApiError> {
-        let _ = resume_after;
         match StreamName::parse(name) {
-            Some(StreamName::RunSteps) => Err(ApiError::not_yet_supported(
-                "run.steps",
-                "the echo-agent run feed (m0-s13)",
-            )),
+            Some(StreamName::RunSteps) => {
+                run_ops::stream_subscribe(&project_ops::parse_input(input_json)?, resume_after)
+            }
+            None => Err(ApiError::unknown_stream(name)),
+        }
+    }
+
+    /// Replays durable frames after `resume_after`, then tails checkpoint
+    /// boundaries until the Run becomes terminal or the consumer disconnects.
+    pub fn stream_follow(
+        &self,
+        name: &str,
+        input_json: &str,
+        resume_after: Option<u64>,
+        consume: impl FnMut(StreamFrame) -> bool,
+    ) -> Result<(), ApiError> {
+        match StreamName::parse(name) {
+            Some(StreamName::RunSteps) => run_ops::stream_follow(
+                &project_ops::parse_input(input_json)?,
+                resume_after,
+                consume,
+            ),
             None => Err(ApiError::unknown_stream(name)),
         }
     }
@@ -581,6 +637,7 @@ pub fn bootstrap_local_runtime(config: LocalBootstrapConfig) -> LocalRuntime {
         identity,
         clock: SystemWallClock,
         open_projects: session::OpenProjects::default(),
+        echo_supervisor: run_ops::EchoSupervisor::new(config.echo),
     }
 }
 

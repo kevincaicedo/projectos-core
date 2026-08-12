@@ -124,6 +124,38 @@ impl PromptFile {
             &self.blake3_hex[..16.min(self.blake3_hex.len())]
         )
     }
+
+    /// Parses one compile-time embedded prompt through the same filename and
+    /// frontmatter rules as the directory registry. Packaged shells use this
+    /// for foundation prompts, while CI still pins the source file through
+    /// `prompts.lock`; there is no second hand-copied prompt body to drift.
+    pub fn from_embedded(file_name: &str, bytes: &[u8]) -> Result<Self, PromptError> {
+        let (id, version) = parse_file_name(file_name).ok_or_else(|| PromptError::BadName {
+            file_name: file_name.to_owned(),
+        })?;
+        if bytes.len() as u64 > PROMPT_FILE_BYTES_MAX {
+            return Err(PromptError::FileTooLarge {
+                file_name: file_name.to_owned(),
+                bytes: bytes.len() as u64,
+            });
+        }
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        let (mut params, body) = parse_frontmatter(file_name, &text)?;
+        let tier = params
+            .remove("tier")
+            .ok_or_else(|| PromptError::BadFrontmatter {
+                file_name: file_name.to_owned(),
+                reason: "missing required `tier:`".to_owned(),
+            })?;
+        Ok(Self {
+            id,
+            version,
+            tier,
+            params,
+            body,
+            blake3_hex: blake3::hash(bytes).to_hex().to_string(),
+        })
+    }
 }
 
 /// All prompts under one directory, loaded eagerly (the tree is small by

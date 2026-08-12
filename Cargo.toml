@@ -47,6 +47,10 @@ blake3 = "1"
 # randomness source outside test seeds.
 getrandom = "0.3"
 ciborium = "0.2"
+# Civil-time arithmetic over IANA zones with explicit gap/ambiguity handling
+# (m0-s14 cron). Default features use the OS tz database on Unix and the
+# bundled one on Windows, so a zone rule change ships with the OS, not with us.
+jiff = "0.2"
 clap = { version = "4", features = ["derive"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 proptest = "1"
@@ -67,6 +71,8 @@ tauri-plugin-single-instance = "=2.4.3"
 tempfile = "3"
 # tokio is the §20 async-runtime decision; features stay minimal per consumer.
 tokio = { version = "1", default-features = false }
+# Bounded adapter from Tokio channels to HTTP response streams; transport only.
+tokio-stream = { version = "0.1", default-features = false }
 # ts-rs generates the apps/ui API types from the Rust wire types (L12); the
 # serde-compat default keeps the emitted TS aligned with the serde wire names.
 ts-rs = "12"

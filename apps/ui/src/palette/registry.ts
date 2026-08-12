@@ -29,10 +29,8 @@ export interface SwitchTarget {
   readonly label: string;
 }
 
-/// The registered v0 commands (milestone list). Run/job entries dispatch
-/// through the real seam and surface its typed answer — today that is the
-/// honest not_yet_supported envelope from the registry (engines land in
-/// m0-s12/s13/s14).
+/// The registered v0 commands (milestone list). Run entries use the durable
+/// m0-s12/s13 engine; the job entry remains an honest future seam until m0-s14.
 export function paletteCommands(
   actions: PaletteActions,
   switchTargets: readonly SwitchTarget[],

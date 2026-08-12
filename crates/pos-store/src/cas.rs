@@ -55,6 +55,11 @@ impl BlobHash {
     pub fn of_bytes(bytes: &[u8]) -> Self {
         Self(blake3::hash(bytes))
     }
+
+    #[must_use]
+    pub fn into_bytes(self) -> [u8; 32] {
+        *self.0.as_bytes()
+    }
 }
 
 impl fmt::Debug for BlobHash {
@@ -119,12 +124,24 @@ impl BlobStore {
             path: temp.clone(),
             source,
         })?;
+        let active_process_prefix = format!("write-{}-", process::id());
         for entry in entries {
             let entry = entry.map_err(|source| StoreError::Io {
                 context: "sweep blob temp directory",
                 path: temp.clone(),
                 source,
             })?;
+            // Another ProjectStore handle in this process may currently own
+            // this writer. Crash leftovers come from a dead process id and
+            // are swept; current-process files are removed by BlobWriter
+            // finish/drop, never by an unrelated read-side reopen.
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&active_process_prefix))
+            {
+                continue;
+            }
             // Best-effort: a leftover that cannot be removed is reported by
             // verify(), not a reason to refuse opening the project.
             let _ = fs::remove_file(entry.path());

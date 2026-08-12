@@ -129,7 +129,7 @@ fn v0_state_machines_land_in_sane_projection_rows() {
             let mismatched_finished = connection.query_row(
                 "SELECT count(*) FROM proj_runs r
                  WHERE r.status != 'running'
-                   AND r.step_count != (SELECT count(*) FROM proj_run_steps s WHERE s.run_id = r.run_id)",
+                   AND r.committed_step_count != (SELECT count(*) FROM proj_run_steps s WHERE s.run_id = r.run_id)",
                 [],
                 |row| row.get(0),
             )?;

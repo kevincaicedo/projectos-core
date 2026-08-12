@@ -25,12 +25,13 @@ pub use recents::{RECENT_PROJECT_COUNT_MAX, Recents};
 
 use pos_api::{
     CommandName, LocalBootstrapConfig, LocalRuntime, ProjectCreateInput, ProjectPathInput,
-    QueryName, bootstrap_local_runtime, input_json,
+    QueryName, SSE_RETRY_MS, StreamFrame, bootstrap_local_runtime, input_json,
 };
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::Manager;
+use tauri::ipc::Channel;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::tray::TrayIconBuilder;
 
@@ -46,7 +47,7 @@ const SHUTDOWN_POLL_MS: u64 = 25;
 pub struct ShellState {
     config_dir: PathBuf,
     recents: Mutex<Recents>,
-    in_flight: AtomicUsize,
+    in_flight: Arc<AtomicUsize>,
 }
 
 /// Exercises the packaged executable's real project path without starting a
@@ -102,7 +103,7 @@ impl ShellState {
         Self {
             config_dir,
             recents: Mutex::new(recents),
-            in_flight: AtomicUsize::new(0),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -135,9 +136,11 @@ impl ShellState {
         .to_string()
     }
 
-    fn enter_dispatch(&self) -> DispatchGuard<'_> {
+    fn enter_dispatch(&self) -> DispatchGuard {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
-        DispatchGuard { state: self }
+        DispatchGuard {
+            in_flight: Arc::clone(&self.in_flight),
+        }
     }
 
     /// Blocks until no dispatch is in flight, or the drain budget expires.
@@ -157,13 +160,13 @@ impl ShellState {
 
 /// Decrements the in-flight count however the dispatch ends, including a
 /// panic — a leaked count would hang every later shutdown.
-struct DispatchGuard<'state> {
-    state: &'state ShellState,
+struct DispatchGuard {
+    in_flight: Arc<AtomicUsize>,
 }
 
-impl Drop for DispatchGuard<'_> {
+impl Drop for DispatchGuard {
     fn drop(&mut self) {
-        self.state.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -211,6 +214,50 @@ fn path_from_input(input_json: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn dispatch_stream(
+    runtime: Arc<LocalRuntime>,
+    name: String,
+    input: String,
+    resume_after: Option<u64>,
+    channel: Channel<String>,
+    guard: DispatchGuard,
+) -> Result<(), String> {
+    let frames = runtime
+        .stream_subscribe(&name, &input, resume_after)
+        .map_err(|error| error.to_json())?;
+    let tail_cursor = frames
+        .last()
+        .map_or(resume_after, |frame| Some(frame.stream_seq));
+    std::thread::Builder::new()
+        .name("pos-desktop-run-stream".to_owned())
+        .spawn(move || {
+            let _guard = guard;
+            if channel.send(format!("retry: {SSE_RETRY_MS}\n\n")).is_err() {
+                return;
+            }
+            for frame in frames {
+                if !send_stream_frame(&channel, &frame) {
+                    return;
+                }
+            }
+            let followed = runtime.stream_follow(&name, &input, tail_cursor, |frame| {
+                send_stream_frame(&channel, &frame)
+            });
+            if let Err(error) = followed {
+                let _ = channel.send(format!(
+                    "event: stream.error\ndata: {}\n\n",
+                    error.to_json()
+                ));
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| format!("start desktop Run stream: {error}"))
+}
+
+fn send_stream_frame(channel: &Channel<String>, frame: &StreamFrame) -> bool {
+    channel.send(frame.to_sse()).is_ok()
+}
+
 #[tauri::command]
 #[allow(
     clippy::needless_pass_by_value,
@@ -219,11 +266,11 @@ fn path_from_input(input_json: &str) -> Option<String> {
 fn api_query(
     name: String,
     input: Option<String>,
-    runtime: tauri::State<'_, LocalRuntime>,
+    runtime: tauri::State<'_, Arc<LocalRuntime>>,
     shell: tauri::State<'_, ShellState>,
 ) -> Result<String, String> {
     let _guard = shell.enter_dispatch();
-    dispatch_query(runtime.inner(), &name, input.as_deref())
+    dispatch_query(runtime.inner().as_ref(), &name, input.as_deref())
 }
 
 #[tauri::command]
@@ -234,11 +281,34 @@ fn api_query(
 fn api_command(
     name: String,
     input: String,
-    runtime: tauri::State<'_, LocalRuntime>,
+    runtime: tauri::State<'_, Arc<LocalRuntime>>,
     shell: tauri::State<'_, ShellState>,
 ) -> Result<String, String> {
     let _guard = shell.enter_dispatch();
-    dispatch_command(runtime.inner(), shell.inner(), &name, &input)
+    dispatch_command(runtime.inner().as_ref(), shell.inner(), &name, &input)
+}
+
+#[tauri::command]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Tauri deserializes IPC arguments and the channel into owned values"
+)]
+fn api_stream(
+    name: String,
+    input: String,
+    resume_after: Option<u64>,
+    channel: Channel<String>,
+    runtime: tauri::State<'_, Arc<LocalRuntime>>,
+    shell: tauri::State<'_, ShellState>,
+) -> Result<(), String> {
+    dispatch_stream(
+        Arc::clone(runtime.inner()),
+        name,
+        input,
+        resume_after,
+        channel,
+        shell.enter_dispatch(),
+    )
 }
 
 /// The shell surface the UI reads at startup to restore its last project.
@@ -279,8 +349,8 @@ pub fn run() -> Result<(), tauri::Error> {
                 .app_data_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join("packs");
-            app.manage(bootstrap_local_runtime(LocalBootstrapConfig::isolated(
-                packs_root,
+            app.manage(Arc::new(bootstrap_local_runtime(
+                LocalBootstrapConfig::isolated(packs_root),
             )));
             app.manage(ShellState::new(config_dir));
             install_menu(app)?;
@@ -302,6 +372,7 @@ pub fn run() -> Result<(), tauri::Error> {
         .invoke_handler(tauri::generate_handler![
             api_query,
             api_command,
+            api_stream,
             shell_recents
         ])
         .run(tauri::generate_context!())
@@ -386,12 +457,21 @@ impl<R: tauri::Runtime> EmitShellCommand for tauri::WebviewWindow<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShellState, dispatch_command, dispatch_query, packaging_smoke, path_from_input};
-    use pos_api::{
-        CommandName, LocalBootstrapConfig, LocalRuntime, ProjectCreateInput, ProjectPathInput,
-        QueryName, bootstrap_local_runtime, input_json,
+    use super::{
+        ShellState, dispatch_command, dispatch_query, dispatch_stream, packaging_smoke,
+        path_from_input,
     };
+    use pos_api::{
+        CommandName, CostRollupInput, EchoRuntimeOptions, LocalBootstrapConfig, LocalRuntime,
+        ProjectCreateInput, ProjectPathInput, QueryName, RunBudgetWire, RunControlInput,
+        RunStartInput, RunStepsInput, RunWorker, StreamName, bootstrap_local_runtime, input_json,
+    };
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tauri::ipc::Channel;
 
     fn runtime() -> LocalRuntime {
         bootstrap_local_runtime(LocalBootstrapConfig::isolated(PathBuf::from(
@@ -422,6 +502,219 @@ mod tests {
             dispatch_query(&runtime, name, None).expect("the registered query resolves");
         let direct = runtime.query(name).expect("the registered query resolves");
         assert_eq!(through_ipc, direct);
+    }
+
+    #[test]
+    fn the_tauri_channel_forwards_the_exact_durable_echo_frame_bytes() {
+        let (base_url, model_thread) = echo_endpoint();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = tempfile::tempdir().expect("config tempdir");
+        let path = directory
+            .path()
+            .join("echo-channel.pos")
+            .display()
+            .to_string();
+        let runtime = Arc::new(bootstrap_local_runtime(
+            LocalBootstrapConfig::isolated(directory.path().join("packs")).with_echo(
+                EchoRuntimeOptions::loopback(base_url, "echo-desktop-fixture"),
+            ),
+        ));
+        let shell = ShellState::new(config.path().to_path_buf());
+        dispatch_command(
+            runtime.as_ref(),
+            &shell,
+            CommandName::ProjectCreate.as_str(),
+            &input_json(&ProjectCreateInput {
+                path: path.clone(),
+                name: Some("Echo channel".to_owned()),
+                template: "generic".to_owned(),
+            })
+            .expect("create input serializes"),
+        )
+        .expect("create project over IPC path");
+        let started = dispatch_command(
+            runtime.as_ref(),
+            &shell,
+            CommandName::RunStart.as_str(),
+            &input_json(&RunStartInput {
+                path: path.clone(),
+                worker: RunWorker::Echo,
+                autonomy_level: 2,
+                budget: echo_budget(),
+                tool_grants: Vec::new(),
+                parent_run_id: None,
+            })
+            .expect("Run input serializes"),
+        )
+        .expect("start Echo over IPC path");
+        let run_id = serde_json::from_str::<serde_json::Value>(&started)
+            .expect("Run report parses")
+            .get("runId")
+            .and_then(serde_json::Value::as_str)
+            .expect("Run report has runId")
+            .to_owned();
+        let stream_input = input_json(&RunStepsInput {
+            path: path.clone(),
+            run_id,
+        })
+        .expect("stream input serializes");
+        let (message_tx, message_rx) = std::sync::mpsc::channel::<String>();
+        let channel = Channel::<String>::new(move |body| {
+            if let Ok(message) = body.deserialize::<String>() {
+                let _ = message_tx.send(message);
+            }
+            Ok(())
+        });
+        dispatch_stream(
+            Arc::clone(&runtime),
+            StreamName::RunSteps.as_str().to_owned(),
+            stream_input.clone(),
+            None,
+            channel,
+            shell.enter_dispatch(),
+        )
+        .expect("Tauri channel stream starts");
+
+        let mut channel_frames = Vec::new();
+        loop {
+            let message = message_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("channel receives the terminal Echo feed");
+            if message.starts_with("id:") {
+                let terminal = message.contains("\"terminal\":true");
+                channel_frames.push(message);
+                if terminal {
+                    break;
+                }
+            }
+        }
+        assert_eq!(channel_frames.len(), 3);
+        let durable = runtime
+            .stream_subscribe(StreamName::RunSteps.as_str(), &stream_input, None)
+            .expect("read durable frames")
+            .into_iter()
+            .map(|frame| frame.to_sse())
+            .collect::<Vec<_>>();
+        assert_eq!(channel_frames, durable);
+        assert_one_echo_cost(runtime.as_ref(), &path);
+        model_thread.join().expect("Echo fixture exits");
+        assert!(shell.drain_in_flight());
+    }
+
+    #[test]
+    fn desktop_cancel_lands_after_the_blocked_model_checkpoint() {
+        let (base_url, requested, release, model_thread) = blocking_echo_endpoint();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = tempfile::tempdir().expect("config tempdir");
+        let path = directory
+            .path()
+            .join("echo-cancel-channel.pos")
+            .display()
+            .to_string();
+        let runtime = Arc::new(bootstrap_local_runtime(
+            LocalBootstrapConfig::isolated(directory.path().join("packs")).with_echo(
+                EchoRuntimeOptions::loopback(base_url, "echo-desktop-cancel-fixture"),
+            ),
+        ));
+        let shell = ShellState::new(config.path().to_path_buf());
+        dispatch_command(
+            runtime.as_ref(),
+            &shell,
+            CommandName::ProjectCreate.as_str(),
+            &input_json(&ProjectCreateInput {
+                path: path.clone(),
+                name: Some("Echo desktop cancel".to_owned()),
+                template: "generic".to_owned(),
+            })
+            .expect("create input serializes"),
+        )
+        .expect("create project over IPC path");
+        let started = dispatch_command(
+            runtime.as_ref(),
+            &shell,
+            CommandName::RunStart.as_str(),
+            &input_json(&RunStartInput {
+                path: path.clone(),
+                worker: RunWorker::Echo,
+                autonomy_level: 2,
+                budget: echo_budget(),
+                tool_grants: Vec::new(),
+                parent_run_id: None,
+            })
+            .expect("Run input serializes"),
+        )
+        .expect("start Echo over IPC path");
+        let run_id = serde_json::from_str::<serde_json::Value>(&started)
+            .expect("Run report parses")["runId"]
+            .as_str()
+            .expect("Run report has runId")
+            .to_owned();
+        requested
+            .recv_timeout(Duration::from_secs(10))
+            .expect("Echo reaches the blocked model effect");
+
+        let stream_input = input_json(&RunStepsInput {
+            path: path.clone(),
+            run_id: run_id.clone(),
+        })
+        .expect("stream input serializes");
+        let (message_tx, message_rx) = std::sync::mpsc::channel::<String>();
+        let channel = Channel::<String>::new(move |body| {
+            if let Ok(message) = body.deserialize::<String>() {
+                let _ = message_tx.send(message);
+            }
+            Ok(())
+        });
+        dispatch_stream(
+            Arc::clone(&runtime),
+            StreamName::RunSteps.as_str().to_owned(),
+            stream_input.clone(),
+            None,
+            channel,
+            shell.enter_dispatch(),
+        )
+        .expect("Tauri channel stream starts");
+        let first = loop {
+            let message = message_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("preflight frame streams while the model is blocked");
+            if message.starts_with("id:") {
+                break message;
+            }
+        };
+        assert!(first.contains("\"streamSeq\":1"));
+
+        let pending = dispatch_command(
+            runtime.as_ref(),
+            &shell,
+            CommandName::RunCancel.as_str(),
+            &input_json(&RunControlInput {
+                path: path.clone(),
+                run_id,
+                reason: "Desktop cancellation oracle".to_owned(),
+            })
+            .expect("cancel input serializes"),
+        )
+        .expect("cancel appends over IPC path");
+        assert!(pending.contains("\"pendingControl\":\"cancel\""));
+        release.send(()).expect("release model fixture");
+
+        let terminal = message_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("canceled checkpoint streams");
+        assert!(terminal.contains("\"streamSeq\":2"));
+        assert!(terminal.contains("\"runStatus\":\"canceled\""));
+        assert!(terminal.contains("\"terminal\":true"));
+        let durable = runtime
+            .stream_subscribe(StreamName::RunSteps.as_str(), &stream_input, None)
+            .expect("read durable canceled frames")
+            .into_iter()
+            .map(|frame| frame.to_sse())
+            .collect::<Vec<_>>();
+        assert_eq!(durable, vec![first, terminal]);
+        assert_one_echo_cost(runtime.as_ref(), &path);
+        model_thread.join().expect("Echo fixture exits");
+        assert!(shell.drain_in_flight());
     }
 
     /// The m0-s07 lifecycle AC, minus the webview: create a project through
@@ -520,5 +813,126 @@ mod tests {
         );
         assert_eq!(path_from_input("{\"path\":42}"), None);
         assert_eq!(path_from_input("not json"), None);
+    }
+
+    const fn echo_budget() -> RunBudgetWire {
+        RunBudgetWire {
+            tokens: 4_096,
+            usd_micros: 0,
+            wall_ms: 90_000,
+            storage_bytes: 64 * 1_024,
+            tool_calls: 3,
+            retries: 0,
+            steps: 3,
+        }
+    }
+
+    fn assert_one_echo_cost(runtime: &LocalRuntime, path: &str) {
+        let input = input_json(&CostRollupInput {
+            path: Some(path.to_owned()),
+        })
+        .expect("cost input serializes");
+        let cost = dispatch_query(runtime, QueryName::CostRollup.as_str(), Some(&input))
+            .expect("desktop cost rollup reads");
+        let cost: serde_json::Value = serde_json::from_str(&cost).expect("cost report parses");
+        assert_eq!(cost["totals"]["calls"], 1);
+        assert_eq!(cost["rows"][0]["feature"], "echo");
+        assert_eq!(cost["rows"][0]["agent"], "echo");
+    }
+
+    fn echo_endpoint() -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Echo fixture binds");
+        let address = listener.local_addr().expect("Echo fixture has address");
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("Echo worker connects");
+            let marker = read_echo_marker(&mut stream);
+            let delta = serde_json::json!({
+                "choices": [{"delta": {"content": format!("ECHO: {marker}")}}]
+            });
+            let usage = serde_json::json!({
+                "choices": [],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+            });
+            let body = format!("data: {delta}\n\ndata: {usage}\n\ndata: [DONE]\n\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write Echo response");
+        });
+        (format!("http://{address}"), thread)
+    }
+
+    fn blocking_echo_endpoint() -> (
+        String,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Echo fixture binds");
+        let address = listener.local_addr().expect("Echo fixture has address");
+        let (requested_tx, requested) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("Echo worker connects");
+            let marker = read_echo_marker(&mut stream);
+            requested_tx.send(()).expect("test waits for request");
+            release_rx.recv().expect("test releases response");
+            let delta = serde_json::json!({
+                "choices": [{"delta": {"content": format!("ECHO: {marker}")}}]
+            });
+            let usage = serde_json::json!({
+                "choices": [],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+            });
+            let body = format!("data: {delta}\n\ndata: {usage}\n\ndata: [DONE]\n\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write Echo response");
+        });
+        (format!("http://{address}"), requested, release, thread)
+    }
+
+    fn read_echo_marker(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 1_024];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).expect("read Echo request");
+            assert!(read > 0, "Echo request closed before headers");
+            bytes.extend_from_slice(&chunk[..read]);
+            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .expect("Echo request has content-length");
+        while bytes.len() - header_end < content_length {
+            let read = stream.read(&mut chunk).expect("read Echo body");
+            assert!(read > 0, "Echo request closed before body");
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        let request: serde_json::Value =
+            serde_json::from_slice(&bytes[header_end..header_end + content_length])
+                .expect("Echo request parses");
+        request["messages"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .and_then(|message| message["content"].as_str())
+            .expect("Echo marker exists")
+            .to_owned()
     }
 }

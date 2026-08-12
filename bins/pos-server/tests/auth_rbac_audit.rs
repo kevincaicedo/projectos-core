@@ -8,10 +8,16 @@
 use pos_server::control::Role;
 use pos_server::web::{ServerConfig, ServerState, serve};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::time::Duration;
 
-use pos_api::{CommandName, QueryName, StreamName};
+use pos_api::{
+    CommandName, CostRollupInput, EchoRuntimeOptions, ProjectCreateInput, QueryName, RunBudgetWire,
+    RunControlInput, RunResumeInput, RunStartInput, RunStepsInput, RunWorker, StreamName,
+    input_json,
+};
 
 /// A served shell on an ephemeral loopback port with its own data root.
 struct ServedShell {
@@ -34,12 +40,60 @@ struct Client {
     projects_root: String,
 }
 
+struct BlockingEchoEndpoint {
+    base_url: String,
+    requested: Receiver<()>,
+    release: Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl BlockingEchoEndpoint {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Echo fixture binds");
+        let address = listener.local_addr().expect("Echo fixture has address");
+        let (requested_tx, requested) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("Echo worker connects");
+            let marker = read_echo_marker(&mut stream);
+            requested_tx.send(()).expect("test waits for request");
+            release_rx.recv().expect("test releases response");
+            write_echo_response(&mut stream, &marker);
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            requested,
+            release,
+            thread,
+        }
+    }
+
+    fn wait_for_request(&self) {
+        self.requested
+            .recv_timeout(Duration::from_secs(10))
+            .expect("Echo reaches the model fixture");
+    }
+
+    fn release(&self) {
+        self.release.send(()).expect("release Echo response");
+    }
+
+    fn finish(self) {
+        self.thread.join().expect("Echo fixture exits");
+    }
+}
+
 impl ServedShell {
     fn start() -> Self {
+        Self::start_with_echo(None)
+    }
+
+    fn start_with_echo(echo: Option<EchoRuntimeOptions>) -> Self {
         let data_root = tempfile::tempdir().expect("tempdir");
         let state = ServerState::initialize(&ServerConfig {
             data_root: data_root.path().to_path_buf(),
             ui_dist: None,
+            echo,
         })
         .expect("server state initializes");
         let served = Arc::clone(&state);
@@ -253,6 +307,225 @@ fn every_registered_route_requires_a_session() {
     assert_eq!(status, 401);
 }
 
+#[test]
+fn authenticated_echo_frames_stream_before_the_run_finishes() {
+    let endpoint = BlockingEchoEndpoint::start();
+    let shell = ServedShell::start_with_echo(Some(EchoRuntimeOptions::loopback(
+        &endpoint.base_url,
+        "echo-http-fixture",
+    )));
+    let client = shell.signup("echo@example.com", "echo password 1");
+    let project = project_path(&client, "echo-live");
+    let (status, created) = api(
+        &shell,
+        &client,
+        "cmd",
+        CommandName::ProjectCreate.as_str(),
+        &input_json(&ProjectCreateInput {
+            path: project.clone(),
+            name: Some("Echo live".to_owned()),
+            template: "generic".to_owned(),
+        })
+        .expect("create input serializes"),
+    );
+    assert_eq!(status, 200, "create failed: {created}");
+    let (status, started) = api(
+        &shell,
+        &client,
+        "cmd",
+        CommandName::RunStart.as_str(),
+        &input_json(&RunStartInput {
+            path: project.clone(),
+            worker: RunWorker::Echo,
+            autonomy_level: 2,
+            budget: echo_budget(),
+            tool_grants: Vec::new(),
+            parent_run_id: None,
+        })
+        .expect("Run input serializes"),
+    );
+    assert_eq!(status, 200, "Echo start failed: {started}");
+    let run_id = json_field(&started, "runId");
+    endpoint.wait_for_request();
+
+    let input = input_json(&RunStepsInput {
+        path: project.clone(),
+        run_id,
+    })
+    .expect("stream input serializes");
+    let target = format!(
+        "/api/stream/{}?input={}",
+        StreamName::RunSteps.as_str(),
+        percent_encode(&input)
+    );
+    let mut stream = TcpStream::connect(shell.addr).expect("connect SSE client");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set SSE timeout");
+    let request = format!(
+        "GET {target} HTTP/1.1\r\nhost: {}\r\nconnection: close\r\ncookie: {}\r\n\r\n",
+        shell.addr, client.cookie
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("write SSE subscribe");
+    let mut raw = Vec::new();
+    read_until_contains(&mut stream, &mut raw, b"\"streamSeq\":1");
+    let live = String::from_utf8_lossy(&raw);
+    assert!(live.contains("content-type: text/event-stream"));
+    assert!(live.contains("event: run.step"));
+    assert!(
+        !live.contains("\"streamSeq\":2"),
+        "the blocked model boundary must not be announced as durable"
+    );
+
+    endpoint.release();
+    stream
+        .read_to_end(&mut raw)
+        .expect("read terminal SSE tail");
+    let complete = String::from_utf8_lossy(&raw);
+    for needle in [
+        "\"streamSeq\":2",
+        "\"streamSeq\":3",
+        "\"runStatus\":\"done\"",
+        "\"validationStatus\":\"passed\"",
+    ] {
+        assert!(complete.contains(needle), "SSE response omitted {needle}");
+    }
+
+    let (status, cost) = api(
+        &shell,
+        &client,
+        "query",
+        QueryName::CostRollup.as_str(),
+        &input_json(&CostRollupInput {
+            path: Some(project),
+        })
+        .expect("cost input serializes"),
+    );
+    assert_eq!(status, 200, "cost rollup failed: {cost}");
+    assert!(cost.contains("\"calls\":1"));
+    assert!(cost.contains("\"feature\":\"echo\""));
+    assert!(cost.contains("\"agent\":\"echo\""));
+    endpoint.finish();
+}
+
+#[test]
+fn authenticated_web_cancel_lands_at_the_next_streamed_checkpoint() {
+    let endpoint = BlockingEchoEndpoint::start();
+    let shell = ServedShell::start_with_echo(Some(EchoRuntimeOptions::loopback(
+        &endpoint.base_url,
+        "echo-http-cancel-fixture",
+    )));
+    let client = shell.signup("echo-cancel@example.com", "echo cancel password 1");
+    let project = project_path(&client, "echo-cancel");
+    let (status, created) = api(
+        &shell,
+        &client,
+        "cmd",
+        CommandName::ProjectCreate.as_str(),
+        &input_json(&ProjectCreateInput {
+            path: project.clone(),
+            name: Some("Echo web cancel".to_owned()),
+            template: "generic".to_owned(),
+        })
+        .expect("create input serializes"),
+    );
+    assert_eq!(status, 200, "create failed: {created}");
+    let (status, started) = api(
+        &shell,
+        &client,
+        "cmd",
+        CommandName::RunStart.as_str(),
+        &input_json(&RunStartInput {
+            path: project.clone(),
+            worker: RunWorker::Echo,
+            autonomy_level: 2,
+            budget: echo_budget(),
+            tool_grants: Vec::new(),
+            parent_run_id: None,
+        })
+        .expect("Run input serializes"),
+    );
+    assert_eq!(status, 200, "Echo start failed: {started}");
+    let run_id = json_field(&started, "runId");
+    endpoint.wait_for_request();
+
+    let stream_input = input_json(&RunStepsInput {
+        path: project.clone(),
+        run_id: run_id.clone(),
+    })
+    .expect("stream input serializes");
+    let target = format!(
+        "/api/stream/{}?input={}",
+        StreamName::RunSteps.as_str(),
+        percent_encode(&stream_input)
+    );
+    let mut stream = TcpStream::connect(shell.addr).expect("connect SSE client");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set SSE timeout");
+    stream
+        .write_all(
+            format!(
+                "GET {target} HTTP/1.1\r\nhost: {}\r\nconnection: close\r\ncookie: {}\r\n\r\n",
+                shell.addr, client.cookie
+            )
+            .as_bytes(),
+        )
+        .expect("write SSE subscribe");
+    let mut raw = Vec::new();
+    read_until_contains(&mut stream, &mut raw, b"\"streamSeq\":1");
+    assert!(!String::from_utf8_lossy(&raw).contains("\"streamSeq\":2"));
+
+    let (status, pending) = api(
+        &shell,
+        &client,
+        "cmd",
+        CommandName::RunCancel.as_str(),
+        &input_json(&RunControlInput {
+            path: project.clone(),
+            run_id,
+            reason: "Web cancellation oracle".to_owned(),
+        })
+        .expect("cancel input serializes"),
+    );
+    assert_eq!(status, 200, "cancel failed: {pending}");
+    assert!(pending.contains("\"pendingControl\":\"cancel\""));
+    endpoint.release();
+    stream
+        .read_to_end(&mut raw)
+        .expect("read canceled SSE tail");
+    let canceled = String::from_utf8_lossy(&raw);
+    for needle in [
+        "\"streamSeq\":2",
+        "\"runStatus\":\"canceled\"",
+        "\"terminal\":true",
+    ] {
+        assert!(canceled.contains(needle), "canceled feed omitted {needle}");
+    }
+    assert!(
+        !canceled.contains("\"streamSeq\":3"),
+        "cancel must stop before the report step"
+    );
+
+    let (status, cost) = api(
+        &shell,
+        &client,
+        "query",
+        QueryName::CostRollup.as_str(),
+        &input_json(&CostRollupInput {
+            path: Some(project),
+        })
+        .expect("cost input serializes"),
+    );
+    assert_eq!(status, 200, "cost rollup failed: {cost}");
+    assert!(cost.contains("\"calls\":1"));
+    assert!(cost.contains("\"feature\":\"echo\""));
+    assert!(cost.contains("\"agent\":\"echo\""));
+    endpoint.finish();
+}
+
 /// The m0-s08 cross-tenant AC: user B, enumerating ids, cannot read or
 /// mutate user A's projects through ANY registered API route. The suite
 /// iterates the registry: every name is dispatched by B against A's
@@ -294,10 +567,15 @@ fn cross_tenant_isolation_holds_on_every_registered_route() {
     // B enumerates A's ids: workspace hex is known, project path is known.
     // Every registered name gets a row; path-bearing ops target A's project.
     let a_export = format!("{}/exfil.pos", a.projects_root);
+    let enumerated_run_id = "11".repeat(16);
     let mut rows: Vec<(&str, String, String)> = Vec::new();
     for query in QueryName::ALL {
         let input = match query {
             QueryName::ProjectInspect | QueryName::ProjectVerify => path_input(&alpha),
+            QueryName::CostRollup => input_json(&CostRollupInput {
+                path: Some(alpha.clone()),
+            })
+            .expect("cost input serializes"),
             _ => "{}".to_owned(),
         };
         rows.push(("query", query.as_str().to_owned(), input));
@@ -319,12 +597,48 @@ fn cross_tenant_isolation_holds_on_every_registered_route() {
                 serde_json::to_string(&a_export).expect("serializes")
             ),
             CommandName::ProjectOpen => path_input(&alpha),
+            CommandName::RunStart => input_json(&RunStartInput {
+                path: alpha.clone(),
+                worker: RunWorker::Navigator,
+                autonomy_level: 2,
+                budget: RunBudgetWire {
+                    tokens: 1,
+                    usd_micros: 0,
+                    wall_ms: 1,
+                    storage_bytes: 0,
+                    tool_calls: 0,
+                    retries: 0,
+                    steps: 0,
+                },
+                tool_grants: Vec::new(),
+                parent_run_id: None,
+            })
+            .expect("Run input serializes"),
+            CommandName::RunCancel | CommandName::RunPause => input_json(&RunControlInput {
+                path: alpha.clone(),
+                run_id: enumerated_run_id.clone(),
+                reason: "enumeration probe".to_owned(),
+            })
+            .expect("control input serializes"),
+            CommandName::RunResume => input_json(&RunResumeInput {
+                path: alpha.clone(),
+                run_id: enumerated_run_id.clone(),
+            })
+            .expect("resume input serializes"),
             _ => "{}".to_owned(),
         };
         rows.push(("cmd", command.as_str().to_owned(), input));
     }
     for stream in StreamName::ALL {
-        rows.push(("stream", stream.as_str().to_owned(), "{}".to_owned()));
+        rows.push((
+            "stream",
+            stream.as_str().to_owned(),
+            input_json(&RunStepsInput {
+                path: alpha.clone(),
+                run_id: enumerated_run_id.clone(),
+            })
+            .expect("stream input serializes"),
+        ));
     }
 
     let b_client = &b;
@@ -429,6 +743,34 @@ fn a_viewer_cannot_invoke_mutating_commands() {
                 serde_json::to_string(&alpha).expect("serializes"),
                 serde_json::to_string(&viewer_target).expect("serializes")
             ),
+            CommandName::RunStart => input_json(&RunStartInput {
+                path: alpha.clone(),
+                worker: RunWorker::Navigator,
+                autonomy_level: 2,
+                budget: RunBudgetWire {
+                    tokens: 1,
+                    usd_micros: 0,
+                    wall_ms: 1,
+                    storage_bytes: 0,
+                    tool_calls: 0,
+                    retries: 0,
+                    steps: 0,
+                },
+                tool_grants: Vec::new(),
+                parent_run_id: None,
+            })
+            .expect("Run input serializes"),
+            CommandName::RunCancel | CommandName::RunPause => input_json(&RunControlInput {
+                path: alpha.clone(),
+                run_id: "22".repeat(16),
+                reason: "viewer probe".to_owned(),
+            })
+            .expect("control input serializes"),
+            CommandName::RunResume => input_json(&RunResumeInput {
+                path: alpha.clone(),
+                run_id: "22".repeat(16),
+            })
+            .expect("resume input serializes"),
             // Any future command is presumed mutating until this suite gets
             // a deliberate row — deny-by-default extends to the test.
             _ => "{}".to_owned(),
@@ -461,12 +803,36 @@ fn audit_rows_exist_and_no_secret_material_is_stored() {
     assert_eq!(status, 200);
     let (status, _) = api(&shell, &a, "cmd", "project.open", &path_input(&alpha));
     assert_eq!(status, 200);
-    // run.start / run.cancel: audited attempts even while the engine answers
-    // not_yet_supported (the audit records who tried to act).
-    let (status, _) = api(&shell, &a, "cmd", "run.start", "{}");
-    assert_eq!(status, 501);
-    let (status, _) = api(&shell, &a, "cmd", "run.cancel", "{}");
-    assert_eq!(status, 501);
+    // Run actions execute through the real m0-s12 harness; the audit row
+    // names the same project path while the Run id remains typed data.
+    let run_start = input_json(&RunStartInput {
+        path: alpha.clone(),
+        worker: RunWorker::Navigator,
+        autonomy_level: 2,
+        budget: RunBudgetWire {
+            tokens: 100,
+            usd_micros: 100,
+            wall_ms: 10_000,
+            storage_bytes: 1_024,
+            tool_calls: 4,
+            retries: 2,
+            steps: 4,
+        },
+        tool_grants: Vec::new(),
+        parent_run_id: None,
+    })
+    .expect("Run start input serializes");
+    let (status, started) = api(&shell, &a, "cmd", "run.start", &run_start);
+    assert_eq!(status, 200, "run.start failed: {started}");
+    let run_id = json_field(&started, "runId");
+    let run_cancel = input_json(&RunControlInput {
+        path: alpha,
+        run_id,
+        reason: "Audit fixture cancellation".to_owned(),
+    })
+    .expect("Run cancel input serializes");
+    let (status, canceled) = api(&shell, &a, "cmd", "run.cancel", &run_cancel);
+    assert_eq!(status, 200, "run.cancel failed: {canceled}");
 
     let (status, _, audit) = shell.request("GET", "/auth/audit", &a.cookie, "");
     assert_eq!(status, 200, "audit query failed: {audit}");
@@ -535,6 +901,7 @@ fn the_ui_bundle_is_served_with_cache_discipline() {
     let state = ServerState::initialize(&ServerConfig {
         data_root: data_root.path().to_path_buf(),
         ui_dist: Some(dist.path().to_path_buf()),
+        echo: None,
     })
     .expect("server state initializes");
     let served = Arc::clone(&state);
@@ -587,6 +954,87 @@ fn the_ui_bundle_is_served_with_cache_discipline() {
 
     let _ = shutdown.send(());
     let _ = thread.join();
+}
+
+const fn echo_budget() -> RunBudgetWire {
+    RunBudgetWire {
+        tokens: 4_096,
+        usd_micros: 0,
+        wall_ms: 90_000,
+        storage_bytes: 64 * 1_024,
+        tool_calls: 3,
+        retries: 0,
+        steps: 3,
+    }
+}
+
+fn read_until_contains(stream: &mut TcpStream, bytes: &mut Vec<u8>, needle: &[u8]) {
+    let mut chunk = [0_u8; 1_024];
+    for _ in 0..1_024 {
+        if bytes.windows(needle.len()).any(|window| window == needle) {
+            return;
+        }
+        let read = stream.read(&mut chunk).expect("read live SSE bytes");
+        assert!(read > 0, "SSE closed before the expected live frame");
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    panic!("SSE did not contain the expected frame within the bounded read loop");
+}
+
+fn read_echo_marker(stream: &mut TcpStream) -> String {
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 1_024];
+    let header_end = loop {
+        let read = stream.read(&mut chunk).expect("read Echo request");
+        assert!(read > 0, "Echo request closed before its headers");
+        bytes.extend_from_slice(&chunk[..read]);
+        assert!(bytes.len() <= 1024 * 1024, "Echo request exceeds 1 MiB");
+        if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .expect("Echo request carries content-length");
+    while bytes.len() - header_end < content_length {
+        let read = stream.read(&mut chunk).expect("read Echo request body");
+        assert!(read > 0, "Echo request closed before its body");
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    let request: serde_json::Value =
+        serde_json::from_slice(&bytes[header_end..header_end + content_length])
+            .expect("Echo request is JSON");
+    request["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .and_then(|message| message["content"].as_str())
+        .expect("Echo request has its marker")
+        .to_owned()
+}
+
+fn write_echo_response(stream: &mut TcpStream, marker: &str) {
+    let delta = serde_json::json!({
+        "choices": [{"delta": {"content": format!("ECHO: {marker}")}}]
+    });
+    let usage = serde_json::json!({
+        "choices": [],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+    });
+    let body = format!("data: {delta}\n\ndata: {usage}\n\ndata: [DONE]\n\n");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .expect("write Echo response");
 }
 
 fn hex_bytes(text: &str) -> [u8; 16] {

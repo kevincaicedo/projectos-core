@@ -85,10 +85,16 @@ release-signing-check:
 # m0-s10 release-qualification lane (NOT in `ci`): live Ollama profile
 # qualification against a running local daemon. LM Studio/vLLM run the same
 # lane with their env vars; cloud smokes join when the TLS transport lands
-# (visible debt: m0-s13/m1-s03).
+# (visible debt: m1-s03).
 qualify-gateway-local base="http://127.0.0.1:11434" model="qwen3:0.6b":
     POS_QUALIFY_OLLAMA_BASE={{base}} POS_QUALIFY_OLLAMA_MODEL={{model}} \
       cargo test -p pos-gateway --test live_qualification -- --ignored qualify_live_ollama --nocapture
+
+# m0-s13 release-qualification lane (NOT in `ci`): the complete Echo path,
+# including Run frames, validation, and its durable cost row, against the
+# pinned local Ollama model used by EchoRuntimeOptions::default().
+qualify-echo-local:
+    cargo test -p pos-api --test echo_runtime identical_echo_path_passes_live_ollama_under_local_only -- --ignored --nocapture
 
 qualify-gateway-lm-studio model base="http://127.0.0.1:1234":
     POS_QUALIFY_LMSTUDIO_BASE={{base}} POS_QUALIFY_LMSTUDIO_MODEL={{model}} \

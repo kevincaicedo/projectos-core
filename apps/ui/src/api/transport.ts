@@ -2,6 +2,7 @@
 // vite.config.ts). Everything below it is shell-agnostic: both transports carry
 // the same pos-api bytes, and this module never invents runtime state when a
 // transport is missing — it reports what actually happened.
+import { Channel } from "@tauri-apps/api/core";
 import {
   CAPABILITY_SNAPSHOT_QUERY,
   capabilityCards,
@@ -12,6 +13,7 @@ import {
   type CapabilityState,
   type ConnectorHostTick,
 } from "./gen/capabilities";
+import { SseDecoder, type SseMessage } from "./sse";
 
 declare global {
   interface Window {
@@ -75,6 +77,193 @@ export async function apiCommand(name: string, inputJson: string): Promise<Dispa
     headers: { accept: "application/json", "content-type": "application/json" },
     body: inputJson,
   });
+}
+
+export interface StreamHandlers {
+  readonly onMessage: (message: SseMessage) => void;
+  readonly onError: (error: ApiErrorEnvelope) => void;
+  readonly onEnd: () => void;
+}
+
+export interface StreamSubscription {
+  readonly transport: TransportName;
+  readonly close: () => void;
+}
+
+/// Follows a registry stream through a real incremental HTTP body or the
+/// desktop Channel. Both paths feed the same decoder and therefore expose the
+/// same complete SSE messages to the shared React bundle.
+export function apiStream(
+  name: string,
+  inputJson: string,
+  resumeAfter: number | null,
+  handlers: StreamHandlers,
+): StreamSubscription {
+  const transport = activeTransport();
+  const decoder = new SseDecoder();
+  let open = true;
+  const receive = (chunk: string) => {
+    if (!open) {
+      return;
+    }
+    try {
+      for (const message of decoder.push(chunk)) {
+        dispatchStreamMessage(message, handlers);
+      }
+    } catch (thrown: unknown) {
+      open = false;
+      handlers.onError(malformedStream(thrown));
+    }
+  };
+  const finish = () => {
+    if (!open) {
+      return;
+    }
+    try {
+      decoder.finish();
+      handlers.onEnd();
+    } catch (thrown: unknown) {
+      open = false;
+      handlers.onError(malformedStream(thrown));
+    }
+  };
+
+  if (transport === "tauri-ipc") {
+    let channel: Channel<string>;
+    try {
+      channel = new Channel<string>(receive);
+    } catch (thrown: unknown) {
+      handlers.onError(malformedStream(thrown));
+      return { transport, close: () => undefined };
+    }
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (invoke === undefined) {
+      handlers.onError(transportUnavailable("The IPC bridge disappeared."));
+    } else {
+      void invoke("api_stream", {
+        name,
+        input: inputJson,
+        resumeAfter,
+        channel,
+      }).catch((thrown: unknown) => {
+        if (open) {
+          open = false;
+          handlers.onError(decodeError(thrown));
+        }
+      });
+    }
+    return {
+      transport,
+      close: () => {
+        open = false;
+        channel.onmessage = () => undefined;
+      },
+    };
+  }
+
+  const controller = new AbortController();
+  void followHttpStream(
+    name,
+    inputJson,
+    resumeAfter,
+    controller,
+    receive,
+    finish,
+    () => open,
+  ).catch((thrown: unknown) => {
+    if (open && !controller.signal.aborted) {
+      open = false;
+      handlers.onError(decodeError(thrown));
+    }
+  });
+  return {
+    transport,
+    close: () => {
+      open = false;
+      controller.abort();
+    },
+  };
+}
+
+async function followHttpStream(
+  name: string,
+  inputJson: string,
+  resumeAfter: number | null,
+  controller: AbortController,
+  receive: (chunk: string) => void,
+  finish: () => void,
+  isOpen: () => boolean,
+): Promise<void> {
+  const query = new URLSearchParams({ input: inputJson });
+  if (resumeAfter !== null) {
+    query.set("from", String(resumeAfter));
+  }
+  const response = await fetch(`/api/stream/${name}?${query.toString()}`, {
+    headers: { accept: "text/event-stream" },
+    credentials: "same-origin",
+    signal: controller.signal,
+  });
+  if (!response.ok) {
+    throw decodeError(await response.text());
+  }
+  if (response.body === null) {
+    throw transportUnavailable("The ProjectOS server returned no Run stream body.");
+  }
+  const reader = response.body.getReader();
+  const textDecoder = new TextDecoder();
+  while (isOpen()) {
+    const result = await reader.read();
+    if (result.done) {
+      receive(textDecoder.decode());
+      finish();
+      return;
+    }
+    receive(textDecoder.decode(result.value, { stream: true }));
+  }
+}
+
+function dispatchStreamMessage(message: SseMessage, handlers: StreamHandlers): void {
+  if (message.event !== "stream.error") {
+    handlers.onMessage(message);
+    return;
+  }
+  const error = asErrorEnvelope(parseJson(message.data));
+  handlers.onError(
+    error ?? {
+      code: "malformed_result",
+      message: "The runtime returned an invalid stream error envelope.",
+      retriable: false,
+    },
+  );
+}
+
+function malformedStream(thrown: unknown): ApiErrorEnvelope {
+  return {
+    code: "malformed_result",
+    message: thrown instanceof Error ? thrown.message : "The Run stream framing was invalid.",
+    retriable: false,
+  };
+}
+
+function transportUnavailable(message: string): ApiErrorEnvelope {
+  return { code: "transport_unavailable", message, retriable: true };
+}
+
+function decodeError(thrown: unknown): ApiErrorEnvelope {
+  if (isRecord(thrown) && typeof thrown.code === "string") {
+    const envelope = asErrorEnvelope(thrown);
+    if (envelope !== null) {
+      return envelope;
+    }
+  }
+  const envelope = asErrorEnvelope(parseJson(typeof thrown === "string" ? thrown : ""));
+  return (
+    envelope ?? {
+      code: "transport_failed",
+      message: thrown instanceof Error ? thrown.message : "The Run stream failed.",
+      retriable: true,
+    }
+  );
 }
 
 async function invokeIpc(command: string, args: Record<string, unknown>): Promise<DispatchOutcome> {

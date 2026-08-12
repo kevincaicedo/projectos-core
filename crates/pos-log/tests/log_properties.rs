@@ -32,6 +32,7 @@ const COUNTS_TABLE: TableDef = TableDef {
         name: "count",
         kind: ColumnKind::Integer,
     }],
+    indexes: &[],
 };
 
 impl Projection for CountsProjection {
@@ -68,6 +69,7 @@ const LATEST_TABLE: TableDef = TableDef {
             kind: ColumnKind::Text,
         },
     ],
+    indexes: &[],
 };
 
 impl Projection for LatestProjection {
@@ -101,6 +103,7 @@ const BODIES_TABLE: TableDef = TableDef {
         name: "body",
         kind: ColumnKind::Blob,
     }],
+    indexes: &[],
 };
 
 impl Projection for BodiesProjection {
@@ -190,6 +193,32 @@ fn batches_strategy() -> impl Strategy<Value = Vec<Vec<RequestSpec>>> {
             body,
         });
     proptest::collection::vec(proptest::collection::vec(spec, 1..12), 1..6)
+}
+
+#[test]
+fn conditional_append_detects_a_stale_head_inside_the_writer_transaction() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let log = open_log(directory.path());
+    let clock = ManualWallClock::starting_at(2_000);
+    let request = request_from_spec(&RequestSpec {
+        device_index: 1,
+        kind_index: 0,
+        body: vec![1],
+    });
+    let first = log
+        .append_at_head(EventSeq::ZERO, request.clone(), &clock)
+        .expect("empty head matches");
+    assert_eq!(first, EventSeq::new(1));
+
+    let error = log
+        .append_at_head(EventSeq::ZERO, request, &clock)
+        .expect_err("the stale compare must fail without appending");
+    let LogError::HeadChanged { expected, actual } = error else {
+        panic!("stale append returned the wrong typed error");
+    };
+    assert_eq!(expected, EventSeq::ZERO);
+    assert_eq!(actual, EventSeq::new(1));
+    assert_eq!(log.head().expect("head reads"), EventSeq::new(1));
 }
 
 proptest! {

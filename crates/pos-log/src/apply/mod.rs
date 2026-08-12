@@ -65,6 +65,19 @@ pub struct ColumnDef {
     pub kind: ColumnKind,
 }
 
+/// A declared secondary index over a projection table. Read paths that scan a
+/// projection at queue scale (m0-s14's claim query) state their index here
+/// rather than issuing DDL from a feature crate — index definitions stay
+/// beside the table they belong to, and the apply chokepoint stays the only
+/// code that renders projection DDL.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexDef {
+    /// Globally unique in the database; by convention `idx_<table>_<purpose>`.
+    pub name: &'static str,
+    /// Indexed columns in order; each must be a declared key or value column.
+    pub columns: &'static [&'static str],
+}
+
 /// A projection table's declared shape. The name must start with `proj_`
 /// (the grep convention that makes illegal writes findable), key columns are
 /// NOT NULL and form the primary key, and `version` participates in the
@@ -75,11 +88,21 @@ pub struct TableDef {
     pub version: u32,
     pub key_columns: &'static [ColumnDef],
     pub value_columns: &'static [ColumnDef],
+    /// Secondary indexes created with the table and dropped with it. Included
+    /// in the registry digest: adding one changes the read plan a story was
+    /// measured against, so the rebuild that follows is the honest default.
+    pub indexes: &'static [IndexDef],
 }
 
 /// A typed row mutation — everything a projection can do to its table.
 #[derive(Clone, Debug)]
 pub enum RowWrite {
+    /// Insert a new row and fail if the key already exists. Lifecycle facts
+    /// use this when a duplicate would hide durable corruption.
+    Insert {
+        key: Vec<SqlValue>,
+        values: Vec<SqlValue>,
+    },
     /// Insert or fully replace the row at `key`. `values` supplies every
     /// value column in declared order.
     Upsert {
@@ -91,12 +114,38 @@ pub enum RowWrite {
         key: Vec<SqlValue>,
         assignments: Vec<(&'static str, SqlValue)>,
     },
+    /// Update exactly one existing row; zero rows is an invariant failure.
+    UpdateOne {
+        key: Vec<SqlValue>,
+        assignments: Vec<(&'static str, SqlValue)>,
+    },
+    /// Update one existing row only while a declared value column is NULL.
+    /// Durable receipts/checkpoints are single-assignment facts: a duplicate
+    /// event must fail rather than overwrite the first proof.
+    UpdateOneWhenNull {
+        key: Vec<SqlValue>,
+        guard_column: &'static str,
+        assignments: Vec<(&'static str, SqlValue)>,
+    },
     /// Add `delta` to an integer column, inserting the row (other value
     /// columns NULL) when absent — deterministic counters without reads.
     Increment {
         key: Vec<SqlValue>,
         column: &'static str,
         delta: i64,
+    },
+    /// Increment a column on exactly one existing row; never synthesizes a
+    /// partial lifecycle row when its creation fact is missing.
+    IncrementOne {
+        key: Vec<SqlValue>,
+        column: &'static str,
+        delta: i64,
+    },
+    /// Increment several columns on exactly one row in one statement. Run
+    /// usage has multiple integer dimensions but remains one atomic fact.
+    IncrementManyOne {
+        key: Vec<SqlValue>,
+        deltas: Vec<(&'static str, i64)>,
     },
     /// Delete the row at `key`; missing rows are a deterministic no-op.
     Delete { key: Vec<SqlValue> },
@@ -170,6 +219,21 @@ impl ProjectionRegistry {
                     table.name
                 )));
             }
+            for index in table.indexes {
+                for column in index.columns {
+                    let declared = table
+                        .key_columns
+                        .iter()
+                        .chain(table.value_columns)
+                        .any(|candidate| candidate.name == *column);
+                    if !declared {
+                        return Err(shape_error(format!(
+                            "index {} on {} names undeclared column {column}",
+                            index.name, table.name
+                        )));
+                    }
+                }
+            }
             previous_name = table.name;
         }
         Ok(Self { projections })
@@ -192,6 +256,12 @@ impl ProjectionRegistry {
             for column in table.key_columns.iter().chain(table.value_columns) {
                 hasher.update(column.name.as_bytes());
                 hasher.update(column.kind.sql_type().as_bytes());
+            }
+            for index in table.indexes {
+                hasher.update(index.name.as_bytes());
+                for column in index.columns {
+                    hasher.update(column.as_bytes());
+                }
             }
         }
         *hasher.finalize().as_bytes()
@@ -271,6 +341,15 @@ fn execute_write(
         reason: format!("{}: {error}", table.name),
     };
     match write {
+        RowWrite::Insert { key, values } => {
+            require_arity(table, "key", key.len(), table.key_columns.len())?;
+            require_arity(table, "values", values.len(), table.value_columns.len())?;
+            let sql = insert_sql(table, schema);
+            let mut statement = transaction.prepare_cached(&sql).map_err(sql_error)?;
+            statement
+                .execute(params_from_iter(bind_values(key.iter().chain(values))))
+                .map_err(sql_error)?;
+        }
         RowWrite::Upsert { key, values } => {
             require_arity(table, "key", key.len(), table.key_columns.len())?;
             require_arity(table, "values", values.len(), table.value_columns.len())?;
@@ -297,6 +376,47 @@ fn execute_write(
                 .execute(params_from_iter(bind_values(values)))
                 .map_err(sql_error)?;
         }
+        RowWrite::UpdateOne { key, assignments } => {
+            require_arity(table, "key", key.len(), table.key_columns.len())?;
+            for (column, _) in assignments {
+                require_value_column(table, column)?;
+            }
+            if assignments.is_empty() {
+                return Err(ApplyError {
+                    reason: format!("{}: strict update with no assignments", table.name),
+                });
+            }
+            let sql = update_sql(table, schema, assignments);
+            let mut statement = transaction.prepare_cached(&sql).map_err(sql_error)?;
+            let values = assignments.iter().map(|(_, value)| value).chain(key.iter());
+            let changed = statement
+                .execute(params_from_iter(bind_values(values)))
+                .map_err(sql_error)?;
+            require_one_changed(table, "strict update", changed)?;
+        }
+        RowWrite::UpdateOneWhenNull {
+            key,
+            guard_column,
+            assignments,
+        } => {
+            require_arity(table, "key", key.len(), table.key_columns.len())?;
+            require_value_column(table, guard_column)?;
+            for (column, _) in assignments {
+                require_value_column(table, column)?;
+            }
+            if assignments.is_empty() {
+                return Err(ApplyError {
+                    reason: format!("{}: guarded update with no assignments", table.name),
+                });
+            }
+            let sql = update_when_null_sql(table, schema, assignments, guard_column);
+            let mut statement = transaction.prepare_cached(&sql).map_err(sql_error)?;
+            let values = assignments.iter().map(|(_, value)| value).chain(key.iter());
+            let changed = statement
+                .execute(params_from_iter(bind_values(values)))
+                .map_err(sql_error)?;
+            require_one_changed(table, "guarded single-assignment update", changed)?;
+        }
         RowWrite::Increment { key, column, delta } => {
             require_arity(table, "key", key.len(), table.key_columns.len())?;
             require_value_column(table, column)?;
@@ -308,6 +428,40 @@ fn execute_write(
                 .execute(params_from_iter(bind_values(values)))
                 .map_err(sql_error)?;
         }
+        RowWrite::IncrementOne { key, column, delta } => {
+            require_arity(table, "key", key.len(), table.key_columns.len())?;
+            require_value_column(table, column)?;
+            let sql = increment_one_sql(table, schema, column);
+            let mut statement = transaction.prepare_cached(&sql).map_err(sql_error)?;
+            let delta_value = SqlValue::Integer(*delta);
+            let values = std::iter::once(&delta_value).chain(key.iter());
+            let changed = statement
+                .execute(params_from_iter(bind_values(values)))
+                .map_err(sql_error)?;
+            require_one_changed(table, "strict increment", changed)?;
+        }
+        RowWrite::IncrementManyOne { key, deltas } => {
+            require_arity(table, "key", key.len(), table.key_columns.len())?;
+            if deltas.is_empty() {
+                return Err(ApplyError {
+                    reason: format!("{}: strict multi-increment has no deltas", table.name),
+                });
+            }
+            for (column, _) in deltas {
+                require_value_column(table, column)?;
+            }
+            let sql = increment_many_one_sql(table, schema, deltas);
+            let mut statement = transaction.prepare_cached(&sql).map_err(sql_error)?;
+            let delta_values = deltas
+                .iter()
+                .map(|(_, delta)| SqlValue::Integer(*delta))
+                .collect::<Vec<_>>();
+            let values = delta_values.iter().chain(key.iter());
+            let changed = statement
+                .execute(params_from_iter(bind_values(values)))
+                .map_err(sql_error)?;
+            require_one_changed(table, "strict multi-increment", changed)?;
+        }
         RowWrite::Delete { key } => {
             require_arity(table, "key", key.len(), table.key_columns.len())?;
             let sql = delete_sql(table, schema);
@@ -318,6 +472,23 @@ fn execute_write(
         }
     }
     Ok(())
+}
+
+fn require_one_changed(
+    table: &TableDef,
+    operation: &str,
+    changed: usize,
+) -> Result<(), ApplyError> {
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(ApplyError {
+            reason: format!(
+                "{}: {operation} changed {changed} rows; exactly one lifecycle row must exist",
+                table.name
+            ),
+        })
+    }
 }
 
 fn require_arity(
@@ -399,6 +570,22 @@ fn upsert_sql(table: &TableDef, schema: SchemaTarget) -> String {
     )
 }
 
+fn insert_sql(table: &TableDef, schema: SchemaTarget) -> String {
+    let keys = column_list(table.key_columns);
+    let values = column_list(table.value_columns);
+    let all = if table.value_columns.is_empty() {
+        keys
+    } else {
+        format!("{keys}, {values}")
+    };
+    format!(
+        "INSERT INTO {schema}.{table} ({all}) VALUES ({binds})",
+        schema = schema.qualifier(),
+        table = table.name,
+        binds = placeholders(table.key_columns.len() + table.value_columns.len()),
+    )
+}
+
 fn update_sql(
     table: &TableDef,
     schema: SchemaTarget,
@@ -417,6 +604,25 @@ fn update_sql(
     )
 }
 
+fn update_when_null_sql(
+    table: &TableDef,
+    schema: SchemaTarget,
+    assignments: &[(&'static str, SqlValue)],
+    guard_column: &str,
+) -> String {
+    let sets = assignments
+        .iter()
+        .map(|(column, _)| format!("{column} = ?"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "UPDATE {schema}.{table} SET {sets} WHERE {keys} AND {guard_column} IS NULL",
+        schema = schema.qualifier(),
+        table = table.name,
+        keys = key_predicate(table),
+    )
+}
+
 fn increment_sql(table: &TableDef, schema: SchemaTarget, column: &str) -> String {
     format!(
         "INSERT INTO {schema}.{table} ({keys}, {column}) VALUES ({binds}, ?) \
@@ -425,6 +631,33 @@ fn increment_sql(table: &TableDef, schema: SchemaTarget, column: &str) -> String
         table = table.name,
         keys = column_list(table.key_columns),
         binds = placeholders(table.key_columns.len()),
+    )
+}
+
+fn increment_one_sql(table: &TableDef, schema: SchemaTarget, column: &str) -> String {
+    format!(
+        "UPDATE {schema}.{table} SET {column} = COALESCE({column}, 0) + ? WHERE {keys}",
+        schema = schema.qualifier(),
+        table = table.name,
+        keys = key_predicate(table),
+    )
+}
+
+fn increment_many_one_sql(
+    table: &TableDef,
+    schema: SchemaTarget,
+    deltas: &[(&'static str, i64)],
+) -> String {
+    let assignments = deltas
+        .iter()
+        .map(|(column, _)| format!("{column} = COALESCE({column}, 0) + ?"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "UPDATE {schema}.{table} SET {assignments} WHERE {keys}",
+        schema = schema.qualifier(),
+        table = table.name,
+        keys = key_predicate(table),
     )
 }
 
@@ -460,13 +693,26 @@ pub(crate) fn create_table_sql(table: &TableDef, schema: SchemaTarget) -> String
     for column in table.value_columns {
         columns.push(format!("{} {}", column.name, column.kind.sql_type()));
     }
-    format!(
-        "CREATE TABLE IF NOT EXISTS {schema}.{table} ({columns}, PRIMARY KEY ({keys})) WITHOUT ROWID",
+    let mut sql = format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.{table} ({columns}, PRIMARY KEY ({keys})) WITHOUT ROWID;",
         schema = schema.qualifier(),
         table = table.name,
         columns = columns.join(", "),
         keys = column_list(table.key_columns),
-    )
+    );
+    for index in table.indexes {
+        // The index name is schema-qualified rather than suffixed: `temp` and
+        // `main` hold the same table under the verify replay, and SQLite index
+        // names are unique per schema.
+        sql.push_str(&format!(
+            "CREATE INDEX IF NOT EXISTS {schema}.{index} ON {table} ({columns});",
+            schema = schema.qualifier(),
+            index = index.name,
+            table = table.name,
+            columns = index.columns.join(", "),
+        ));
+    }
+    sql
 }
 
 pub(crate) fn drop_table_sql(table: &TableDef, schema: SchemaTarget) -> String {

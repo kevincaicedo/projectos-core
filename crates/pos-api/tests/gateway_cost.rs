@@ -126,6 +126,7 @@ fn dispatch_calls(project_root: &Path, count: usize, fail_last: bool) -> Vec<Str
                 content: "why did activation drop?".to_owned(),
             }],
             tools_json: None,
+            reasoning_effort: None,
             max_output_tokens: 64,
             timeout_ms: 5_000,
         };

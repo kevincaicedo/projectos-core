@@ -77,6 +77,29 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// Optional provider reasoning control. `None` on [`CompletionRequest`]
+/// preserves the provider default; `Disabled` is explicit because a small
+/// deterministic task must not lose its output budget to hidden reasoning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReasoningEffort {
+    Disabled,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 /// One completion call, provider-neutral. `tools_json` is the pass-through
 /// tool-use shape: a JSON array in the provider's native tool schema,
 /// forwarded verbatim — the gateway routes bytes, the harness owns meaning.
@@ -86,6 +109,9 @@ pub struct CompletionRequest {
     pub system: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub tools_json: Option<String>,
+    /// Explicit reasoning control when the selected adapter supports it.
+    /// Unsupported families refuse typed rather than silently ignoring it.
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub max_output_tokens: u32,
     /// Per-call transport deadline. A named default lives with the gateway
     /// config; the field is explicit so tests and the harness can tighten it.

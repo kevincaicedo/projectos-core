@@ -3,4 +3,4 @@
 /**
  * One aggregated ledger group. Money stays integer micro-USD end to end.
  */
-export type CostRollupRow = { projectId: string, feature: string, provider: string, credentialClass: string, model: string, providerCostKind: string, calls: number, tokensIn: number, tokensOut: number, wallMsTotal: number, usdMicros: number, };
+export type CostRollupRow = { projectId: string, feature: string, agent: string | null, provider: string, credentialClass: string, model: string, providerCostKind: string, calls: number, tokensIn: number, tokensOut: number, wallMsTotal: number, usdMicros: number, };

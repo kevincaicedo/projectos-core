@@ -11,3 +11,11 @@ workspace = true
 [dependencies]
 pos-foundation = { path = "../pos-foundation" }
 pos-domain = { path = "../pos-domain" }
+pos-log = { path = "../pos-log" }
+pos-capabilities = { path = "../pos-capabilities" }
+pos-gateway = { path = "../pos-gateway" }
+pos-store = { path = "../pos-store" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }

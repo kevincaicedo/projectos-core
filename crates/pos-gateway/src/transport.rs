@@ -9,7 +9,7 @@
 //! typed error before connecting. Local endpoint qualification (Ollama,
 //! LM Studio, vLLM) needs exactly this much; the cloud-capable TLS transport
 //! is a deliberate later dependency review owned by the first story that can
-//! actually run a live cloud smoke (m0-s13's cloud leg / m1-s03), recorded as
+//! actually run a live cloud smoke (m1-s03), recorded as
 //! visible debt in `docs/progress.md`. Until then, core is structurally
 //! incapable of cloud egress — the strongest possible form of L9's
 //! `local_only` guarantee.
@@ -202,7 +202,7 @@ fn parse_http_url(url: &str) -> Result<ParsedUrl, TransportError> {
         let host = rest.split(['/', ':']).next().unwrap_or(rest);
         return Err(TransportError::HostRefused {
             host: host.to_owned(),
-            reason: "https requires the cloud-capable TLS transport (visible debt: m0-s13/m1-s03)",
+            reason: "https requires the cloud-capable TLS transport (visible debt: m1-s03)",
         });
     }
     let rest = url.strip_prefix("http://").ok_or_else(invalid)?;

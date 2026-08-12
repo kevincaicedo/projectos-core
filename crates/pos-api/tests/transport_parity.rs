@@ -17,24 +17,25 @@
 #![forbid(unsafe_code)]
 
 use pos_api::{
-    CommandName, LocalBootstrapConfig, LocalRuntime, OPEN_PROJECT_COUNT_MAX, ProjectCreateInput,
-    ProjectPathInput, ProjectSeedInput, QueryName, StreamName, bootstrap_local_runtime, input_json,
+    API_SURFACE_VERSION, CommandName, LocalBootstrapConfig, LocalRuntime, OPEN_PROJECT_COUNT_MAX,
+    ProjectCreateInput, ProjectPathInput, ProjectSeedInput, QueryName, RunBudgetWire,
+    RunControlInput, RunResumeInput, RunStartInput, RunStepsInput, RunWorker, StreamName,
+    bootstrap_local_runtime, input_json,
 };
 use std::path::PathBuf;
 
 /// Input-free queries: dispatchable with `{}` from any transport. The two
 /// registered-but-later entries answer with their typed envelope, which is
 /// as much a part of the contract as a success body.
-const INPUT_FREE_QUERIES: [QueryName; 5] = [
+const INPUT_FREE_QUERIES: [QueryName; 4] = [
     QueryName::CapabilitySnapshot,
     QueryName::ProjectList,
-    QueryName::JobList,
     QueryName::CostRollup,
     QueryName::Health,
 ];
 
-/// Commands whose engine lands with the agent harness (m0-s12/m0-s13); until
-/// then their contract is the typed `not_yet_supported` envelope.
+/// Commands owned by the agent harness. The coverage test keeps all four
+/// names coupled to the lifecycle contract below.
 const RUN_LIFECYCLE_COMMANDS: [CommandName; 4] = [
     CommandName::RunStart,
     CommandName::RunCancel,
@@ -77,9 +78,9 @@ fn http_command(runtime: &LocalRuntime, name: &str, input: &str) -> Result<Strin
         .map_err(|error| error.to_json())
 }
 
-fn stream_subscribe(runtime: &LocalRuntime, name: &str) -> Result<usize, String> {
+fn stream_subscribe(runtime: &LocalRuntime, name: &str, input: &str) -> Result<usize, String> {
     runtime
-        .stream_subscribe(name, "{}", None)
+        .stream_subscribe(name, input, None)
         .map(|frames| frames.len())
         .map_err(|error| error.to_json())
 }
@@ -138,6 +139,30 @@ fn project_rows(directory: &tempfile::TempDir) -> Vec<(&'static str, String, boo
         (
             QueryName::ProjectVerify.as_str(),
             input_json(&ProjectPathInput { path: path.clone() }).expect("input serializes"),
+            false,
+        ),
+        (
+            QueryName::JobList.as_str(),
+            input_json(&pos_api::JobListInput {
+                path: path.clone(),
+                state: None,
+                row_count_max: Some(10),
+            })
+            .expect("input serializes"),
+            false,
+        ),
+        (
+            // A fixed origin instant: the preview is a pure function of
+            // (expression, zone, origin), so the parity row is stable without
+            // freezing the process clock.
+            QueryName::CronPreview.as_str(),
+            input_json(&pos_api::CronPreviewInput {
+                expr: "*/15 9-17 * * 1-5".to_owned(),
+                tz: "Europe/Berlin".to_owned(),
+                after_ts_ms: Some(1_772_946_000_000),
+                count: Some(10),
+            })
+            .expect("input serializes"),
             false,
         ),
         (
@@ -215,42 +240,207 @@ fn input_free_queries_are_byte_identical_across_transports() {
             ipc, http,
             "{name} differs between transports; a transport reshaped a result"
         );
-        // Both success bodies and typed envelopes travel unchanged.
-        match ipc {
-            Ok(body) => assert!(body.starts_with('{'), "{name} returned a non-object"),
-            Err(envelope) => assert!(
-                envelope.contains("\"code\":\"not_yet_supported\""),
-                "{name} failed with an unexpected envelope: {envelope}"
-            ),
-        }
+        // Every input-free query answers with a real body since m0-s14;
+        // a typed envelope here would mean a registered surface regressed.
+        let body = ipc.expect("an input-free query must resolve");
+        assert!(body.starts_with('{'), "{name} returned a non-object");
     }
 }
 
 #[test]
-fn run_lifecycle_commands_answer_with_the_typed_envelope_on_both_transports() {
+fn run_lifecycle_commands_are_byte_identical_across_transports() {
     let runtime = runtime();
-    for command in RUN_LIFECYCLE_COMMANDS {
-        let name = command.as_str();
-        let ipc = ipc_command(&runtime, name, "{}")
-            .expect_err("the run engine has not landed; success would be a lie");
-        let http = http_command(&runtime, name, "{}")
-            .expect_err("the run engine has not landed; success would be a lie");
-        assert_eq!(ipc, http, "{name} envelope differs between transports");
-        assert!(ipc.contains("\"code\":\"not_yet_supported\""));
-        assert!(ipc.contains("m0-s12"), "{name} must name its owning story");
-        assert!(ipc.contains("\"retriable\":false"));
+    let directory = tempfile::tempdir().expect("tempdir");
+    let ipc_path = directory.path().join("run-ipc.pos").display().to_string();
+    let http_path = directory.path().join("run-http.pos").display().to_string();
+    for path in [&ipc_path, &http_path] {
+        ipc_command(
+            &runtime,
+            CommandName::ProjectCreate.as_str(),
+            &input_json(&ProjectCreateInput {
+                path: path.clone(),
+                name: Some("Run parity".to_owned()),
+                template: "generic".to_owned(),
+            })
+            .expect("create input serializes"),
+        )
+        .expect("create project");
     }
+
+    let budget = RunBudgetWire {
+        tokens: 100,
+        usd_micros: 100,
+        wall_ms: 10_000,
+        storage_bytes: 1_024,
+        tool_calls: 4,
+        retries: 2,
+        steps: 4,
+    };
+    let start_input = |path: &str| {
+        input_json(&RunStartInput {
+            path: path.to_owned(),
+            worker: RunWorker::Navigator,
+            autonomy_level: 2,
+            budget,
+            tool_grants: Vec::new(),
+            parent_run_id: None,
+        })
+        .expect("start input serializes")
+    };
+    let ipc_start = ipc_command(
+        &runtime,
+        CommandName::RunStart.as_str(),
+        &start_input(&ipc_path),
+    )
+    .expect("run.start over IPC");
+    let http_start = http_command(
+        &runtime,
+        CommandName::RunStart.as_str(),
+        &start_input(&http_path),
+    )
+    .expect("run.start over HTTP");
+    let ipc_run_id = run_field(&ipc_start, "runId");
+    let http_run_id = run_field(&http_start, "runId");
+    assert_run_bytes_equal(&ipc_start, &http_start);
+    assert_eq!(run_field(&ipc_start, "status"), "preflight");
+
+    let control_input = |path: &str, run_id: &str, reason: &str| {
+        input_json(&RunControlInput {
+            path: path.to_owned(),
+            run_id: run_id.to_owned(),
+            reason: reason.to_owned(),
+        })
+        .expect("control input serializes")
+    };
+    let ipc_pause = ipc_command(
+        &runtime,
+        CommandName::RunPause.as_str(),
+        &control_input(&ipc_path, &ipc_run_id, "Parity pause"),
+    )
+    .expect("run.pause over IPC");
+    let http_pause = http_command(
+        &runtime,
+        CommandName::RunPause.as_str(),
+        &control_input(&http_path, &http_run_id, "Parity pause"),
+    )
+    .expect("run.pause over HTTP");
+    assert_run_bytes_equal(&ipc_pause, &http_pause);
+    assert_eq!(run_field(&ipc_pause, "status"), "paused");
+    assert!(ipc_pause.contains("\"pause\":{\"kind\":\"requested\""));
+    assert!(ipc_pause.contains("\"reason\":\"Parity pause\""));
+
+    let resume_input = |path: &str, run_id: &str| {
+        input_json(&RunResumeInput {
+            path: path.to_owned(),
+            run_id: run_id.to_owned(),
+        })
+        .expect("resume input serializes")
+    };
+    let ipc_resume = ipc_command(
+        &runtime,
+        CommandName::RunResume.as_str(),
+        &resume_input(&ipc_path, &ipc_run_id),
+    )
+    .expect("run.resume over IPC");
+    let http_resume = http_command(
+        &runtime,
+        CommandName::RunResume.as_str(),
+        &resume_input(&http_path, &http_run_id),
+    )
+    .expect("run.resume over HTTP");
+    assert_run_bytes_equal(&ipc_resume, &http_resume);
+    assert_eq!(run_field(&ipc_resume, "status"), "running");
+
+    let ipc_cancel = ipc_command(
+        &runtime,
+        CommandName::RunCancel.as_str(),
+        &control_input(&ipc_path, &ipc_run_id, "Parity cancel"),
+    )
+    .expect("run.cancel over IPC");
+    let http_cancel = http_command(
+        &runtime,
+        CommandName::RunCancel.as_str(),
+        &control_input(&http_path, &http_run_id, "Parity cancel"),
+    )
+    .expect("run.cancel over HTTP");
+    assert_run_bytes_equal(&ipc_cancel, &http_cancel);
+    assert_eq!(run_field(&ipc_cancel, "status"), "canceled");
+}
+
+fn run_field(body: &str, field: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .expect("Run report is JSON")
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("Run report has string field {field}"))
+        .to_owned()
+}
+
+fn normalize_run_bytes(body: &str) -> String {
+    let path = run_field(body, "path");
+    let run_id = run_field(body, "runId");
+    let project_id = run_field(body, "projectId");
+    body.replace(&path, "<path>")
+        .replace(&run_id, "<runId>")
+        .replace(&project_id, "<projectId>")
+}
+
+fn assert_run_bytes_equal(ipc: &str, http: &str) {
+    assert_eq!(
+        normalize_run_bytes(ipc),
+        normalize_run_bytes(http),
+        "Run lifecycle bytes differ beyond caller/project-minted identity"
+    );
 }
 
 #[test]
 fn the_stream_surface_is_registered_and_typed() {
     let runtime = runtime();
-    let subscribed = stream_subscribe(&runtime, StreamName::RunSteps.as_str())
-        .expect_err("run.steps has no producer until m0-s13; success would be a lie");
-    assert!(subscribed.contains("\"code\":\"not_yet_supported\""));
-    assert!(subscribed.contains("m0-s13"));
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("stream.pos").display().to_string();
+    runtime
+        .command(
+            CommandName::ProjectCreate.as_str(),
+            &input_json(&ProjectCreateInput {
+                path: path.clone(),
+                name: Some("Stream".to_owned()),
+                template: "generic".to_owned(),
+            })
+            .expect("create input serializes"),
+        )
+        .expect("create project");
+    let started = runtime
+        .command(
+            CommandName::RunStart.as_str(),
+            &input_json(&RunStartInput {
+                path: path.clone(),
+                worker: RunWorker::Navigator,
+                autonomy_level: 2,
+                budget: RunBudgetWire {
+                    tokens: 1,
+                    usd_micros: 0,
+                    wall_ms: 1,
+                    storage_bytes: 0,
+                    tool_calls: 0,
+                    retries: 0,
+                    steps: 0,
+                },
+                tool_grants: Vec::new(),
+                parent_run_id: None,
+            })
+            .expect("start input serializes"),
+        )
+        .expect("start Run");
+    let input = input_json(&RunStepsInput {
+        path,
+        run_id: run_field(&started, "runId"),
+    })
+    .expect("stream input serializes");
+    let subscribed = stream_subscribe(&runtime, StreamName::RunSteps.as_str(), &input)
+        .expect("run.steps reads the durable projection");
+    assert_eq!(subscribed, 0);
 
-    let unknown = stream_subscribe(&runtime, "run.st3ps")
+    let unknown = stream_subscribe(&runtime, "run.st3ps", "{}")
         .expect_err("an unregistered stream must not resolve");
     assert!(unknown.contains("\"code\":\"unknown_stream\""));
 }
@@ -431,7 +621,7 @@ fn the_snapshot_carries_live_state_rather_than_a_compile_time_claim() {
     // instead of quietly reporting themselves as local.
     assert!(snapshot.contains("\"mode\":\"unavailable\",\"reason\":\""));
     assert!(!snapshot.contains("\"reason\":\"\""));
-    assert!(snapshot.contains("\"surfaceVersion\":4"));
+    assert!(snapshot.contains(&format!("\"surfaceVersion\":{API_SURFACE_VERSION}")));
 }
 
 #[test]

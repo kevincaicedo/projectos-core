@@ -19,6 +19,12 @@ use crate::project_ops::{
     ProjectInspectReport, ProjectPathInput, ProjectSeedInput, ProjectSeedReport,
     ProjectVerifyReport,
 };
+use crate::run_ops::{
+    RunBudgetDimensionWire, RunBudgetWire, RunControlInput, RunPauseReport, RunReport,
+    RunResumeInput, RunStartInput, RunStepFrame, RunStepsInput, RunToolGrantInput,
+    RunToolGrantModeWire, RunWorker,
+};
+use crate::sched_ops::{CronPreviewInput, CronPreviewReport, JobListInput, JobListReport, JobRow};
 use crate::session::{HealthReport, OpenProjectRow, ProjectListReport};
 use crate::stream::{SSE_RETRY_MS, STREAM_RESUME_WINDOW_LEN};
 use crate::{API_SURFACE_VERSION, ApiError, CommandName, QueryName, StreamName};
@@ -50,7 +56,24 @@ macro_rules! for_each_exported_type {
             CostRollupTotals,
             CostRollupReport,
             ModelsPullInput,
-            ModelsPullReport
+            ModelsPullReport,
+            RunWorker,
+            RunBudgetDimensionWire,
+            RunBudgetWire,
+            RunToolGrantModeWire,
+            RunToolGrantInput,
+            RunStartInput,
+            RunControlInput,
+            RunResumeInput,
+            RunStepsInput,
+            RunStepFrame,
+            RunPauseReport,
+            RunReport,
+            JobListInput,
+            JobRow,
+            JobListReport,
+            CronPreviewInput,
+            CronPreviewReport
         )
     };
 }

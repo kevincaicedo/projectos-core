@@ -147,6 +147,7 @@ proptest! {
             system: None,
             messages: vec![ChatMessage { role: MessageRole::User, content: "hi".to_owned() }],
             tools_json: None,
+            reasoning_effort: None,
             max_output_tokens: if matches!(class, OutcomeClass::OverBudget) {
                 pos_gateway::OUTPUT_TOKENS_REQUEST_MAX + 1
             } else {

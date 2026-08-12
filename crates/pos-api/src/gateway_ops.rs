@@ -90,6 +90,7 @@ pub struct CostRollupInput {
 pub struct CostRollupRow {
     pub project_id: String,
     pub feature: String,
+    pub agent: Option<String>,
     pub provider: String,
     pub credential_class: String,
     pub model: String,
@@ -158,6 +159,7 @@ pub(crate) fn cost_rollup(
         (
             &left.project_id,
             &left.feature,
+            &left.agent,
             &left.provider,
             &left.model,
             &left.credential_class,
@@ -166,6 +168,7 @@ pub(crate) fn cost_rollup(
             .cmp(&(
                 &right.project_id,
                 &right.feature,
+                &right.agent,
                 &right.provider,
                 &right.model,
                 &right.credential_class,
@@ -201,26 +204,27 @@ fn rollup_one_project(root: &Path, rows: &mut Vec<CostRollupRow>) -> Result<(), 
         .db()
         .with_reader("cost rollup", |connection| {
             let mut statement = connection.prepare(
-                "SELECT lower(hex(project_id)), feature, provider, credential_class, model, \
+                "SELECT lower(hex(project_id)), feature, agent, provider, credential_class, model, \
                         provider_cost_kind, COUNT(*), SUM(tokens_in), SUM(tokens_out), \
                         SUM(wall_ms), SUM(usd_micros) \
                  FROM proj_model_calls \
-                 GROUP BY project_id, feature, provider, credential_class, model, provider_cost_kind \
-                 ORDER BY project_id, feature, provider, model, credential_class, provider_cost_kind",
+                 GROUP BY project_id, feature, agent, provider, credential_class, model, provider_cost_kind \
+                 ORDER BY project_id, feature, agent, provider, model, credential_class, provider_cost_kind",
             )?;
             let mapped = statement.query_map([], |row| {
                 Ok(CostRollupRow {
                     project_id: row.get(0)?,
                     feature: row.get(1)?,
-                    provider: row.get(2)?,
-                    credential_class: row.get(3)?,
-                    model: row.get(4)?,
-                    provider_cost_kind: row.get(5)?,
-                    calls: row.get::<_, i64>(6)?.max(0).unsigned_abs(),
-                    tokens_in: row.get::<_, i64>(7)?.max(0).unsigned_abs(),
-                    tokens_out: row.get::<_, i64>(8)?.max(0).unsigned_abs(),
-                    wall_ms_total: row.get::<_, i64>(9)?.max(0).unsigned_abs(),
-                    usd_micros: row.get::<_, i64>(10)?.max(0).unsigned_abs(),
+                    agent: row.get(2)?,
+                    provider: row.get(3)?,
+                    credential_class: row.get(4)?,
+                    model: row.get(5)?,
+                    provider_cost_kind: row.get(6)?,
+                    calls: row.get::<_, i64>(7)?.max(0).unsigned_abs(),
+                    tokens_in: row.get::<_, i64>(8)?.max(0).unsigned_abs(),
+                    tokens_out: row.get::<_, i64>(9)?.max(0).unsigned_abs(),
+                    wall_ms_total: row.get::<_, i64>(10)?.max(0).unsigned_abs(),
+                    usd_micros: row.get::<_, i64>(11)?.max(0).unsigned_abs(),
                 })
             })?;
             mapped.collect()
@@ -256,7 +260,7 @@ pub struct ModelsPullReport {
 
 /// The `models.pull` command: manifest lookup, consent gate, BLAKE3-verified
 /// streaming download over the loopback-only transport (file:// and local
-/// HTTP sources today; remote HTTPS names its owning debt, m0-s13/m1-s03).
+/// HTTP sources today; remote HTTPS names its owning debt, m1-s03).
 pub(crate) fn models_pull(input: &ModelsPullInput) -> Result<String, ApiError> {
     let manifest =
         ModelManifest::load(Path::new(&input.manifest_path)).map_err(|error| pull_error(&error))?;

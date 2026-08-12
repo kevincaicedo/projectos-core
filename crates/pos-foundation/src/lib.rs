@@ -136,11 +136,19 @@ const fn hex_nibble(digit: u8) -> Option<u8> {
 }
 
 opaque_id!(AccountId, "account");
+opaque_id!(ArtifactId, "artifact");
+opaque_id!(CheckpointId, "Run checkpoint");
+opaque_id!(CronId, "cron schedule");
 opaque_id!(DeviceId, "origin device/server");
+opaque_id!(ExecutionLeaseId, "execution lease");
+opaque_id!(GateReceiptId, "human gate receipt");
 opaque_id!(JobId, "scheduled job");
 opaque_id!(ProjectId, "project");
+opaque_id!(QuestionId, "Run question");
 opaque_id!(RunId, "Run");
+opaque_id!(ToolCallId, "tool call");
 opaque_id!(UserId, "user");
+opaque_id!(ValidationId, "Run validation");
 opaque_id!(WorkspaceId, "workspace");
 
 /// Per-project, contiguous event sequence number, assigned at append

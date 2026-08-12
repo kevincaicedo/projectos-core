@@ -36,13 +36,12 @@ export async function dispatchQueryNotice(name: string): Promise<SeamNotice> {
 }
 
 /// The run feed's teaching notice: the stream surface is registered and its
-/// SSE framing is frozen (m0-s06); the first producer is the echo agent.
+/// SSE framing is frozen; Echo now produces durable frames in both shells.
 export function runFeedNotice(): SeamNotice {
   return {
     kind: "info",
     title: "Run feed",
     detail:
-      "The run-step stream (run.steps) is registered with resumable SSE framing; live steps " +
-      "arrive with the echo agent in m0-s13.",
+      "The Run feed is on the project stage. It resumes from its last durable checkpoint after a dropped connection.",
   };
 }
