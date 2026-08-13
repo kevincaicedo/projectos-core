@@ -65,7 +65,13 @@ const REPLAY_BATCH_EVENT_COUNT: usize = 4_096;
 const KIND_TAG_LEN_MAX: usize = 64;
 /// Upper bound on refs per event; an event touching more entities than this
 /// is modeling a batch, not a fact.
-const EVENT_REFS_COUNT_MAX: usize = 64;
+///
+/// Public because producers of batched facts have to *size their batches by
+/// it*. The ingestion pipeline's chunk batches are the first such producer
+/// (m1-s01): a batch is capped at this bound minus its own subject, so every
+/// chunk keeps the L2 ref that says which Evidence item produced it rather
+/// than dropping the why-chain to fit more rows in one event.
+pub const EVENT_REFS_COUNT_MAX: usize = 64;
 /// Upper bound on an encoded body. Bodies carry facts; bulk content belongs
 /// in the CAS with a ref (L8).
 const EVENT_BODY_LEN_MAX: usize = 1_048_576;

@@ -14,6 +14,7 @@
 mod gateway_ops;
 #[cfg(feature = "http")]
 pub mod http;
+mod ingest_ops;
 mod project_ops;
 mod run_ops;
 mod sched_ops;
@@ -24,6 +25,10 @@ mod ts_export;
 pub use gateway_ops::{
     CostGroupRow, CostRollupInput, CostRollupReport, CostRollupRow, CostRollupTotals,
     EventCostLedger, ModelsPullInput, ModelsPullReport,
+};
+pub use ingest_ops::{
+    EvidenceListInput, EvidenceListReport, EvidenceRow, EvidenceStageRow, IngestReprocessInput,
+    IngestReprocessReport, SourceHealthInput, SourceHealthReport, SourceHealthRow,
 };
 pub use project_ops::{ProjectCreateInput, ProjectExportInput, ProjectPathInput, ProjectSeedInput};
 pub use run_ops::{
@@ -72,7 +77,9 @@ use std::task::{Context, Poll, Waker};
 /// `cron.preview`, the tz-aware next-runs answer a cron editor reads.
 /// v8: m0-s15 adds the per-project/feature/agent `groups` to `cost.rollup`,
 /// so the cost surfaces re-sum nothing in a shell.
-pub const API_SURFACE_VERSION: u16 = 8;
+/// v9: m1-s01/m1-s02 add the ingestion slice — `evidence.list`,
+/// `source.health`, and the `ingest.reprocess` command.
+pub const API_SURFACE_VERSION: u16 = 9;
 
 /// Bounded item budget for the M0 connector-host liveness tick (L8). The socket
 /// itself caps this at 32; the runtime asks for less than it is allowed.
@@ -105,10 +112,14 @@ pub enum QueryName {
     CostRollup,
     /// Liveness + version identity of this runtime process (m0-s06).
     Health,
+    /// Evidence rows with their pipeline status (m1-s01/m1-s02).
+    EvidenceList,
+    /// Per-source, per-stage ingestion health (m1-s01).
+    SourceHealth,
 }
 
 impl QueryName {
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 10;
     pub const ALL: [Self; Self::COUNT] = [
         Self::CapabilitySnapshot,
         Self::ProjectInspect,
@@ -118,6 +129,8 @@ impl QueryName {
         Self::CronPreview,
         Self::CostRollup,
         Self::Health,
+        Self::EvidenceList,
+        Self::SourceHealth,
     ];
 
     #[must_use]
@@ -131,6 +144,8 @@ impl QueryName {
             Self::CronPreview => "cron.preview",
             Self::CostRollup => "cost.rollup",
             Self::Health => "health",
+            Self::EvidenceList => "evidence.list",
+            Self::SourceHealth => "source.health",
         }
     }
 
@@ -163,10 +178,13 @@ pub enum CommandName {
     RunResume,
     /// Checksummed, consent-gated model download (m0-s11).
     ModelsPull,
+    /// Re-run the ingestion pipeline from a stage (m1-s01). Never re-fetches
+    /// from the source — that is the whole point of the command.
+    IngestReprocess,
 }
 
 impl CommandName {
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 10;
     pub const ALL: [Self; Self::COUNT] = [
         Self::ProjectCreate,
         Self::ProjectExport,
@@ -177,6 +195,7 @@ impl CommandName {
         Self::RunPause,
         Self::RunResume,
         Self::ModelsPull,
+        Self::IngestReprocess,
     ];
 
     #[must_use]
@@ -191,6 +210,7 @@ impl CommandName {
             Self::RunPause => "run.pause",
             Self::RunResume => "run.resume",
             Self::ModelsPull => "models.pull",
+            Self::IngestReprocess => "ingest.reprocess",
         }
     }
 
@@ -397,6 +417,12 @@ impl LocalRuntime {
             Some(QueryName::CronPreview) => {
                 sched_ops::cron_preview(&project_ops::parse_input(input_json)?)
             }
+            Some(QueryName::EvidenceList) => {
+                ingest_ops::evidence_list(&project_ops::parse_input(input_json)?)
+            }
+            Some(QueryName::SourceHealth) => {
+                ingest_ops::source_health(&project_ops::parse_input(input_json)?)
+            }
             None => Err(ApiError::unknown_query(name)),
         }
     }
@@ -410,6 +436,18 @@ impl LocalRuntime {
         let result = self.dispatch_command(name, input_json, &mut span);
         finish_api_span(span, result.as_ref().err());
         result
+    }
+
+    /// The reprocess command needs the acting identity and the project the
+    /// directory holds, neither of which belongs in a wire input: the actor
+    /// is the session's, and the project id is a fact in the log.
+    fn ingest_reprocess(
+        &self,
+        input: &ingest_ops::IngestReprocessInput,
+    ) -> Result<String, ApiError> {
+        let log = project_ops::open_log(std::path::Path::new(&input.path))?;
+        let project_id = ingest_ops::project_id_of(&log)?;
+        ingest_ops::ingest_reprocess(self.identity.device, self.identity.user, project_id, input)
     }
 
     fn dispatch_command(
@@ -437,6 +475,9 @@ impl LocalRuntime {
             ),
             Some(CommandName::ModelsPull) => {
                 gateway_ops::models_pull(&project_ops::parse_input(input_json)?)
+            }
+            Some(CommandName::IngestReprocess) => {
+                self.ingest_reprocess(&project_ops::parse_input(input_json)?)
             }
             Some(CommandName::RunStart) => run_ops::start(
                 &self.identity,

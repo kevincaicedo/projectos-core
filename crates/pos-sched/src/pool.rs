@@ -201,6 +201,17 @@ impl ProjectRegistry {
         lock_recovering(&self.projects).remove(&project_id.into_bytes());
     }
 
+    /// One project's handle. A job handler holds the registry rather than a
+    /// log, because between claim and run the shell may have closed the
+    /// project — and "it is no longer open" is a retriable answer, not a
+    /// dangling handle (m1-s01).
+    #[must_use]
+    pub fn get(&self, project_id: ProjectId) -> Option<Arc<ProjectLog>> {
+        lock_recovering(&self.projects)
+            .get(&project_id.into_bytes())
+            .map(Arc::clone)
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> Vec<(ProjectId, Arc<ProjectLog>)> {
         lock_recovering(&self.projects)

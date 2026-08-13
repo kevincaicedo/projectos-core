@@ -10,4 +10,11 @@ workspace = true
 
 [dependencies]
 pos-foundation = { path = "../pos-foundation" }
+pos-store = { path = "../pos-store" }
+pos-log = { path = "../pos-log" }
 pos-domain = { path = "../pos-domain" }
+pos-sched = { path = "../pos-sched" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }

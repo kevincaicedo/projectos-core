@@ -166,6 +166,8 @@ macro_rules! taxonomy_span {
             run_lo = tracing::field::Empty,
             job_hi = tracing::field::Empty,
             job_lo = tracing::field::Empty,
+            evidence_hi = tracing::field::Empty,
+            evidence_lo = tracing::field::Empty,
             step_index = tracing::field::Empty,
             attempt = tracing::field::Empty,
             tokens_in = tracing::field::Empty,
@@ -197,6 +199,7 @@ pub(super) fn new_span(
         SpanName::AgentsStep => taxonomy_span!("agents.step"),
         SpanName::GatewayCall => taxonomy_span!("gateway.call"),
         SpanName::SchedJob => taxonomy_span!("sched.job"),
+        SpanName::IngestStage => taxonomy_span!("ingest.stage"),
     };
     span.record("detail", detail.as_str());
     let trace = context.trace.into_bytes();
@@ -237,6 +240,10 @@ pub(super) fn record(span: &tracing::Span, field: SpanField, value: SpanValue) {
         (SpanField::Job, SpanValue::Id(bytes)) => {
             span.record("job_hi", u64_at(&bytes, 0));
             span.record("job_lo", u64_at(&bytes, 8));
+        }
+        (SpanField::Evidence, SpanValue::Id(bytes)) => {
+            span.record("evidence_hi", u64_at(&bytes, 0));
+            span.record("evidence_lo", u64_at(&bytes, 8));
         }
         (SpanField::StepIndex, SpanValue::Count(count)) => {
             span.record("step_index", count);

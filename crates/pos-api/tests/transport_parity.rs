@@ -166,6 +166,42 @@ fn project_rows(directory: &tempfile::TempDir) -> Vec<(&'static str, String, boo
             false,
         ),
         (
+            QueryName::EvidenceList.as_str(),
+            input_json(&pos_api::EvidenceListInput {
+                path: path.clone(),
+                source_id: None,
+                status: None,
+                row_count_max: Some(10),
+                with_stages: true,
+            })
+            .expect("input serializes"),
+            false,
+        ),
+        (
+            QueryName::SourceHealth.as_str(),
+            input_json(&pos_api::SourceHealthInput {
+                path: path.clone(),
+                source_id: None,
+            })
+            .expect("input serializes"),
+            false,
+        ),
+        (
+            // A project with no Evidence yet: the reprocess reports zero
+            // requeued rather than refusing, which is the honest answer and
+            // the one both transports must agree on byte for byte.
+            CommandName::IngestReprocess.as_str(),
+            input_json(&pos_api::IngestReprocessInput {
+                path: path.clone(),
+                from_stage: "chunk".to_owned(),
+                evidence_id: None,
+                item_count_max: Some(10),
+                reason: "contract row".to_owned(),
+            })
+            .expect("input serializes"),
+            true,
+        ),
+        (
             CommandName::ProjectExport.as_str(),
             input_json(&pos_api::ProjectExportInput {
                 path,

@@ -79,6 +79,63 @@ enum CliCommand {
         #[command(subcommand)]
         command: ModelsCommand,
     },
+    /// Browse the Evidence a project holds and what the pipeline did to it
+    /// (m1-s01/m1-s02).
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommand,
+    },
+    /// Per-source, per-stage ingestion health (m1-s01).
+    SourceHealth {
+        directory: PathBuf,
+        /// Hex source id; omitted means every source.
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Ingestion pipeline control (m1-s01).
+    Ingest {
+        #[command(subcommand)]
+        command: IngestCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum EvidenceCommand {
+    /// List Evidence with its pipeline status.
+    List {
+        directory: PathBuf,
+        #[arg(long)]
+        source: Option<String>,
+        /// `raw` … `indexed` | `failed`.
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Include each item's per-stage history.
+        #[arg(long)]
+        with_stages: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum IngestCommand {
+    /// Re-run the pipeline from a stage. Never re-fetches from the source:
+    /// the bytes already stored are the Evidence.
+    Reprocess {
+        directory: PathBuf,
+        /// `normalize` | `transcribe` | `chunk` | `embed` | `extract` | `index`.
+        #[arg(long)]
+        from_stage: String,
+        /// One item; omitted means every eligible item, up to `--limit`.
+        #[arg(long)]
+        evidence: Option<String>,
+        #[arg(long, default_value_t = 500)]
+        limit: u32,
+        /// Why. Recorded on the event — a reprocess with no stated reason is
+        /// an unexplained rewrite of derived state.
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -176,6 +233,57 @@ fn run(runtime: &LocalRuntime, command: CliCommand) -> Result<ExitCode, String> 
                 seed,
             };
             let report = dispatch_command(runtime, CommandName::ProjectSeedSynthetic, &input)?;
+            println!("{report}");
+            Ok(ExitCode::SUCCESS)
+        }
+        CliCommand::Evidence {
+            command:
+                EvidenceCommand::List {
+                    directory,
+                    source,
+                    status,
+                    limit,
+                    with_stages,
+                },
+        } => {
+            let input = pos_api::EvidenceListInput {
+                path: path_text(&directory)?,
+                source_id: source,
+                status,
+                row_count_max: Some(limit),
+                with_stages,
+            };
+            let report = dispatch_query(runtime, QueryName::EvidenceList, &input)?;
+            println!("{report}");
+            Ok(ExitCode::SUCCESS)
+        }
+        CliCommand::SourceHealth { directory, source } => {
+            let input = pos_api::SourceHealthInput {
+                path: path_text(&directory)?,
+                source_id: source,
+            };
+            let report = dispatch_query(runtime, QueryName::SourceHealth, &input)?;
+            println!("{report}");
+            Ok(ExitCode::SUCCESS)
+        }
+        CliCommand::Ingest {
+            command:
+                IngestCommand::Reprocess {
+                    directory,
+                    from_stage,
+                    evidence,
+                    limit,
+                    reason,
+                },
+        } => {
+            let input = pos_api::IngestReprocessInput {
+                path: path_text(&directory)?,
+                from_stage,
+                evidence_id: evidence,
+                item_count_max: Some(limit),
+                reason,
+            };
+            let report = dispatch_command(runtime, CommandName::IngestReprocess, &input)?;
             println!("{report}");
             Ok(ExitCode::SUCCESS)
         }

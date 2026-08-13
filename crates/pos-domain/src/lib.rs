@@ -13,6 +13,9 @@
 #![forbid(unsafe_code)]
 
 pub mod events;
+pub mod evidence_state;
+pub mod ingest;
+pub mod ingest_projections;
 pub mod job_state;
 pub mod projections;
 pub mod run_state;
@@ -30,6 +33,17 @@ pub use events::{
     RunStartedBody, RunStepCommittedBody, RunStepPhase, RunTaintRaisedBody, RunToolCall,
     RunToolEffectRecordedBody, RunToolGrant, RunToolGrantMode, RunTrigger, RunUsage,
     RunValidationRecordedBody, RunValidationRef, RunValidationStatus,
+};
+pub use evidence_state::{
+    ChunkRecord, EVIDENCE_LIST_ROW_COUNT_MAX, EvidenceListFilter, EvidenceReadError,
+    EvidenceRecord, SourceHealthRecord, StageRecord, StageState, count_chunks_by_content,
+    list_chunks, list_evidence, list_source_health, list_stages, read_evidence,
+};
+pub use ingest::{
+    CHUNK_BATCH_COUNT_MAX, CanaryLevel, ChunkFact, ChunkKind, EvidenceAddedBody,
+    EvidenceChunkedBody, EvidenceReprocessRequestedBody, EvidenceShape, EvidenceStatus,
+    ExternalRef, IngestStage, IngestStageDisposition, IngestStageFailedBody,
+    IngestStageFinishedBody, IngestStageOutput, IngestStageStartedBody, Locator, MediaKind,
 };
 pub use job_state::{
     CronRecord, JOB_LIST_ROW_COUNT_MAX, JobDurableState, JobListFilter, JobReadError, JobRecord,

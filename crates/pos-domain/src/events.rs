@@ -4,6 +4,10 @@
 //! matches both (event-sourcing skill). Unknown kinds decode to `None` so a
 //! newer project opens under an older build instead of failing closed.
 
+use crate::ingest::{
+    EvidenceAddedBody, EvidenceChunkedBody, EvidenceReprocessRequestedBody, IngestStageFailedBody,
+    IngestStageFinishedBody, IngestStageStartedBody,
+};
 use pos_foundation::{
     AccountId, ArtifactId, CheckpointId, CronId, ExecutionLeaseId, GateReceiptId, JobId, ProjectId,
     QuestionId, RunId, ToolCallId, UserId, ValidationId,
@@ -771,6 +775,12 @@ pub enum DomainEvent {
     CronEnablementSet(CronEnablementSetBody),
     AccountAudited(AccountAuditedBody),
     ModelCallCompleted(ModelCallCompletedBody),
+    EvidenceAdded(EvidenceAddedBody),
+    IngestStageStarted(IngestStageStartedBody),
+    IngestStageFinished(IngestStageFinishedBody),
+    IngestStageFailed(IngestStageFailedBody),
+    EvidenceChunked(EvidenceChunkedBody),
+    EvidenceReprocessRequested(EvidenceReprocessRequestedBody),
 }
 
 impl DomainEvent {
@@ -803,6 +813,12 @@ impl DomainEvent {
             Self::CronEnablementSet(_) => "CronEnablementSet",
             Self::AccountAudited(_) => "AccountAudited",
             Self::ModelCallCompleted(_) => "ModelCallCompleted",
+            Self::EvidenceAdded(_) => "EvidenceAdded",
+            Self::IngestStageStarted(_) => "IngestStageStarted",
+            Self::IngestStageFinished(_) => "IngestStageFinished",
+            Self::IngestStageFailed(_) => "IngestStageFailed",
+            Self::EvidenceChunked(_) => "EvidenceChunked",
+            Self::EvidenceReprocessRequested(_) => "EvidenceReprocessRequested",
         }
     }
 
@@ -995,6 +1011,43 @@ impl DomainEvent {
             Self::ModelCallCompleted(ModelCallCompletedBody::V1 { project_id, .. }) => {
                 vec![entity_ref("project", project_id.into_bytes())]
             }
+            Self::EvidenceAdded(EvidenceAddedBody::V1 {
+                evidence_id,
+                source_id,
+                ..
+            }) => vec![
+                entity_ref("evidence", evidence_id.into_bytes()),
+                entity_ref("source", source_id.into_bytes()),
+            ],
+            Self::IngestStageStarted(IngestStageStartedBody::V1 {
+                evidence_id,
+                job_id,
+                ..
+            }) => vec![
+                entity_ref("evidence", evidence_id.into_bytes()),
+                entity_ref("job", job_id.into_bytes()),
+            ],
+            Self::IngestStageFinished(IngestStageFinishedBody::V1 { evidence_id, .. })
+            | Self::IngestStageFailed(IngestStageFailedBody::V1 { evidence_id, .. })
+            | Self::EvidenceReprocessRequested(EvidenceReprocessRequestedBody::V1 {
+                evidence_id,
+                ..
+            }) => vec![entity_ref("evidence", evidence_id.into_bytes())],
+            // A chunk batch touches every chunk it creates: the L2 why-chain
+            // is what a citation walks backwards, and the batch is already
+            // bounded by `CHUNK_BATCH_COUNT_MAX`, so the ref list is too.
+            Self::EvidenceChunked(EvidenceChunkedBody::V1 {
+                evidence_id,
+                chunks,
+                ..
+            }) => {
+                let mut refs = Vec::with_capacity(chunks.len() + 1);
+                refs.push(entity_ref("evidence", evidence_id.into_bytes()));
+                for chunk in chunks {
+                    refs.push(entity_ref("chunk", chunk.chunk_id.into_bytes()));
+                }
+                refs
+            }
         }
     }
 
@@ -1029,6 +1082,12 @@ impl DomainEvent {
             Self::CronEnablementSet(inner) => ciborium::into_writer(inner, &mut body),
             Self::AccountAudited(inner) => ciborium::into_writer(inner, &mut body),
             Self::ModelCallCompleted(inner) => ciborium::into_writer(inner, &mut body),
+            Self::EvidenceAdded(inner) => ciborium::into_writer(inner, &mut body),
+            Self::IngestStageStarted(inner) => ciborium::into_writer(inner, &mut body),
+            Self::IngestStageFinished(inner) => ciborium::into_writer(inner, &mut body),
+            Self::IngestStageFailed(inner) => ciborium::into_writer(inner, &mut body),
+            Self::EvidenceChunked(inner) => ciborium::into_writer(inner, &mut body),
+            Self::EvidenceReprocessRequested(inner) => ciborium::into_writer(inner, &mut body),
         };
         encoded.expect("CBOR encoding of typed bodies into a Vec cannot fail"); // INVARIANT: bodies contain only owned serde-friendly values and the writer is a Vec.
         body
@@ -1078,6 +1137,14 @@ impl DomainEvent {
             "CronEnablementSet" => Self::CronEnablementSet(read("CronEnablementSet", body)?),
             "AccountAudited" => Self::AccountAudited(read("AccountAudited", body)?),
             "ModelCallCompleted" => Self::ModelCallCompleted(read("ModelCallCompleted", body)?),
+            "EvidenceAdded" => Self::EvidenceAdded(read("EvidenceAdded", body)?),
+            "IngestStageStarted" => Self::IngestStageStarted(read("IngestStageStarted", body)?),
+            "IngestStageFinished" => Self::IngestStageFinished(read("IngestStageFinished", body)?),
+            "IngestStageFailed" => Self::IngestStageFailed(read("IngestStageFailed", body)?),
+            "EvidenceChunked" => Self::EvidenceChunked(read("EvidenceChunked", body)?),
+            "EvidenceReprocessRequested" => {
+                Self::EvidenceReprocessRequested(read("EvidenceReprocessRequested", body)?)
+            }
             _ => return Ok(None),
         };
         Ok(Some(decoded))

@@ -17,7 +17,7 @@ use pos_domain::{
     JobDurableState, JobEnqueuedBody, JobRecord, count_jobs_by_state, read_job,
 };
 use pos_foundation::{CronId, DeviceId, JobId, ProjectId, WallClock};
-use pos_log::{Actor, LogError, ProjectLog};
+use pos_log::{Actor, AppendRequest, LogError, ProjectLog};
 use pos_store::rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -161,19 +161,8 @@ impl JobQueue {
             self.metrics.record_duplicate_enqueue();
             return Ok(EnqueueOutcome::Duplicate(job_id));
         }
-        let event = DomainEvent::JobEnqueued(JobEnqueuedBody::V2 {
-            job_id,
-            project_id,
-            job_kind: spec.kind.as_str().to_owned(),
-            idempotency_key: spec.idempotency_key.clone(),
-            priority: spec.priority,
-            class: spec.class,
-            payload: spec.payload.clone(),
-            run_at_ts_ms: spec.run_at_ts_ms,
-            attempt_count_max: spec.retry_count_max,
-            cron: spec.cron,
-        });
-        let request = event.into_request(self.config.device, Actor::System(job_id))?;
+        let request = enqueued_event(job_id, project_id, spec)
+            .into_request(self.config.device, Actor::System(job_id))?;
         match log.append(request, clock) {
             Ok(_) => {
                 self.metrics.record_enqueued();
@@ -191,6 +180,41 @@ impl JobQueue {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Builds the enqueue append *without* appending it, so a caller can
+    /// commit "my fact and the work it schedules" in one transaction
+    /// (m1-s01). This is the seam the crate docs already claimed — an enqueue
+    /// is an append — and the ingestion pipeline needs it for correctness,
+    /// not convenience: a stage that appended its completion and then
+    /// enqueued the next stage separately would stall the whole item if the
+    /// process died between the two commits.
+    ///
+    /// `Ok(None)` means the job already exists; the caller's own facts still
+    /// need appending, and re-enqueueing would be the duplicate this returns
+    /// instead of raising.
+    pub fn enqueue_request(
+        &self,
+        log: &ProjectLog,
+        project_id: ProjectId,
+        spec: &JobSpec,
+    ) -> Result<(JobId, Option<AppendRequest>), SchedError> {
+        spec.validate()?;
+        let job_id = derive_job_id(project_id, &spec.kind, &spec.idempotency_key);
+        if read_job(log, job_id)?.is_some() {
+            self.metrics.record_duplicate_enqueue();
+            return Ok((job_id, None));
+        }
+        let request = enqueued_event(job_id, project_id, spec)
+            .into_request(self.config.device, Actor::System(job_id))?;
+        Ok((job_id, Some(request)))
+    }
+
+    /// Records the metrics an [`Self::enqueue_request`] caller earned once it
+    /// has committed the batch. Kept separate so the counter follows the
+    /// durable append rather than the intention to append.
+    pub fn record_enqueued(&self) {
+        self.metrics.record_enqueued();
     }
 
     /// Takes the highest-priority runnable job in `class`, oldest first, and
@@ -555,6 +579,23 @@ impl JobQueue {
 /// The read view rule, in one place so the API, the pool, and the tests
 /// cannot disagree about what `Running` means.
 #[must_use]
+/// The one place a `JobEnqueued` body is built, so the appending and the
+/// request-building paths cannot drift apart.
+fn enqueued_event(job_id: JobId, project_id: ProjectId, spec: &JobSpec) -> DomainEvent {
+    DomainEvent::JobEnqueued(JobEnqueuedBody::V2 {
+        job_id,
+        project_id,
+        job_kind: spec.kind.as_str().to_owned(),
+        idempotency_key: spec.idempotency_key.clone(),
+        priority: spec.priority,
+        class: spec.class,
+        payload: spec.payload.clone(),
+        run_at_ts_ms: spec.run_at_ts_ms,
+        attempt_count_max: spec.retry_count_max,
+        cron: spec.cron,
+    })
+}
+
 pub fn live_state_of(record: &JobRecord, lease_live: bool) -> JobLiveState {
     match record.state {
         JobDurableState::Done => JobLiveState::Done,

@@ -23,7 +23,7 @@ use pos_log::{
 
 /// Builds the registry every v0 shell opens projects with.
 pub fn v0_registry() -> Result<ProjectionRegistry, LogError> {
-    ProjectionRegistry::new(vec![
+    let mut projections: Vec<Box<dyn Projection>> = vec![
         Box::new(ProjectsProjection),
         Box::new(RunsProjection),
         Box::new(RunToolGrantsProjection),
@@ -32,7 +32,12 @@ pub fn v0_registry() -> Result<ProjectionRegistry, LogError> {
         Box::new(CronsProjection),
         Box::new(AuditProjection),
         Box::new(ModelCallsProjection),
-    ])
+    ];
+    // The ingestion tables live beside their own applies (m1-s01/m1-s02);
+    // the registry stays the one place that says which projections a project
+    // opens with, so a rebuild covers all of them or none.
+    projections.extend(crate::ingest_projections::projections());
+    ProjectionRegistry::new(projections)
 }
 
 fn decode_for(table: &TableDef, event: &Event) -> Result<Option<DomainEvent>, ApplyError> {

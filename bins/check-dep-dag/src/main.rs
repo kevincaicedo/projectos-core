@@ -63,6 +63,16 @@ fn allowed_deps() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         map.insert(crate_name, base_and_beside.clone());
     }
 
+    // Feature-crate cross-edge, added deliberately by m1-s01: the ingestion
+    // pipeline *is* `pos-sched` jobs (master plan §9), so `pos-ingest` needs
+    // the queue's enqueue seam and its handler/registry types. Recorded here
+    // rather than silently: if a second and third feature crate need the same
+    // edge, `pos-sched` is infrastructure beside the domain rather than a
+    // feature plane, and that is a §19 change with an ADR — not another line.
+    if let Some(ingest) = map.get_mut("pos-ingest") {
+        ingest.insert("pos-sched");
+    }
+
     // pos-api sits on top of every library crate.
     let mut api_deps = base_and_beside.clone();
     api_deps.extend(feature_crates);

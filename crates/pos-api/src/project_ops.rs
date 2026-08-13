@@ -418,6 +418,34 @@ fn open_log_over(store: ProjectStore) -> Result<ProjectLog, ApiError> {
     ProjectLog::open(store, registry, LogConfig::default()).map_err(log_error)
 }
 
+/// The project id this `.pos` directory records. Until M5's multi-project
+/// workspaces a directory holds exactly one project, so a single row is the
+/// answer and two rows are corruption rather than a choice.
+pub(crate) fn project_id(log: &ProjectLog) -> Result<ProjectId, ApiError> {
+    let raw: Option<Vec<u8>> = log
+        .store()
+        .db()
+        .with_reader("read project id", |connection| {
+            use pos_store::rusqlite::OptionalExtension;
+            connection
+                .query_row("SELECT project_id FROM proj_projects", [], |row| row.get(0))
+                .optional()
+        })
+        .map_err(|error| store_error(&error))?;
+    let bytes = raw.ok_or_else(|| ApiError {
+        code: "state_mutated",
+        message: "the project directory has no ProjectCreated fact".to_owned(),
+        retriable: false,
+    })?;
+    <[u8; 16]>::try_from(bytes.as_slice())
+        .map(ProjectId::from_bytes)
+        .map_err(|_| ApiError {
+            code: "state_mutated",
+            message: "proj_projects holds a malformed project id".to_owned(),
+            retriable: false,
+        })
+}
+
 fn read_project_name(log: &ProjectLog, project_id: ProjectId) -> Result<Option<String>, ApiError> {
     log.store()
         .db()

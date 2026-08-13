@@ -3035,6 +3035,11 @@ version = "0.1.0-dev"
 dependencies = [
  "pos-domain",
  "pos-foundation",
+ "pos-log",
+ "pos-sched",
+ "pos-store",
+ "proptest",
+ "tempfile",
 ]
 
 [[package]]

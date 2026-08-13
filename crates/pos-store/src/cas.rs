@@ -56,6 +56,16 @@ impl BlobHash {
         Self(blake3::hash(bytes))
     }
 
+    /// Rebuilds an address from its stored 32 bytes. Projections and event
+    /// bodies keep hashes as raw bytes rather than hex, so this is the way
+    /// back — no validation is possible or needed: every 32-byte value is a
+    /// syntactically valid address, and whether it names a blob we hold is
+    /// [`BlobStore::contains`]'s question.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(blake3::Hash::from_bytes(bytes))
+    }
+
     #[must_use]
     pub fn into_bytes(self) -> [u8; 32] {
         *self.0.as_bytes()

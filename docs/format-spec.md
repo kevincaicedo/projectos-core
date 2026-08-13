@@ -125,6 +125,32 @@ ended — lives in the log as `JobEnqueued` / `JobAttemptFailed` /
 - `blobs/tmp/` holds in-flight writes; its contents are disposable and are
   swept on open. Tools must ignore it.
 
+- **Blob roles the ingestion pipeline writes (m1-s01).** Blobs are opaque
+  bytes and the store does not type them; three roles are referenced from
+  event bodies and are therefore part of the portable contract:
+  - the **original content** of an Evidence item, byte-for-byte as it arrived
+    (`EvidenceAdded.content_blob`);
+  - the **normalized text**, UTF-8, `\n`-separated, BOM-stripped — the bytes a
+    citation renders (`IngestStageFinished` → `Normalized.text_blob`);
+  - the **segment index** over that text
+    (`Normalized.segments_blob`), a sequence of fixed 40-byte
+    little-endian records with no framing:
+
+    | Offset | Size | Field |
+    |---|---|---|
+    | 0 | 8 | `byte_start` — inclusive offset into the normalized text |
+    | 8 | 8 | `byte_end` — exclusive |
+    | 16 | 1 | locator kind: `1` time range, `2` line range, `3` message range |
+    | 17 | 1 | structural depth (markdown heading level, else 0) |
+    | 18 | 6 | reserved, written as zero, ignored on read |
+    | 24 | 8 | locator bound A (`start_ms` / `start`) |
+    | 32 | 8 | locator bound B (`end_ms` / `end`) |
+
+    An unknown locator kind, a short trailing record, or `byte_end <
+    byte_start` is corruption, not a value to guess at. A conforming tool does
+    **not** need this blob to render a citation — every chunk's locator is
+    also a field of the `EvidenceChunked` fact — only to re-chunk.
+
 ## 7. Export (`pos export`)
 
 An export is a directory that is **itself a valid v0 project** — it re-opens

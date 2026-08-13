@@ -84,6 +84,7 @@ pub struct SpanContext {
 const DOMAIN_RUN: u64 = 0x706f_735f_7275_6e31; // "pos_run1"
 const DOMAIN_JOB: u64 = 0x706f_735f_6a6f_6231; // "pos_job1"
 const DOMAIN_PROCESS: u64 = 0x706f_735f_7072_6331; // "pos_prc1"
+const DOMAIN_EVIDENCE: u64 = 0x706f_735f_6576_6431; // "pos_evd1"
 
 impl TraceId {
     #[must_use]
@@ -115,6 +116,20 @@ impl TraceId {
             DOMAIN_JOB,
             project.into_bytes(),
             job.into_bytes(),
+        ))
+    }
+
+    /// The trace every pipeline stage of one Evidence item belongs to.
+    /// Derived from the evidence rather than from any one job, because the
+    /// milestone asks for a single correlated trace from connector fetch to
+    /// INDEX — and those are seven different jobs, in possibly seven
+    /// different processes, over possibly several days.
+    #[must_use]
+    pub fn for_evidence(project: crate::ProjectId, evidence: crate::EvidenceId) -> Self {
+        Self(derive_128(
+            DOMAIN_EVIDENCE,
+            project.into_bytes(),
+            evidence.into_bytes(),
         ))
     }
 
@@ -157,6 +172,16 @@ impl SpanId {
         )))
     }
 
+    /// The Evidence item's pipeline root span id.
+    #[must_use]
+    pub fn root_for_evidence(project: crate::ProjectId, evidence: crate::EvidenceId) -> Self {
+        Self(first8(derive_128(
+            DOMAIN_EVIDENCE ^ 1,
+            project.into_bytes(),
+            evidence.into_bytes(),
+        )))
+    }
+
     #[must_use]
     pub fn to_hex(self) -> String {
         hex(&self.0)
@@ -179,6 +204,15 @@ impl SpanContext {
         Self {
             trace: TraceId::for_job(project, job),
             span: SpanId::root_for_job(project, job),
+        }
+    }
+
+    /// The context every pipeline stage of this Evidence item attaches to.
+    #[must_use]
+    pub fn for_evidence(project: crate::ProjectId, evidence: crate::EvidenceId) -> Self {
+        Self {
+            trace: TraceId::for_evidence(project, evidence),
+            span: SpanId::root_for_evidence(project, evidence),
         }
     }
 }
@@ -259,10 +293,12 @@ pub enum SpanName {
     AgentsStep,
     GatewayCall,
     SchedJob,
+    /// One ingestion stage attempt (m1-s01), rooted on its Evidence item.
+    IngestStage,
 }
 
 impl SpanName {
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 7;
     pub const ALL: [Self; Self::COUNT] = [
         Self::ApiCommand,
         Self::ApiQuery,
@@ -270,6 +306,7 @@ impl SpanName {
         Self::AgentsStep,
         Self::GatewayCall,
         Self::SchedJob,
+        Self::IngestStage,
     ];
 
     /// The static stem. `tracing` fixes a span's name at its callsite, so the
@@ -284,6 +321,7 @@ impl SpanName {
             Self::AgentsStep => "agents.step",
             Self::GatewayCall => "gateway.call",
             Self::SchedJob => "sched.job",
+            Self::IngestStage => "ingest.stage",
         }
     }
 
@@ -379,6 +417,8 @@ pub enum SpanField {
     Project,
     Run,
     Job,
+    /// The Evidence item a pipeline stage is working on.
+    Evidence,
     StepIndex,
     Attempt,
     /// Whether a tool step was read-only, idempotent, or not — the L5/L6
@@ -403,6 +443,7 @@ impl SpanField {
             Self::Project => "project",
             Self::Run => "run",
             Self::Job => "job",
+            Self::Evidence => "evidence",
             Self::StepIndex => "step_index",
             Self::Attempt => "attempt",
             Self::EffectClass => "effect_class",

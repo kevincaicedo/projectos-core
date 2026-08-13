@@ -139,12 +139,22 @@ const fn hex_nibble(digit: u8) -> Option<u8> {
 opaque_id!(AccountId, "account");
 opaque_id!(ArtifactId, "artifact");
 opaque_id!(CheckpointId, "Run checkpoint");
+// Chunk and Evidence ids are BLAKE3 digests truncated to 128 bits rather than
+// full 256-bit hashes (m1-s02). Two reasons, both structural: `EntityRef.id`
+// is `[u8; 16]`, so an id wider than that could not participate in the L2
+// why-chain at all; and a citation points at a chunk forever, so the id also
+// has to stay cheap in every index and export. 128 bits keeps the collision
+// probability below 10^-26 at the 1M-chunk §18 scale, which is far under the
+// probability of the disk lying to us.
+opaque_id!(ChunkId, "evidence chunk");
 opaque_id!(CronId, "cron schedule");
 opaque_id!(DeviceId, "origin device/server");
+opaque_id!(EvidenceId, "Evidence item");
 opaque_id!(ExecutionLeaseId, "execution lease");
 opaque_id!(GateReceiptId, "human gate receipt");
 opaque_id!(JobId, "scheduled job");
 opaque_id!(ProjectId, "project");
+opaque_id!(SourceId, "connected source");
 opaque_id!(QuestionId, "Run question");
 opaque_id!(RunId, "Run");
 opaque_id!(ToolCallId, "tool call");

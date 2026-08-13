@@ -377,6 +377,7 @@ fn check_rust_file(
         panic_policy_enforced: !is_integration_test_path(root, path),
         telemetry_emission_allowed: telemetry_emission_allowed(root, path),
         registered_kind_detail_allowed: registered_kind_detail_allowed(root, path),
+        slurp_policy_enforced: slurp_policy_enforced(root, path),
         violations,
     };
     visitor.visit_file(&syntax);
@@ -418,6 +419,7 @@ struct PolicyVisitor<'a> {
     panic_policy_enforced: bool,
     telemetry_emission_allowed: bool,
     registered_kind_detail_allowed: bool,
+    slurp_policy_enforced: bool,
     violations: &'a mut Vec<Violation>,
 }
 
@@ -482,6 +484,54 @@ impl PolicyVisitor<'_> {
         }
     }
 
+    /// The m1-s01 streaming rule. `pos-ingest` reads gigabytes of user
+    /// content through a stated per-stage buffer budget; a single
+    /// `read_to_end` anywhere in it would make the §18 RSS gate a function of
+    /// how big the input was. Same shape as the telemetry and projection
+    /// rules: the discipline is a build failure, not a review habit.
+    fn check_slurp_method(&mut self, name: &str, line: usize) {
+        if self.slurp_policy_enforced && SLURP_METHODS.contains(&name) {
+            self.report_slurp(name, line);
+        }
+    }
+
+    /// `fs::read`-shaped calls, matched on the last two path segments so a
+    /// bare `Read::read` — the bounded primitive everything here is built on
+    /// — is not swept up with them.
+    fn check_slurp_path(&mut self, path: &syn::Path, line: usize) {
+        if !self.slurp_policy_enforced {
+            return;
+        }
+        let mut tail = path
+            .segments
+            .iter()
+            .rev()
+            .take(2)
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>();
+        tail.reverse();
+        if tail.len() == 2 && SLURP_PATHS.iter().any(|pair| pair[..] == tail[..]) {
+            self.report_slurp(&tail.join("::"), line);
+        }
+        if let Some(last) = path.segments.last()
+            && SLURP_METHODS.contains(&last.ident.to_string().as_str())
+        {
+            self.report_slurp(&last.ident.to_string(), line);
+        }
+    }
+
+    fn report_slurp(&mut self, name: &str, line: usize) {
+        self.violations.push(Violation {
+            policy: "streaming-discipline",
+            path: self.path.to_path_buf(),
+            line: Some(line),
+            message: format!(
+                "{name} reads user content whole; {SLURP_POLICY_OWNER} streams through \
+                 BoundedStream with a stated per-stage buffer budget (m1-s01)"
+            ),
+        });
+    }
+
     fn check_projection_literal(&mut self, value: &str, line: usize) {
         if self.projection_writes_allowed {
             return;
@@ -516,6 +566,7 @@ impl<'ast> Visit<'ast> for PolicyVisitor<'_> {
             let end = call.span().end();
             self.check_panic_call(&method, end.line, end.column);
         }
+        self.check_slurp_method(&method, call.method.span().start().line);
         syn::visit::visit_expr_method_call(self, call);
     }
 
@@ -528,6 +579,7 @@ impl<'ast> Visit<'ast> for PolicyVisitor<'_> {
 
     fn visit_path(&mut self, path: &'ast syn::Path) {
         self.check_telemetry_path(path, path.span().start().line);
+        self.check_slurp_path(path, path.span().start().line);
         syn::visit::visit_path(self, path);
     }
 
@@ -644,6 +696,29 @@ const TELEMETRY_EMISSION_MESSAGE: &str = "`tracing` is reachable only from crate
      pos_foundation::telemetry::Span so its name and fields stay a closed, string-free vocabulary";
 const REGISTERED_KIND_DETAIL: &str = "from_registered_kind";
 const REGISTERED_KIND_DETAIL_OWNER: &str = "crates/pos-sched/src/pool.rs";
+
+/// The calls that read user content whole. `fs::read`/`fs::read_to_string`
+/// are matched by their final path segment, which is why the list mixes
+/// method and function names.
+const SLURP_METHODS: [&str; 2] = ["read_to_end", "read_to_string"];
+
+/// The free functions that do the same thing. `fs::read` is matched on the
+/// two-segment tail so a `Read::read` call — the bounded primitive
+/// `BoundedStream` is built on — stays legal.
+const SLURP_PATHS: [[&str; 2]; 3] = [
+    ["fs", "read"],
+    ["fs", "read_to_string"],
+    ["fs", "read_to_end"],
+];
+
+/// The crate the streaming rule governs. Ingestion is where GB-scale user
+/// content enters, so it is where slurping is a build failure.
+const SLURP_POLICY_OWNER: &str = "crates/pos-ingest";
+
+fn slurp_policy_enforced(root: &Path, path: &Path) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    relative.starts_with(SLURP_POLICY_OWNER) && !is_integration_test_path(root, path)
+}
 
 fn telemetry_emission_allowed(root: &Path, path: &Path) -> bool {
     path.starts_with(root.join(TELEMETRY_EMISSION_OWNER))
@@ -968,10 +1043,62 @@ mod tests {
             panic_policy_enforced: !super::is_integration_test_path(root, path),
             telemetry_emission_allowed: super::telemetry_emission_allowed(root, path),
             registered_kind_detail_allowed: super::registered_kind_detail_allowed(root, path),
+            slurp_policy_enforced: super::slurp_policy_enforced(root, path),
             violations: &mut violations,
         };
         visitor.visit_file(&syntax);
         violations
+    }
+
+    /// The m1-s01 streaming rule, with its seeded violations. A checker that
+    /// has never been seen to fail is decoration.
+    #[test]
+    fn slurping_user_content_is_denied_inside_the_ingestion_crate() {
+        let ingest = "/workspace/crates/pos-ingest/src/normalize.rs";
+        let seeded = [
+            "fn load(reader: &mut impl std::io::Read) { let mut buffer = Vec::new(); \
+             reader.read_to_end(&mut buffer).ok(); }",
+            "fn load(reader: &mut impl std::io::Read) { let mut text = String::new(); \
+             reader.read_to_string(&mut text).ok(); }",
+            "fn load(path: &std::path::Path) { let _ = std::fs::read(path); }",
+            "fn load(path: &std::path::Path) { let _ = fs::read_to_string(path); }",
+        ];
+        for source in seeded {
+            let violations = rust_violations_at(source, ingest);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.policy == "streaming-discipline"),
+                "no streaming-discipline violation for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bounded_read_primitive_and_other_crates_stay_legal() {
+        // `Read::read` is what BoundedStream is built on; denying it would
+        // deny the very discipline the rule exists to enforce.
+        let bounded = "fn fill(reader: &mut impl std::io::Read, buffer: &mut [u8]) { \
+             let _ = reader.read(buffer); }";
+        assert!(
+            rust_violations_at(bounded, "/workspace/crates/pos-ingest/src/budget.rs")
+                .iter()
+                .all(|violation| violation.policy != "streaming-discipline")
+        );
+        // The rule governs ingestion, where GB-scale user content enters.
+        let elsewhere = "fn load(path: &std::path::Path) { let _ = std::fs::read(path); }";
+        assert!(
+            rust_violations_at(elsewhere, "/workspace/crates/pos-gateway/src/lib.rs")
+                .iter()
+                .all(|violation| violation.policy != "streaming-discipline")
+        );
+        // Integration tests may build fixtures however they like.
+        let fixture = "fn load(path: &std::path::Path) { let _ = std::fs::read(path); }";
+        assert!(
+            rust_violations_at(fixture, "/workspace/crates/pos-ingest/tests/pipeline.rs")
+                .iter()
+                .all(|violation| violation.policy != "streaming-discipline")
+        );
     }
 
     /// The m0-s15 telemetry rule, with its seeded violations. A checker that
