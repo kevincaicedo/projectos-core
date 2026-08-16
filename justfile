@@ -170,6 +170,15 @@ crash-matrix:
     cargo test -p pos-store --test crash_matrix
     cargo test -p pos-log --test log_crash
 
+# The m1-s01 pipeline oracles at nightly weight. NOT a duplicate of the PR
+# lane: release profile puts real corpus sizes in reach, and the wider
+# property budget is what makes the segment decoder's totality claim mean
+# something. The fault-point matrix inside `stage_framework` covers every
+# stage this build registers — it grows as m1-s03/s04/s05/s11 land theirs,
+# which is why the story's AC stays open until then.
+ingest-matrix:
+    PROPTEST_CASES=4096 cargo test --release -p pos-ingest
+
 # The m0-s16 gate campaign. NOT in `ci`: §18 numbers are measured on a pinned
 # reference machine under the docs/reference-machines.md §4 protocol, and the
 # harness itself downgrades anything else to `early_warning`.

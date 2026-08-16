@@ -14,6 +14,10 @@ use crate::gateway_ops::{
     CostGroupRow, CostRollupInput, CostRollupReport, CostRollupRow, CostRollupTotals,
     ModelsPullInput, ModelsPullReport,
 };
+use crate::ingest_ops::{
+    EvidenceListInput, EvidenceListReport, EvidenceRow, EvidenceStageRow, IngestReprocessInput,
+    IngestReprocessReport, SourceHealthInput, SourceHealthReport, SourceHealthRow,
+};
 use crate::project_ops::{
     ProjectCreateInput, ProjectCreateReport, ProjectExportInput, ProjectExportReport,
     ProjectInspectReport, ProjectPathInput, ProjectSeedInput, ProjectSeedReport,
@@ -74,7 +78,16 @@ macro_rules! for_each_exported_type {
             JobRow,
             JobListReport,
             CronPreviewInput,
-            CronPreviewReport
+            CronPreviewReport,
+            EvidenceListInput,
+            EvidenceStageRow,
+            EvidenceRow,
+            EvidenceListReport,
+            SourceHealthInput,
+            SourceHealthRow,
+            SourceHealthReport,
+            IngestReprocessInput,
+            IngestReprocessReport
         )
     };
 }

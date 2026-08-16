@@ -2,7 +2,8 @@
 # runner, plus a 1M-event synthetic round-trip that is too slow for the
 # per-PR wall-clock budget. PR CI runs the same crash suites at M0 scale;
 # this lane is the standing harness the milestone gate names, and it grows
-# the GB-corpus and chaos matrices in M1/M2.
+# the GB-corpus and chaos matrices in M1/M2. M1 added the ingest fault-point
+# matrix (m1-s01); the 10 GB corpus lane joins it with m1-s13.
 name: nightly
 
 on:
@@ -27,6 +28,8 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Crash-point matrix (kill -9 × append/snapshot/CAS)
         run: just crash-matrix
+      - name: Ingest fault-point matrix + streaming budget (m1-s01)
+        run: just ingest-matrix
       - name: 1M-event synthetic round-trip (create → seed → verify → export)
         run: |
           cargo build --release -p pos

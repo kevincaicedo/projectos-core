@@ -280,6 +280,87 @@ test.describe("walking skeleton without a server, an account, or the cloud repos
   });
 });
 
+/// Ingestion health with one dead-lettered item (m1-s01). Hand-built like
+/// the project/health fixtures above — and drift-safe for the same reason
+/// the validators exist: `asSourceHealthReport`/`asEvidenceListReport` narrow
+/// into the *generated* ts-rs shapes, so a wire change the UI stops
+/// understanding renders the error state and fails these assertions rather
+/// than silently rendering a stale shape.
+const SOURCE_HEALTH = JSON.stringify({
+  sources: [
+    {
+      sourceId: "5c0a11e900000000000000000000beef",
+      stage: "raw",
+      okCount: 4,
+      failedCount: 0,
+      deadCount: 0,
+      itemCount: 4,
+      bytesTotal: 91_204,
+      wallMsTotal: 0,
+      lastSuccessTsMs: 1_760_000_000_000,
+      lastFailureTsMs: null,
+      lastErrorCode: null,
+      costFeature: "ingest.raw",
+    },
+    {
+      sourceId: "5c0a11e900000000000000000000beef",
+      stage: "normalize",
+      okCount: 3,
+      failedCount: 4,
+      deadCount: 1,
+      itemCount: 3,
+      bytesTotal: 68_403,
+      wallMsTotal: 214,
+      lastSuccessTsMs: 1_760_000_000_500,
+      lastFailureTsMs: 1_760_000_001_000,
+      lastErrorCode: "unreadable",
+      costFeature: "ingest.normalize",
+    },
+  ],
+});
+
+const NO_SOURCE_HEALTH = JSON.stringify({ sources: [] });
+const NO_DEAD_LETTERS = JSON.stringify({ evidence: [], rowCountMax: 20 });
+
+const DEAD_LETTERS = JSON.stringify({
+  evidence: [
+    {
+      evidenceId: "dead1e77e0000000000000000000f00d",
+      sourceId: "5c0a11e900000000000000000000beef",
+      sourceKind: "upload",
+      externalId: "supplier-quote.pdf",
+      externalUrl: null,
+      mediaKind: "opaque",
+      shape: "document",
+      status: "failed",
+      canaryLevel: "clean",
+      title: "Supplier quote",
+      author: "ops@example.test",
+      occurredTsMs: 1_759_990_000_000,
+      byteSize: 22_801,
+      chunkCount: 0,
+      pass: 0,
+      nextStage: null,
+      nextStageOwnerStory: null,
+      nextStageAvailable: false,
+      stages: [
+        {
+          stage: "normalize",
+          state: "dead",
+          pass: 0,
+          attemptIndex: 4,
+          wallMs: null,
+          bytesRead: null,
+          itemCount: null,
+          lastErrorCode: "unreadable",
+          lastErrorDetail: "content is not valid UTF-8 at byte offset 12",
+        },
+      ],
+    },
+  ],
+  rowCountMax: 20,
+});
+
 test.describe("the M0 shell", () => {
   test("an empty session teaches instead of showing a blank panel", async ({ page }) => {
     await installIpc(page, {
@@ -315,6 +396,78 @@ test.describe("the M0 shell", () => {
     await expect(home).toContainText("Demo Project");
     await expect(home).toContainText("head seq 7");
     await expect(page.locator("[data-teaching='project']")).toBeVisible();
+  });
+
+  /// m1-s01's DLQ criterion: a dead-lettered item shows its stage, its
+  /// attempt count, and its typed reason — in the surface a human actually
+  /// looks at. The L8 rule is that a dead item is never a silent drop, and a
+  /// count alone is a silent drop with a number on it.
+  test("a dead-lettered item names its stage, attempts, and typed reason", async ({ page }) => {
+    await installIpc(page, {
+      "project.list": ONE_PROJECT,
+      health: HEALTH,
+      "capability.snapshot": SNAPSHOT_FIXTURE,
+      "source.health": SOURCE_HEALTH,
+      "evidence.list": DEAD_LETTERS,
+    });
+    await page.goto("/");
+    await page.locator("[data-project-row]").first().click();
+
+    // The per-source, per-stage table carries the counts...
+    const normalize = page.locator("[data-stage-row='normalize']");
+    await expect(normalize).toBeVisible();
+    await expect(normalize.locator("[data-dead-count]")).toHaveAttribute("data-dead-count", "1");
+
+    // ...and the dead-letter entry carries what a human needs to act.
+    const item = page.locator("[data-dead-letter]").first();
+    await expect(item).toBeVisible();
+    await expect(item).toContainText("Supplier quote");
+    await expect(item.locator("[data-dead-stage]")).toHaveAttribute("data-dead-stage", "normalize");
+    await expect(item.locator("[data-dead-attempts]")).toHaveAttribute("data-dead-attempts", "4");
+    await expect(item.locator("[data-dead-reason]")).toHaveAttribute(
+      "data-dead-reason",
+      "unreadable",
+    );
+    await expect(item).toContainText("4 attempts");
+    await expect(item).toContainText("content is not valid UTF-8 at byte offset 12");
+  });
+
+  test("source health teaches when a project has ingested nothing", async ({ page }) => {
+    await installIpc(page, {
+      "project.list": ONE_PROJECT,
+      health: HEALTH,
+      "capability.snapshot": SNAPSHOT_FIXTURE,
+      "source.health": NO_SOURCE_HEALTH,
+      "evidence.list": NO_DEAD_LETTERS,
+    });
+    await page.goto("/");
+    await page.locator("[data-project-row]").first().click();
+
+    const empty = page.locator("[data-stage-health='empty']");
+    await expect(empty).toBeVisible();
+    await expect(empty).toContainText("Evidence");
+    await expect(page.locator("[data-dead-letters='empty']")).toContainText(
+      "Nothing is dead-lettered",
+    );
+  });
+
+  test("a refused source-health read renders the typed error with a retry", async ({ page }) => {
+    // `source.health` is deliberately absent from the fixture registry, so
+    // the IPC bridge answers exactly as the runtime does for an unknown
+    // name: a typed envelope, which must reach the user rather than a blank.
+    await installIpc(page, {
+      "project.list": ONE_PROJECT,
+      health: HEALTH,
+      "capability.snapshot": SNAPSHOT_FIXTURE,
+      "evidence.list": NO_DEAD_LETTERS,
+    });
+    await page.goto("/");
+    await page.locator("[data-project-row]").first().click();
+
+    const failed = page.locator("[data-stage-health='error']");
+    await expect(failed).toBeVisible();
+    await expect(failed).toContainText("no query is registered");
+    await expect(failed.getByRole("button", { name: "Try again" })).toBeVisible();
   });
 
   test("the palette opens, filters, switches projects, and stays under the p95 budget", async ({
@@ -441,8 +594,8 @@ test.describe("the M0 shell", () => {
       await expect(page.locator("[data-project-row]")).toHaveCount(50);
       const interactive = await page.evaluate(
         () =>
-          (window as unknown as { __posInteractiveMs: { value: number | null } })
-            .__posInteractiveMs.value,
+          (window as unknown as { __posInteractiveMs: { value: number | null } }).__posInteractiveMs
+            .value,
       );
       expect(interactive, "the interactive mark was never recorded").not.toBeNull();
       samples.push(interactive ?? 0);

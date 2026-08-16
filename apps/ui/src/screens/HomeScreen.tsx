@@ -8,6 +8,8 @@ import type { QueryView } from "../api/query";
 import { CapabilityRegistryView } from "../CapabilityRegistryView";
 import { ProjectActions } from "./ProjectActions";
 import type { SeamNotice } from "./seam";
+import { SourceHealthPanel } from "./SourceHealthPanel";
+import type { SourceHealthController } from "./useSourceHealth";
 import { RunFeedPanel } from "../runs/RunFeedPanel";
 import type { EchoRunController } from "../runs/useEchoRun";
 
@@ -18,6 +20,7 @@ interface HomeScreenProps {
   readonly focusToken: number;
   readonly onChanged: () => void;
   readonly echoRun: EchoRunController;
+  readonly sourceHealth: SourceHealthController;
 }
 
 export function HomeScreen({
@@ -27,6 +30,7 @@ export function HomeScreen({
   focusToken,
   onChanged,
   echoRun,
+  sourceHealth,
 }: HomeScreenProps) {
   return (
     <main className="stage">
@@ -49,6 +53,7 @@ export function HomeScreen({
         <ProjectHome project={selected} />
       )}
 
+      <SourceHealthPanel projectSelected={selected !== null} controller={sourceHealth} />
       <RunFeedPanel project={selected} controller={echoRun} />
       <ProjectActions onChanged={onChanged} focusToken={focusToken} />
       <section className="card">
