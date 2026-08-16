@@ -25,7 +25,7 @@ pub use recents::{RECENT_PROJECT_COUNT_MAX, Recents};
 
 use pos_api::{
     CommandName, LocalBootstrapConfig, LocalRuntime, ProjectCreateInput, ProjectPathInput,
-    QueryName, SSE_RETRY_MS, StreamFrame, bootstrap_local_runtime, input_json,
+    QueryName, SSE_RETRY_MS, StreamFrame, WorkerConfig, bootstrap_local_runtime, input_json,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -368,9 +368,15 @@ pub fn run() -> Result<(), tauri::Error> {
                 .app_data_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join("packs");
-            app.manage(Arc::new(bootstrap_local_runtime(
-                LocalBootstrapConfig::isolated(packs_root),
-            )));
+            let mut runtime = bootstrap_local_runtime(LocalBootstrapConfig::isolated(packs_root));
+            // The desktop app is the long-running shell, so it is the one that
+            // actually runs the pipeline: ingestion advances while the window
+            // is open, and `project.open` registers each project with the pool
+            // (m1-s01/ADR-0007). Failing to start is fatal rather than silent —
+            // a shell that queues work nothing claims looks identical to one
+            // that is merely slow.
+            runtime.start_background_workers(WorkerConfig::default())?;
+            app.manage(Arc::new(runtime));
             app.manage(ShellState::new(config_dir));
             install_menu(app)?;
             install_tray(app)?;
@@ -384,6 +390,17 @@ pub fn run() -> Result<(), tauri::Error> {
                         "pos-desktop: a dispatch outlived the {SHUTDOWN_DRAIN_MS_MAX}ms shutdown \
                          drain; exiting anyway (its transaction either committed or rolled back — \
                          synchronous=FULL leaves no partial state)"
+                    );
+                }
+                // Then the background pool: stop claiming, and let whatever is
+                // mid-handler finish. Queued work is not waited for — it is a
+                // durable fact in the project and resumes on the next open.
+                let runtime = window.state::<Arc<LocalRuntime>>();
+                if !runtime.shutdown_background_workers() {
+                    eprintln!(
+                        "pos-desktop: a background job outlived the shutdown budget; exiting \
+                         anyway (nothing terminal was written, so its lease expires and the \
+                         attempt is re-counted from durable facts on the next open)"
                     );
                 }
             }
@@ -526,6 +543,64 @@ mod tests {
         let error = packaging_smoke(PathBuf::from("relative.pos").as_path())
             .expect_err("a harness path must be absolute");
         assert_eq!(error, "packaging smoke requires an absolute project path");
+    }
+
+    /// The desktop is the long-running shell, so it is the one that actually
+    /// runs the pipeline: opening a project through the IPC dispatch path must
+    /// register it with the pool, closing must release it, and shutdown must
+    /// stop it inside the budget (m1-s01/ADR-0007).
+    #[test]
+    fn the_shell_runs_background_work_and_releases_projects_on_close() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = tempfile::tempdir().expect("config tempdir");
+        let path = directory
+            .path()
+            .join("desktop-workers.pos")
+            .display()
+            .to_string();
+        let mut runtime = runtime();
+        runtime
+            .start_background_workers(pos_api::WorkerConfig::default())
+            .expect("the desktop pool starts");
+        let shell = ShellState::new(config.path().to_path_buf());
+        dispatch_command(
+            &runtime,
+            &shell,
+            CommandName::ProjectCreate.as_str(),
+            &input_json(&ProjectCreateInput {
+                path: path.clone(),
+                name: Some("Desktop Workers".to_owned()),
+                template: "generic".to_owned(),
+            })
+            .expect("input serializes"),
+        )
+        .expect("create resolves");
+        dispatch_command(
+            &runtime,
+            &shell,
+            CommandName::ProjectOpen.as_str(),
+            &input_json(&ProjectPathInput { path: path.clone() }).expect("input serializes"),
+        )
+        .expect("open resolves");
+        let opened =
+            dispatch_query(&runtime, QueryName::Health.as_str(), None).expect("health resolves");
+        assert!(opened.contains("\"running\":true"), "{opened}");
+        assert!(opened.contains("\"registeredProjectCount\":1"), "{opened}");
+
+        dispatch_command(
+            &runtime,
+            &shell,
+            CommandName::ProjectClose.as_str(),
+            &input_json(&ProjectPathInput { path }).expect("input serializes"),
+        )
+        .expect("close resolves");
+        let closed =
+            dispatch_query(&runtime, QueryName::Health.as_str(), None).expect("health resolves");
+        assert!(closed.contains("\"registeredProjectCount\":0"), "{closed}");
+        assert!(
+            runtime.shutdown_background_workers(),
+            "the pool must stop inside the shutdown budget"
+        );
     }
 
     #[test]

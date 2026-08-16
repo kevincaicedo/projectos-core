@@ -60,7 +60,7 @@ pub use normalize::{NormalizeStage, RECORD_BYTES_MAX, sniff_media_kind};
 pub use pipeline::{
     EvidenceSubmission, IngestPipeline, PipelineConfig, STAGE_RETRY_COUNT_MAX, StageContext,
     StageFailure, StageHandler, StageJobHandler, StageOutcome, StageProduct, StageRegistry,
-    SubmitOutcome, stage_idempotency_key, stage_registry_default,
+    SubmitOutcome, stage_idempotency_key, stage_job_handlers, stage_registry_default,
 };
 pub use reprocess::{REPROCESS_ITEM_COUNT_MAX, ReprocessPlan, ReprocessRequest};
 pub use segment::{SEGMENT_COUNT_MAX, SEGMENT_RECORD_BYTES, Segment, SegmentReader, SegmentWriter};

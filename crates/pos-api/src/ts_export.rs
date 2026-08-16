@@ -29,8 +29,9 @@ use crate::run_ops::{
     RunToolGrantModeWire, RunWorker,
 };
 use crate::sched_ops::{CronPreviewInput, CronPreviewReport, JobListInput, JobListReport, JobRow};
-use crate::session::{HealthReport, OpenProjectRow, ProjectListReport};
+use crate::session::{HealthReport, OpenProjectRow, ProjectCloseReport, ProjectListReport};
 use crate::stream::{SSE_RETRY_MS, STREAM_RESUME_WINDOW_LEN};
+use crate::workers::WorkerStatusReport;
 use crate::{API_SURFACE_VERSION, ApiError, CommandName, QueryName, StreamName};
 use std::collections::BTreeMap;
 use std::fs;
@@ -54,6 +55,8 @@ macro_rules! for_each_exported_type {
             ProjectSeedReport,
             OpenProjectRow,
             ProjectListReport,
+            ProjectCloseReport,
+            WorkerStatusReport,
             HealthReport,
             CostRollupInput,
             CostRollupRow,

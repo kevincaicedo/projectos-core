@@ -21,6 +21,7 @@ mod sched_ops;
 mod session;
 mod stream;
 mod ts_export;
+mod workers;
 
 pub use gateway_ops::{
     CostGroupRow, CostRollupInput, CostRollupReport, CostRollupRow, CostRollupTotals,
@@ -45,12 +46,18 @@ pub use pos_foundation::{ProjectId, RunId, SystemWallClock as FoundationClock, U
 // The telemetry vocabulary shells configure and oracles assert against
 // (m0-s15); re-exported so a shell still depends on `pos-api` alone (L12).
 pub use pos_foundation::telemetry;
-pub use session::{HealthReport, OPEN_PROJECT_COUNT_MAX, OpenProjectRow, ProjectListReport};
+pub use session::{
+    HealthReport, OPEN_PROJECT_COUNT_MAX, OpenProjectRow, ProjectCloseReport, ProjectListReport,
+};
 pub use stream::{
     ResumeWindow, SSE_RETRY_MS, STREAM_RESUME_WINDOW_LEN, StreamFrame, parse_resume_cursor,
     sse_body,
 };
 pub use ts_export::{check_typescript_api, write_typescript_api};
+pub use workers::{
+    WORKER_DRAIN_MS_MAX_DEFAULT, WORKER_SHUTDOWN_MS_MAX_DEFAULT, WorkerConfig, WorkerDrainReport,
+    WorkerStatusReport,
+};
 
 use pos_capabilities::{
     AccountId, CAPABILITY_TRAIT_VERSION, CapabilityMode, CapabilityRegistry, ConnectorHostRequest,
@@ -79,7 +86,11 @@ use std::task::{Context, Poll, Waker};
 /// so the cost surfaces re-sum nothing in a shell.
 /// v9: m1-s01/m1-s02 add the ingestion slice — `evidence.list`,
 /// `source.health`, and the `ingest.reprocess` command.
-pub const API_SURFACE_VERSION: u16 = 9;
+/// v10: m1-s01 wires the m0-s14 worker pool into the shells (ADR-0007) —
+/// `project.close` joins the commands, `health` reports whether this process
+/// claims queued jobs, and `ingest.reprocess` says whether anything will run
+/// what it queued.
+pub const API_SURFACE_VERSION: u16 = 10;
 
 /// Bounded item budget for the M0 connector-host liveness tick (L8). The socket
 /// itself caps this at 32; the runtime asks for less than it is allowed.
@@ -168,8 +179,13 @@ pub enum CommandName {
     /// Deterministic synthetic seeding — test/bench scaffolding shared with
     /// `pos-bench` (m0-s05/m0-s16), honest and documented, not a demo trick.
     ProjectSeedSynthetic,
-    /// Opens (validates) a project directory into the session table (m0-s06).
+    /// Opens (validates) a project directory into the session table (m0-s06)
+    /// and registers it with this process's worker pool (m1-s01).
     ProjectOpen,
+    /// Releases a project: the session row and the scheduler registration go
+    /// together, so the projects a pool serves are exactly the ones the
+    /// process has open (m1-s01).
+    ProjectClose,
     /// Run lifecycle — registered now so the surface, contract rows, and
     /// transports are frozen; implemented by the agent harness (m0-s12/s13).
     RunStart,
@@ -184,12 +200,13 @@ pub enum CommandName {
 }
 
 impl CommandName {
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 11;
     pub const ALL: [Self; Self::COUNT] = [
         Self::ProjectCreate,
         Self::ProjectExport,
         Self::ProjectSeedSynthetic,
         Self::ProjectOpen,
+        Self::ProjectClose,
         Self::RunStart,
         Self::RunCancel,
         Self::RunPause,
@@ -205,6 +222,7 @@ impl CommandName {
             Self::ProjectExport => "project.export",
             Self::ProjectSeedSynthetic => "project.seed-synthetic",
             Self::ProjectOpen => "project.open",
+            Self::ProjectClose => "project.close",
             Self::RunStart => "run.start",
             Self::RunCancel => "run.cancel",
             Self::RunPause => "run.pause",
@@ -365,7 +383,9 @@ pub struct LocalRuntime {
     capabilities: CapabilityRegistry,
     identity: project_ops::RuntimeIdentity,
     clock: SystemWallClock,
+    queue: std::sync::Arc<pos_sched::JobQueue>,
     open_projects: session::OpenProjects,
+    workers: Option<workers::BackgroundWorkers>,
     echo_supervisor: run_ops::EchoSupervisor,
 }
 
@@ -373,6 +393,67 @@ impl LocalRuntime {
     #[must_use]
     pub fn capability_count(&self) -> usize {
         self.capabilities.descriptors().len()
+    }
+
+    /// Starts this process's background worker pool (m1-s01/ADR-0007).
+    ///
+    /// Explicit, and taken before the runtime is shared, because a pool that
+    /// started itself on construction would make "is background work running?"
+    /// a question with no honest answer — and because a shell that cannot
+    /// start one should say so at startup rather than silently queue work
+    /// nothing will claim. Calling it twice replaces the first pool, after
+    /// stopping it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed envelope when the worker thread or its runtime cannot
+    /// start, or when the stage handlers cannot be composed.
+    pub fn start_background_workers(&mut self, config: WorkerConfig) -> Result<(), ApiError> {
+        if let Some(previous) = self.workers.take() {
+            previous.shutdown();
+        }
+        self.workers = Some(workers::BackgroundWorkers::start(
+            self.identity.device,
+            std::sync::Arc::clone(&self.queue),
+            config,
+        )?);
+        Ok(())
+    }
+
+    /// Stops the pool, waiting (bounded) for in-flight jobs. Returns whether
+    /// it stopped inside the budget; queued work is durable either way.
+    /// Idempotent, and a no-op when no pool was started.
+    pub fn shutdown_background_workers(&self) -> bool {
+        self.workers
+            .as_ref()
+            .is_none_or(workers::BackgroundWorkers::shutdown)
+    }
+
+    /// Waits, bounded, until every open project's queue is empty — the
+    /// one-shot shape: a CLI invocation that queued work runs it and exits.
+    /// A process with no pool reports the queue it is not draining rather
+    /// than claiming quiescence.
+    #[must_use]
+    pub fn drain_background_workers(&self, budget_ms: u64) -> WorkerDrainReport {
+        match self.workers.as_ref() {
+            Some(workers) => workers.drain(budget_ms),
+            None => WorkerDrainReport {
+                quiescent: false,
+                queued_remaining: 0,
+                dead_total: 0,
+                waited_ms: 0,
+                last_read_error: Some(
+                    "no background worker pool is running in this process".to_owned(),
+                ),
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn background_worker_status(&self) -> WorkerStatusReport {
+        self.workers
+            .as_ref()
+            .map_or_else(WorkerStatusReport::stopped, |workers| workers.status())
     }
 
     /// Dispatches a transport-supplied query name to its canonical JSON result.
@@ -441,13 +522,52 @@ impl LocalRuntime {
     /// The reprocess command needs the acting identity and the project the
     /// directory holds, neither of which belongs in a wire input: the actor
     /// is the session's, and the project id is a fact in the log.
+    ///
+    /// The pool is woken after the enqueue commits, so the latency of a
+    /// requeued item is the claim rather than the idle poll interval.
     fn ingest_reprocess(
         &self,
         input: &ingest_ops::IngestReprocessInput,
     ) -> Result<String, ApiError> {
         let log = project_ops::open_log(std::path::Path::new(&input.path))?;
         let project_id = ingest_ops::project_id_of(&log)?;
-        ingest_ops::ingest_reprocess(self.identity.device, self.identity.user, project_id, input)
+        let report = ingest_ops::ingest_reprocess(
+            self.identity.device,
+            self.identity.user,
+            project_id,
+            &self.queue,
+            self.workers.is_some(),
+            input,
+        )?;
+        if let Some(workers) = self.workers.as_ref() {
+            workers.wake();
+        }
+        Ok(report)
+    }
+
+    /// Opens a project into the session table and registers it with the pool.
+    ///
+    /// Registration failing fails the open: a project that is tracked but not
+    /// served would look open in `project.list` while every job queued against
+    /// it sat unclaimed — precisely the silent half-wired state this seam
+    /// exists to make impossible.
+    fn open_project(&self, input: &ProjectPathInput) -> Result<String, ApiError> {
+        let opened = self
+            .open_projects
+            .open(&self.identity, &self.clock, input)?;
+        if let Some(workers) = self.workers.as_ref() {
+            workers.register(opened.project_id, std::sync::Arc::clone(&opened.log))?;
+        }
+        Ok(opened.json)
+    }
+
+    /// Releases a project from the session table and the pool together.
+    fn close_project(&self, input: &ProjectPathInput) -> Result<String, ApiError> {
+        let (project_id, json) = self.open_projects.close(input)?;
+        if let Some(workers) = self.workers.as_ref() {
+            workers.unregister(project_id);
+        }
+        Ok(json)
     }
 
     fn dispatch_command(
@@ -468,11 +588,12 @@ impl LocalRuntime {
             Some(CommandName::ProjectSeedSynthetic) => {
                 project_ops::seed_synthetic(&self.clock, &project_ops::parse_input(input_json)?)
             }
-            Some(CommandName::ProjectOpen) => self.open_projects.open(
-                &self.identity,
-                &self.clock,
-                &project_ops::parse_input(input_json)?,
-            ),
+            Some(CommandName::ProjectOpen) => {
+                self.open_project(&project_ops::parse_input(input_json)?)
+            }
+            Some(CommandName::ProjectClose) => {
+                self.close_project(&project_ops::parse_input(input_json)?)
+            }
             Some(CommandName::ModelsPull) => {
                 gateway_ops::models_pull(&project_ops::parse_input(input_json)?)
             }
@@ -576,6 +697,7 @@ impl LocalRuntime {
             capability_trait_version: CAPABILITY_TRAIT_VERSION,
             format_version: pos_store::FORMAT_VERSION,
             open_project_count: count,
+            background_workers: self.background_worker_status(),
         })
     }
 
@@ -800,7 +922,11 @@ pub fn bootstrap_local_runtime(config: LocalBootstrapConfig) -> LocalRuntime {
         }),
         identity,
         clock: SystemWallClock,
+        queue: std::sync::Arc::new(ingest_ops::runtime_queue(identity.device)),
         open_projects: session::OpenProjects::default(),
+        // Background work starts only when a shell asks for it
+        // (`start_background_workers`); see `workers.rs`.
+        workers: None,
         echo_supervisor: run_ops::EchoSupervisor::new(config.echo),
     }
 }

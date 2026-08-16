@@ -72,6 +72,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Kept outside the async block so the pools are stopped after the listener
+    // has drained, from a thread that is not inside the runtime.
+    let state_at_exit = std::sync::Arc::clone(&state);
     let served = tokio_runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
@@ -84,6 +87,13 @@ fn main() -> ExitCode {
             .await
             .map_err(|error| format!("serve: {error}"))
     });
+    if !state_at_exit.shutdown_background_workers() {
+        eprintln!(
+            "pos-server: a background job outlived the shutdown budget; exiting anyway (nothing \
+             terminal was written, so its lease expires and the attempt is re-counted from \
+             durable facts)"
+        );
+    }
     match served {
         Ok(()) => {
             eprintln!("pos-server: shut down cleanly");

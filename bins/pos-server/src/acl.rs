@@ -42,6 +42,7 @@ pub fn audited_action(command: CommandName) -> Option<&'static str> {
     match command {
         CommandName::ProjectCreate => Some("project.create"),
         CommandName::ProjectOpen => Some("project.open"),
+        CommandName::ProjectClose => Some("project.close"),
         CommandName::RunStart => Some("run.start"),
         CommandName::RunCancel => Some("run.cancel"),
         _ => None,
@@ -78,7 +79,10 @@ pub fn authorize_command(
             authorize_path(control, data_root, account, &input.out, Access::Mutate)
         }
         // Opening is how a viewer views: read access to the named workspace.
-        CommandName::ProjectOpen => {
+        // Closing releases what opening took, so it carries the same access —
+        // a viewer that could open but not close would hold a handle and a
+        // scheduler registration it has no way to give back.
+        CommandName::ProjectOpen | CommandName::ProjectClose => {
             let input: ProjectPathInput = parse(input_json)?;
             authorize_path(control, data_root, account, &input.path, Access::Read)
         }

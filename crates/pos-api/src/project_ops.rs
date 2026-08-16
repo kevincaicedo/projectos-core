@@ -392,10 +392,13 @@ pub(crate) struct SessionOpen {
     pub template: String,
     pub format_version: u32,
     pub head_seq: u64,
+    /// The open handle, kept so the scheduler can serve this project without
+    /// opening the directory a second time (m1-s01/ADR-0007).
+    pub log: std::sync::Arc<ProjectLog>,
 }
 
 pub(crate) fn open_for_session(root: &Path) -> Result<SessionOpen, ApiError> {
-    let log = open_log(root)?;
+    let log = std::sync::Arc::new(open_log(root)?);
     let manifest = log.store().manifest().clone();
     let head = log.head().map_err(log_error)?;
     let name = read_project_name(&log, manifest.project_id)?;
@@ -405,6 +408,7 @@ pub(crate) fn open_for_session(root: &Path) -> Result<SessionOpen, ApiError> {
         template: manifest.template,
         format_version: manifest.format_version,
         head_seq: head.value(),
+        log,
     })
 }
 

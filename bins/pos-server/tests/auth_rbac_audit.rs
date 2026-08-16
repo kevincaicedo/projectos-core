@@ -842,12 +842,17 @@ fn a_viewer_cannot_invoke_mutating_commands() {
     }
     let (status, body) = api(&shell, &c, "cmd", "project.open", &path_input(&alpha));
     assert_eq!(status, 200, "viewer open refused: {body}");
+    // Closing is the other half of viewing: a viewer that could take a handle
+    // but never give it back would hold a scheduler registration forever.
+    let (status, body) = api(&shell, &c, "cmd", "project.close", &path_input(&alpha));
+    assert_eq!(status, 200, "viewer close refused: {body}");
 
     // Every mutating command in the registry: refused with `forbidden`.
     let viewer_target = format!("{}/viewer-write.pos", a.projects_root);
     for command in CommandName::ALL {
         let input = match command {
-            CommandName::ProjectOpen => continue, // read-shaped, proven above
+            // Read-shaped, both proven above.
+            CommandName::ProjectOpen | CommandName::ProjectClose => continue,
             CommandName::ProjectCreate => path_input(&viewer_target),
             CommandName::ProjectSeedSynthetic => format!(
                 "{{\"path\":{},\"eventCount\":1}}",
@@ -995,6 +1000,52 @@ fn audit_rows_exist_and_no_secret_material_is_stored() {
     assert!(
         !stored_text.contains(&token),
         "the raw session token is stored somewhere in control.db"
+    );
+}
+
+/// The server shell composes a worker pool per account runtime, and the
+/// projects each pool serves are that account's open projects — the isolation
+/// argument that keeps session state per account applies to the scheduler's
+/// registries too (m1-s01/ADR-0007).
+#[test]
+fn each_account_runtime_runs_its_own_background_workers() {
+    let shell = ServedShell::start();
+    let a = shell.signup("workers-a@example.com", "owner password 1");
+    let b = shell.signup("workers-b@example.com", "owner password 2");
+    let alpha = project_path(&a, "alpha");
+    let (status, _) = api(&shell, &a, "cmd", "project.create", &path_input(&alpha));
+    assert_eq!(status, 200);
+
+    let (status, health) = api(&shell, &a, "query", "health", "{}");
+    assert_eq!(status, 200);
+    assert!(
+        health.contains("\"running\":true"),
+        "the server shell must start a pool for an account runtime: {health}"
+    );
+    assert!(health.contains("\"registeredProjectCount\":0"), "{health}");
+
+    let (status, body) = api(&shell, &a, "cmd", "project.open", &path_input(&alpha));
+    assert_eq!(status, 200, "{body}");
+    let (_, health_a) = api(&shell, &a, "query", "health", "{}");
+    assert!(
+        health_a.contains("\"registeredProjectCount\":1"),
+        "{health_a}"
+    );
+    // B's pool never saw A's project: the registries are per runtime, and the
+    // runtime is per account.
+    let (_, health_b) = api(&shell, &b, "query", "health", "{}");
+    assert!(
+        health_b.contains("\"registeredProjectCount\":0"),
+        "{health_b}"
+    );
+
+    let (status, body) = api(&shell, &a, "cmd", "project.close", &path_input(&alpha));
+    assert_eq!(status, 200, "{body}");
+    let (_, closed) = api(&shell, &a, "query", "health", "{}");
+    assert!(closed.contains("\"registeredProjectCount\":0"), "{closed}");
+    assert!(
+        shell.state.shutdown_background_workers(),
+        "every account pool must stop inside the shutdown budget"
     );
 }
 

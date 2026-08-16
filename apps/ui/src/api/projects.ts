@@ -2,7 +2,12 @@
 // runtime bytes into the ts-rs shapes; an unrecognised payload becomes an
 // error state, never rendered content.
 
-import type { HealthReport, OpenProjectRow, ProjectListReport } from "./gen/api";
+import type {
+  HealthReport,
+  OpenProjectRow,
+  ProjectListReport,
+  WorkerStatusReport,
+} from "./gen/api";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -49,8 +54,14 @@ export function asHealthReport(value: unknown): HealthReport | null {
   if (!isRecord(value)) {
     return null;
   }
-  const { status, apiSurfaceVersion, capabilityTraitVersion, formatVersion, openProjectCount } =
-    value;
+  const {
+    status,
+    apiSurfaceVersion,
+    capabilityTraitVersion,
+    formatVersion,
+    openProjectCount,
+    backgroundWorkers,
+  } = value;
   if (
     typeof status !== "string" ||
     typeof apiSurfaceVersion !== "number" ||
@@ -60,5 +71,31 @@ export function asHealthReport(value: unknown): HealthReport | null {
   ) {
     return null;
   }
-  return { status, apiSurfaceVersion, capabilityTraitVersion, formatVersion, openProjectCount };
+  const workers = asWorkerStatusReport(backgroundWorkers);
+  if (workers === null) {
+    return null;
+  }
+  return {
+    status,
+    apiSurfaceVersion,
+    capabilityTraitVersion,
+    formatVersion,
+    openProjectCount,
+    backgroundWorkers: workers,
+  };
+}
+
+function asWorkerStatusReport(value: unknown): WorkerStatusReport | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const { running, registeredProjectCount, lastError } = value;
+  if (
+    typeof running !== "boolean" ||
+    typeof registeredProjectCount !== "number" ||
+    (lastError !== null && typeof lastError !== "string")
+  ) {
+    return null;
+  }
+  return { running, registeredProjectCount, lastError };
 }

@@ -14,10 +14,15 @@
 use clap::{Parser, Subcommand};
 use pos_api::{
     CommandName, LocalBootstrapConfig, LocalRuntime, ProjectCreateInput, ProjectExportInput,
-    ProjectPathInput, ProjectSeedInput, QueryName, bootstrap_local_runtime, input_json,
+    ProjectPathInput, ProjectSeedInput, QueryName, WORKER_DRAIN_MS_MAX_DEFAULT, WorkerConfig,
+    WorkerDrainReport, bootstrap_local_runtime, input_json,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+/// Milliseconds per second, for the `--drain-secs` budget. Seconds on the
+/// flag because that is the unit a human waiting at a terminal thinks in.
+const MS_PER_SEC: u64 = 1_000;
 
 #[derive(Parser)]
 #[command(
@@ -135,6 +140,15 @@ enum IngestCommand {
         /// an unexplained rewrite of derived state.
         #[arg(long)]
         reason: String,
+        /// Queue the work and exit without running it. The jobs stay durable
+        /// in the project and the next shell to open it claims them.
+        #[arg(long)]
+        no_drain: bool,
+        /// How long to run the queued work before giving up and saying what
+        /// is left. A one-shot invocation must terminate whatever the corpus
+        /// does, so this is a budget, not a promise.
+        #[arg(long, default_value_t = WORKER_DRAIN_MS_MAX_DEFAULT / MS_PER_SEC)]
+        drain_secs: u64,
     },
 }
 
@@ -165,14 +179,41 @@ fn main() -> ExitCode {
         eprintln!("{}", error.to_json());
         return ExitCode::FAILURE;
     }
-    let runtime = bootstrap_local_runtime(LocalBootstrapConfig::isolated(PathBuf::from("packs")));
-    match run(&runtime, cli.command) {
+    let mut runtime =
+        bootstrap_local_runtime(LocalBootstrapConfig::isolated(PathBuf::from("packs")));
+    // Only the subcommands that queue work start a pool. A `pos inspect` that
+    // spun up worker threads would pay for a scheduler to read one row, and
+    // an idle pool in a one-shot process is a lie about what is running.
+    if queues_background_work(&cli.command)
+        && let Err(error) = runtime.start_background_workers(WorkerConfig::default())
+    {
+        eprintln!("{}", error.to_json());
+        return ExitCode::FAILURE;
+    }
+    let exit = match run(&runtime, cli.command) {
         Ok(exit) => exit,
         Err(error_json) => {
             eprintln!("{error_json}");
             ExitCode::FAILURE
         }
+    };
+    if !runtime.shutdown_background_workers() {
+        eprintln!(
+            "pos: a background job outlived the shutdown budget; it was left running and its \
+             lease will expire (the work is durable and resumes on the next run)"
+        );
     }
+    exit
+}
+
+/// Whether this invocation enqueues jobs somebody has to claim.
+const fn queues_background_work(command: &CliCommand) -> bool {
+    matches!(
+        command,
+        CliCommand::Ingest {
+            command: IngestCommand::Reprocess { .. }
+        }
+    )
 }
 
 /// The one telemetry configuration key every shell reads (m0-s15).
@@ -274,10 +315,18 @@ fn run(runtime: &LocalRuntime, command: CliCommand) -> Result<ExitCode, String> 
                     evidence,
                     limit,
                     reason,
+                    no_drain,
+                    drain_secs,
                 },
         } => {
+            let path = path_text(&directory)?;
+            let project = ProjectPathInput { path: path.clone() };
+            // Open first: the pool serves the projects this process has open,
+            // so an invocation that queued work without opening the project
+            // would enqueue jobs its own workers cannot see.
+            dispatch_command(runtime, CommandName::ProjectOpen, &project)?;
             let input = pos_api::IngestReprocessInput {
-                path: path_text(&directory)?,
+                path,
                 from_stage,
                 evidence_id: evidence,
                 item_count_max: Some(limit),
@@ -285,6 +334,14 @@ fn run(runtime: &LocalRuntime, command: CliCommand) -> Result<ExitCode, String> 
             };
             let report = dispatch_command(runtime, CommandName::IngestReprocess, &input)?;
             println!("{report}");
+            if !no_drain {
+                render_drain(&runtime.drain_background_workers(drain_secs * MS_PER_SEC));
+            }
+            // Close is best-effort: the work is committed either way, and a
+            // failure here must not turn a successful reprocess into one.
+            if let Err(message) = dispatch_command(runtime, CommandName::ProjectClose, &project) {
+                eprintln!("pos ingest reprocess: closing the project failed: {message}");
+            }
             Ok(ExitCode::SUCCESS)
         }
         CliCommand::CapabilitySnapshot => {
@@ -364,6 +421,28 @@ fn dispatch_query(
     runtime
         .query_with_input(name.as_str(), &input_document)
         .map_err(|error| error.to_json())
+}
+
+/// Reports what the drain observed, on stderr — stdout stays the registry's
+/// canonical bytes for the command that was asked for. An expired budget is
+/// stated, never rounded up to success: the jobs are still durable, and the
+/// next run resumes them.
+fn render_drain(report: &WorkerDrainReport) {
+    if let Some(error) = report.last_read_error.as_deref() {
+        eprintln!("pos ingest reprocess: reading the queue failed during the drain: {error}");
+    }
+    if report.quiescent {
+        eprintln!(
+            "pos ingest reprocess: queue drained in {}ms ({} dead-lettered)",
+            report.waited_ms, report.dead_total
+        );
+    } else {
+        eprintln!(
+            "pos ingest reprocess: the {}ms drain budget expired with {} job(s) still queued; \
+             they stay durable and resume the next time this project is open",
+            report.waited_ms, report.queued_remaining
+        );
+    }
 }
 
 /// Renders the verify outcome: exit 0 only when clean, and every mismatch is

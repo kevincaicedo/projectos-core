@@ -5,4 +5,12 @@ export type IngestReprocessReport = { fromStage: string, requeued: Array<string>
  * Items that never reached the target stage, so there is nothing to
  * redo. Reported rather than counted as work (L8).
  */
-skippedNotReached: number, itemCountMax: number, truncated: boolean, };
+skippedNotReached: number, itemCountMax: number, truncated: boolean, 
+/**
+ * Whether a pool in this process will claim what was just queued
+ * (m1-s01/ADR-0007). `false` is not a failure — a server shell may queue
+ * work another process runs — but a caller must be able to tell the two
+ * apart, because "requeued 12" with nothing running looks identical to
+ * success until nothing happens.
+ */
+backgroundWorkersRunning: boolean, };

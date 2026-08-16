@@ -19,7 +19,7 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use pos_api::{
     ApiError, CommandName, EchoRuntimeOptions, FoundationClock, LocalBootstrapConfig, LocalRuntime,
-    QueryName, StreamName, UserId, WallClock, bootstrap_local_runtime,
+    QueryName, StreamName, UserId, WallClock, WorkerConfig, bootstrap_local_runtime,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -113,13 +113,36 @@ impl ServerState {
                 retriable: true,
             });
         }
-        let runtime = Arc::new(bootstrap_local_runtime(
+        let mut runtime = bootstrap_local_runtime(
             LocalBootstrapConfig::isolated(self.data_root.join("packs"))
                 .with_user(UserId::from_bytes(account))
                 .with_echo(self.echo.clone()),
-        ));
+        );
+        // Each account's runtime claims its own account's jobs. Per account
+        // rather than per process because the registries are per runtime and
+        // an account's project handles must not be reachable from another's —
+        // the same isolation argument as the session table (m0-s08).
+        runtime.start_background_workers(WorkerConfig::default())?;
+        let runtime = Arc::new(runtime);
         runtimes.insert(account, Arc::clone(&runtime));
         Ok(runtime)
+    }
+
+    /// Stops every account's worker pool. Called after the listener drains, so
+    /// a job mid-handler finishes instead of being cut at process exit.
+    pub fn shutdown_background_workers(&self) -> bool {
+        let runtimes = match self.runtimes.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Collected first, deliberately: `all` short-circuits, and every
+        // account's pool must be asked to stop even after one misses its
+        // budget.
+        let stopped: Vec<bool> = runtimes
+            .values()
+            .map(|runtime| runtime.shutdown_background_workers())
+            .collect();
+        stopped.into_iter().all(|stopped| stopped)
     }
 }
 

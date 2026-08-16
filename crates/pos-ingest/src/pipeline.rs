@@ -725,6 +725,40 @@ pub fn stage_registry_default() -> StageRegistry {
         .with(Arc::new(crate::chunk::ChunkStage::new()))
 }
 
+/// Every registered stage as a `pos-sched` handler, ready for a pool's
+/// handler registry.
+///
+/// The composition lives here rather than in each shell because "which stages
+/// can this process run?" must have exactly one answer per build (L12). A
+/// shell that assembled its own subset would make background work a
+/// per-surface behaviour, which is the drift [`StageRegistry`] exists to
+/// prevent.
+///
+/// # Errors
+///
+/// Refuses if a registered stage has no job kind — only [`IngestStage::Raw`],
+/// which is not a job by construction and cannot be in a stage registry.
+pub fn stage_job_handlers(
+    pipeline: &Arc<IngestPipeline>,
+    projects: &Arc<ProjectRegistry>,
+    clock: &Arc<dyn WallClock>,
+) -> Result<Vec<Arc<dyn JobHandler>>, IngestError> {
+    pipeline
+        .stages()
+        .stages()
+        .into_iter()
+        .map(|stage| {
+            StageJobHandler::new(
+                stage,
+                Arc::clone(pipeline),
+                Arc::clone(projects),
+                Arc::clone(clock),
+            )
+            .map(|handler| Arc::new(handler) as Arc<dyn JobHandler>)
+        })
+        .collect()
+}
+
 /// The `pos-sched` adapter: one handler per stage job kind, resolving the
 /// project from the registry the pool already keeps.
 pub struct StageJobHandler {

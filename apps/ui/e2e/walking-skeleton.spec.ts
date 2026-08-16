@@ -120,6 +120,7 @@ const HEALTH = JSON.stringify({
   capabilityTraitVersion: 1,
   formatVersion: 1,
   openProjectCount: 1,
+  backgroundWorkers: { running: true, registeredProjectCount: 1, lastError: null },
 });
 
 const EMPTY_LIST = JSON.stringify({ projects: [], openProjectCountMax: 64 });

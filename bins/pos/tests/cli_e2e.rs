@@ -163,6 +163,63 @@ fn open_and_inspect_report_the_same_healthy_project() {
     assert!(inspected.contains("\"headSeq\":1"));
 }
 
+/// A one-shot `pos` invocation that queues work runs it and exits (m1-s01/
+/// ADR-0007). The CLI is not a daemon: it starts a pool, drains to quiescence
+/// inside a stated budget, reports what it did on stderr, and terminates —
+/// no hung process, and no queued work left behind without saying so.
+///
+/// The project here has no Evidence yet (submission is m1-s07's surface), so
+/// this asserts the *lifecycle*: a pool exists, the report says so, the drain
+/// reaches quiescence, and the process exits.
+#[test]
+fn a_one_shot_reprocess_starts_a_pool_drains_and_exits() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let project = path_text(&directory.path().join("drain.pos"));
+    expect_success(&["create", &project]);
+
+    let output = pos(&[
+        "ingest",
+        "reprocess",
+        &project,
+        "--from-stage",
+        "chunk",
+        "--reason",
+        "cli lifecycle e2e",
+        "--drain-secs",
+        "10",
+    ]);
+    let stdout = String::from_utf8(output.stdout).expect("pos output is UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stderr}");
+    // stdout is the registry's canonical bytes for the command that was asked
+    // for; the drain summary is stderr, so piping stays machine-readable.
+    assert!(stdout.contains("\"requeuedCount\":0"), "{stdout}");
+    assert!(
+        stdout.contains("\"backgroundWorkersRunning\":true"),
+        "the CLI must run what it queues: {stdout}"
+    );
+    assert!(
+        stderr.contains("queue drained in"),
+        "the drain must be reported: {stderr}"
+    );
+
+    // `--no-drain` is the deliberate opposite: queue and exit, for a machine
+    // whose long-running shell will claim the work.
+    let output = pos(&[
+        "ingest",
+        "reprocess",
+        &project,
+        "--from-stage",
+        "chunk",
+        "--reason",
+        "cli lifecycle e2e",
+        "--no-drain",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("queue drained in"), "{stderr}");
+}
+
 #[test]
 fn export_refuses_an_existing_destination() {
     let directory = tempfile::tempdir().expect("tempdir");

@@ -173,6 +173,12 @@ pub struct IngestReprocessReport {
     pub skipped_not_reached: u32,
     pub item_count_max: u32,
     pub truncated: bool,
+    /// Whether a pool in this process will claim what was just queued
+    /// (m1-s01/ADR-0007). `false` is not a failure — a server shell may queue
+    /// work another process runs — but a caller must be able to tell the two
+    /// apart, because "requeued 12" with nothing running looks identical to
+    /// success until nothing happens.
+    pub background_workers_running: bool,
 }
 
 /// `evidence.list` — the browser and source-coverage read.
@@ -222,10 +228,16 @@ pub fn source_health(input: &SourceHealthInput) -> Result<String, ApiError> {
 }
 
 /// `ingest.reprocess` — re-run the pipeline from a stage, never re-fetch.
+///
+/// The queue is the runtime's own, shared with the worker pool, so the enqueue
+/// this command commits and the claim that follows it are counted by one set
+/// of metrics rather than by two that cannot be compared.
 pub fn ingest_reprocess(
     identity_device: DeviceId,
     identity_user: UserId,
     project_id: ProjectId,
+    queue: &Arc<JobQueue>,
+    background_workers_running: bool,
     input: &IngestReprocessInput,
 ) -> Result<String, ApiError> {
     let from_stage = IngestStage::parse(&input.from_stage).ok_or_else(|| ApiError {
@@ -239,13 +251,12 @@ pub fn ingest_reprocess(
     let evidence_id =
         parse_optional_id(input.evidence_id.as_deref(), "evidenceId")?.map(EvidenceId::from_bytes);
     let log = project_ops::open_log(std::path::Path::new(&input.path))?;
-    let queue = ingest_queue(identity_device);
     queue
         .ensure_schema(&log)
         .map_err(|error| sched_error(&error))?;
     let pipeline = IngestPipeline::new(
         PipelineConfig::for_device(identity_device),
-        Arc::new(queue),
+        Arc::clone(queue),
         stage_registry_default(),
     );
     let request = ReprocessRequest {
@@ -277,7 +288,23 @@ pub fn ingest_reprocess(
         skipped_not_reached: plan.skipped_not_reached,
         item_count_max: plan.item_count_max,
         truncated: plan.is_truncated(),
+        background_workers_running,
     })
+}
+
+/// The queue one runtime process appends and claims through. Built once per
+/// runtime so the pool, the reprocess command, and the metrics snapshot are
+/// all talking about the same queue.
+pub(crate) fn runtime_queue(device: DeviceId) -> JobQueue {
+    JobQueue::new(
+        QueueConfig {
+            device,
+            backoff: BackoffPolicy::default(),
+            lease_ttl_ms: pos_sched::SCHED_LEASE_TTL_MS_DEFAULT,
+        },
+        Arc::new(SplitMixJitter::from_os_entropy()),
+        Arc::new(SchedulerMetrics::default()),
+    )
 }
 
 fn evidence_row(
@@ -341,21 +368,6 @@ fn source_health_row(record: &SourceHealthRecord) -> SourceHealthRow {
         last_error_code: record.last_error_code.clone(),
         cost_feature: record.stage.cost_feature().to_owned(),
     }
-}
-
-/// A queue for the API's own appends. The read paths never append, and the
-/// reprocess path appends through the same derived-id discipline every other
-/// enqueue uses.
-fn ingest_queue(device: DeviceId) -> JobQueue {
-    JobQueue::new(
-        QueueConfig {
-            device,
-            backoff: BackoffPolicy::default(),
-            lease_ttl_ms: pos_sched::SCHED_LEASE_TTL_MS_DEFAULT,
-        },
-        Arc::new(SplitMixJitter::from_os_entropy()),
-        Arc::new(SchedulerMetrics::default()),
-    )
 }
 
 fn parse_optional<T>(

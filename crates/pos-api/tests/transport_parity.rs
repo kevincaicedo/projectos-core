@@ -131,6 +131,14 @@ fn project_rows(directory: &tempfile::TempDir) -> Vec<(&'static str, String, boo
             input_json(&ProjectPathInput { path: path.clone() }).expect("input serializes"),
             true,
         ),
+        // Close follows open in this list, and the ordering matters: the rows
+        // are dispatched in sequence, so a close of a project the session
+        // never opened would be a typed refusal rather than a parity row.
+        (
+            CommandName::ProjectClose.as_str(),
+            input_json(&ProjectPathInput { path: path.clone() }).expect("input serializes"),
+            true,
+        ),
         (
             QueryName::ProjectInspect.as_str(),
             input_json(&ProjectPathInput { path: path.clone() }).expect("input serializes"),
@@ -521,7 +529,7 @@ fn the_session_surface_reports_real_open_state() {
     ipc_command(
         &runtime,
         CommandName::ProjectOpen.as_str(),
-        &input_json(&ProjectPathInput { path }).expect("input serializes"),
+        &input_json(&ProjectPathInput { path: path.clone() }).expect("input serializes"),
     )
     .expect("reopen resolves");
     let ipc_list =
@@ -532,6 +540,32 @@ fn the_session_surface_reports_real_open_state() {
     assert_eq!(ipc_list.matches("\"projectId\"").count(), 1);
     let health = ipc_query(&runtime, QueryName::Health.as_str(), "{}").expect("health resolves");
     assert!(health.contains("\"openProjectCount\":1"));
+    // This runtime was never asked to start a pool, and it says so rather than
+    // implying that queued work is being claimed (m1-s01/ADR-0007).
+    assert!(
+        health.contains("\"backgroundWorkers\":{\"running\":false,\"registeredProjectCount\":0"),
+        "health must report worker state honestly: {health}"
+    );
+
+    let closed = ipc_command(
+        &runtime,
+        CommandName::ProjectClose.as_str(),
+        &input_json(&ProjectPathInput { path: path.clone() }).expect("input serializes"),
+    )
+    .expect("close resolves");
+    assert!(closed.contains("\"openProjectCount\":0"));
+    let closed_list =
+        ipc_query(&runtime, QueryName::ProjectList.as_str(), "{}").expect("project.list resolves");
+    assert!(closed_list.contains("\"projects\":[]"));
+    // Closing twice is a typed refusal, not a second success: a shell that
+    // believed it released a handle it never held would leak one per switch.
+    let error = ipc_command(
+        &runtime,
+        CommandName::ProjectClose.as_str(),
+        &input_json(&ProjectPathInput { path }).expect("input serializes"),
+    )
+    .expect_err("closing an already-closed project must refuse");
+    assert!(error.contains("\"code\":\"not_open\""), "{error}");
 }
 
 /// The project operations against ONE project: every read dispatched through
