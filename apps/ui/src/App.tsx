@@ -11,6 +11,7 @@ import { apiCommand } from "./api/transport";
 import { Palette } from "./palette/Palette";
 import { paletteCommands, type PaletteActions } from "./palette/registry";
 import { useEchoRun } from "./runs/useEchoRun";
+import { useIntake } from "./screens/useIntake";
 import { useSourceHealth } from "./screens/useSourceHealth";
 import { useTranscript } from "./screens/useTranscript";
 import { dispatchQueryNotice, runFeedNotice, type SeamNotice } from "./screens/seam";
@@ -51,6 +52,14 @@ export function App() {
     projects.refetch();
     health.refetch();
   }, [projects, health]);
+  // An import changes what the pipeline is working on, so the panels that
+  // read that state re-read rather than keeping their own copy (L1).
+  const reconcileIngest = useCallback(() => {
+    sourceHealth.refresh();
+    transcript.refresh();
+    health.refetch();
+  }, [sourceHealth, transcript, health]);
+  const intake = useIntake(selected?.path ?? null, reconcileIngest);
   // The launch-restore effect runs once and must not re-subscribe whenever
   // the query hooks re-create their callbacks; a ref keeps it stable.
   const reconcileRef = useRef(reconcile);
@@ -175,6 +184,7 @@ export function App() {
         echoRun={echoRun}
         sourceHealth={sourceHealth}
         transcript={transcript}
+        intake={intake}
       />
       <div className="dock-placeholder" title="The voice dock arrives with M2" aria-hidden="true">
         ◦

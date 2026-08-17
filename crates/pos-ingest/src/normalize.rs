@@ -13,12 +13,11 @@
 //!
 //! ## What this stage does not do yet
 //!
-//! Caption files (VTT/SRT) arrive with the upload types in m1-s07, and audio
-//! decoding is m1-s03's; both refuse typed and name their owner rather than
-//! guessing. Connector payloads (`MediaKind::Structured`) normalize through
-//! the connector's own `normalize()` once the m1-s06 contract exists; until
-//! then a record-per-blank-line reading exercises the thread and message
-//! chunkers with real bytes.
+//! Connector payloads (`MediaKind::Structured`) normalize through the
+//! connector's own `normalize()` once the m1-s06 contract exists; until then
+//! a record-per-blank-line reading exercises the thread and message chunkers
+//! with real bytes. Caption files take [`crate::captions`], which produces
+//! the transcript shape TRANSCRIBE produces for audio.
 
 use crate::IngestError;
 use crate::pipeline::{StageContext, StageFailure, StageHandler, StageProduct};
@@ -66,10 +65,12 @@ impl StageHandler for NormalizeStage {
             // Storable and citable, not readable as text. Honest zero chunks
             // beats a fabricated extraction.
             MediaKind::Opaque => empty_output(context, evidence.shape).map_err(StageFailure::from),
-            MediaKind::Captions => Err(StageFailure::permanent(
-                "media_not_supported",
-                "caption files (VTT/SRT) are decoded by m1-s07's upload types",
-            )),
+            // Already-transcribed speech: the words and their timings are in
+            // the file, so this stage produces the same transcript shape
+            // TRANSCRIBE would, without a decoder or a model (m1-s07).
+            MediaKind::Captions => {
+                crate::captions::normalize_captions(context).map_err(StageFailure::from)
+            }
             MediaKind::PlainText | MediaKind::Markdown | MediaKind::Csv | MediaKind::Structured => {
                 let rule = match evidence.media_kind {
                     MediaKind::Csv => RecordRule::CsvRecord,

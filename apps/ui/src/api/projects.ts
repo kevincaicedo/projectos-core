@@ -4,6 +4,7 @@
 
 import type {
   HealthReport,
+  IngestBufferReport,
   OpenProjectRow,
   ProjectListReport,
   WorkerStatusReport,
@@ -61,6 +62,7 @@ export function asHealthReport(value: unknown): HealthReport | null {
     formatVersion,
     openProjectCount,
     backgroundWorkers,
+    ingestBuffers,
   } = value;
   if (
     typeof status !== "string" ||
@@ -72,7 +74,8 @@ export function asHealthReport(value: unknown): HealthReport | null {
     return null;
   }
   const workers = asWorkerStatusReport(backgroundWorkers);
-  if (workers === null) {
+  const buffers = asIngestBufferReport(ingestBuffers);
+  if (workers === null || buffers === null) {
     return null;
   }
   return {
@@ -82,7 +85,25 @@ export function asHealthReport(value: unknown): HealthReport | null {
     formatVersion,
     openProjectCount,
     backgroundWorkers: workers,
+    ingestBuffers: buffers,
   };
+}
+
+/// What the ingestion buffers cost (m1-s07, ADR-0008 bound 1). Read here so
+/// a shell can show the number rather than assert the property.
+function asIngestBufferReport(value: unknown): IngestBufferReport | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const { residentBytes, peakBytes, pipelineBytesMax } = value;
+  if (
+    typeof residentBytes !== "number" ||
+    typeof peakBytes !== "number" ||
+    typeof pipelineBytesMax !== "number"
+  ) {
+    return null;
+  }
+  return { residentBytes, peakBytes, pipelineBytesMax };
 }
 
 function asWorkerStatusReport(value: unknown): WorkerStatusReport | null {

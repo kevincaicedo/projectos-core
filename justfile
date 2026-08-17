@@ -215,7 +215,25 @@ bench-build: node-version-check
 
 # One scenario, for iterating: `just bench-one project-open1m`.
 bench-one scenario:
-    ./target/release/pos-bench run --scenario {{scenario}} --out ../docs/gates/m0
+    ./target/release/pos-bench run --scenario {{scenario}}
+
+# The M1 gate campaign (m1-s07 opened the intake path both rows drive through).
+#
+# `bench-m1-buffers` writes ~8.3 GiB of dataset into `target/bench-data` and
+# ingests it, twice over: budget the disk before starting it.
+# `bench-m1-transcribe` needs whisper-small pulled (`pos models pull`) and a
+# real recording; the artifact records the derived evidence id and the
+# duration, never the path, because the recording is gitignored.
+bench-m1: bench-m1-buffers
+    @echo "bench-m1: run `just bench-m1-transcribe <audio>` with a real recording"
+
+bench-m1-buffers: bench-build
+    ./target/release/pos-bench run --scenario ingest-buffers8gb --replicates 3
+
+bench-m1-transcribe audio replicates="3": bench-build
+    POS_MODELS_DIR=models/pulled \
+      ./target/release/pos-bench run --scenario transcribe-realtime \
+      --audio {{audio}} --replicates {{replicates}}
 
 # Emits the docs/reference-machines.md fingerprint for the current host. Run on
 # each binding machine and paste the output into its registry row (m0-s02).

@@ -16,10 +16,10 @@ use crate::gateway_ops::{
 };
 use crate::ingest_ops::{
     EvidenceListInput, EvidenceListReport, EvidenceRow, EvidenceStageRow, IngestReprocessInput,
-    IngestReprocessReport, SourceHealthInput, SourceHealthReport, SourceHealthRow,
-    TranscriptCorrectInput, TranscriptEditReport, TranscriptGetInput, TranscriptReport,
-    TranscriptSegmentRow, TranscriptSpeakerAssignInput, TranscriptSpeakerNameInput,
-    TranscriptSpeakerRow,
+    IngestReprocessReport, IngestSubmitInput, IngestSubmitReport, IngestSubmitRow,
+    SourceHealthInput, SourceHealthReport, SourceHealthRow, TranscriptCorrectInput,
+    TranscriptEditReport, TranscriptGetInput, TranscriptReport, TranscriptSegmentRow,
+    TranscriptSpeakerAssignInput, TranscriptSpeakerNameInput, TranscriptSpeakerRow,
 };
 use crate::project_ops::{
     ProjectCreateInput, ProjectCreateReport, ProjectExportInput, ProjectExportReport,
@@ -32,7 +32,9 @@ use crate::run_ops::{
     RunToolGrantModeWire, RunWorker,
 };
 use crate::sched_ops::{CronPreviewInput, CronPreviewReport, JobListInput, JobListReport, JobRow};
-use crate::session::{HealthReport, OpenProjectRow, ProjectCloseReport, ProjectListReport};
+use crate::session::{
+    HealthReport, IngestBufferReport, OpenProjectRow, ProjectCloseReport, ProjectListReport,
+};
 use crate::stream::{SSE_RETRY_MS, STREAM_RESUME_WINDOW_LEN};
 use crate::workers::WorkerStatusReport;
 use crate::{API_SURFACE_VERSION, ApiError, CommandName, QueryName, StreamName};
@@ -60,6 +62,7 @@ macro_rules! for_each_exported_type {
             ProjectListReport,
             ProjectCloseReport,
             WorkerStatusReport,
+            IngestBufferReport,
             HealthReport,
             CostRollupInput,
             CostRollupRow,
@@ -92,6 +95,9 @@ macro_rules! for_each_exported_type {
             SourceHealthInput,
             SourceHealthRow,
             SourceHealthReport,
+            IngestSubmitInput,
+            IngestSubmitRow,
+            IngestSubmitReport,
             IngestReprocessInput,
             IngestReprocessReport,
             TranscriptGetInput,

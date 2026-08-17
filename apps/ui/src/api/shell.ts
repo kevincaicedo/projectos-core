@@ -65,6 +65,62 @@ export async function pickProjectDirectory(purpose: "create" | "open"): Promise<
   }
 }
 
+/// Opens the native file picker for ingestion (m1-s07). Returns the chosen
+/// paths — the desktop shell hands the core a path and the core streams the
+/// file, so a four-gigabyte recording never passes through the webview.
+/// Empty on web, where the browser has bytes rather than paths.
+export async function pickFilesToIngest(): Promise<readonly string[]> {
+  const dialog = desktopDialog();
+  if (dialog === null) {
+    return [];
+  }
+  try {
+    const selected = await dialog.open({
+      directory: false,
+      multiple: true,
+      title: "Choose recordings, notes, or transcripts to ingest",
+    });
+    if (typeof selected === "string") {
+      return [selected];
+    }
+    if (Array.isArray(selected)) {
+      return selected.filter((entry): entry is string => typeof entry === "string");
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+/// Subscribes to the native window's file drops. Returns an unsubscribe
+/// function; a no-op on web, where the browser's own drop event carries the
+/// bytes and `apiUpload` sends them.
+export function onFilesDropped(handler: (paths: readonly string[]) => void): () => void {
+  const listen = desktopEvent();
+  if (listen === null) {
+    return () => undefined;
+  }
+  let disposed = false;
+  let unlisten: (() => void) | null = null;
+  void listen<unknown>("tauri://drag-drop", (event) => {
+    const payload = event.payload;
+    if (!isRecord(payload) || !Array.isArray(payload.paths)) {
+      return;
+    }
+    handler(payload.paths.filter((entry): entry is string => typeof entry === "string"));
+  }).then((dispose) => {
+    if (disposed) {
+      dispose();
+    } else {
+      unlisten = dispose;
+    }
+  });
+  return () => {
+    disposed = true;
+    unlisten?.();
+  };
+}
+
 /// Subscribes to native menu selections so the menu and the palette drive
 /// one code path. Returns an unsubscribe function; a no-op on web.
 export function onShellCommand(handler: (id: string) => void): () => void {

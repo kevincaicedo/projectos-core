@@ -27,6 +27,17 @@ use tokio_stream::wrappers::ReceiverStream;
 /// the store — so anything above this cap is a defect or an attack (L8).
 pub const API_HTTP_BODY_BYTES_MAX: usize = 1024 * 1024;
 
+/// Bytes one upload request may carry. The same bound intake states for a
+/// file on disk, because a browser upload and a desktop drag-drop must accept
+/// the same corpus — a limit that depended on which shell you happened to use
+/// would be exactly the parity failure L12 forbids.
+pub const UPLOAD_BYTES_MAX: u64 = pos_ingest::INTAKE_FILE_BYTES_MAX;
+
+/// Where the upload route parks a request body while it streams. Defaults to
+/// the OS temp directory; a deployment whose temp filesystem is small or
+/// memory-backed points this somewhere with room.
+pub const UPLOAD_STAGING_DIR_ENV: &str = "POS_UPLOAD_STAGING_DIR";
+
 /// Builds the API router over the shared registry. `pos-server` (m0-s08)
 /// layers auth, static assets, and the control plane around this.
 pub fn router(runtime: Arc<LocalRuntime>) -> Router {
@@ -35,6 +46,15 @@ pub fn router(runtime: Arc<LocalRuntime>) -> Router {
         .route("/api/query/{name}", get(dispatch_query))
         .route("/api/stream/{name}", get(dispatch_stream))
         .layer(DefaultBodyLimit::max(API_HTTP_BODY_BYTES_MAX))
+        // Added *after* the body-limit layer, so it is not covered by it: a
+        // recording is gigabytes and a command input is kilobytes, and one
+        // cap for both would mean choosing which of the two to get wrong.
+        // The upload route states its own bound and counts it while
+        // streaming, so nothing is ever buffered to find out how big it was.
+        .route(
+            "/api/upload/{name}",
+            post(dispatch_upload).layer(DefaultBodyLimit::disable()),
+        )
         .with_state(runtime)
 }
 
@@ -65,6 +85,9 @@ pub fn status_for_error_code(code: &str) -> StatusCode {
             StatusCode::NOT_FOUND
         }
         "invalid_input" => StatusCode::BAD_REQUEST,
+        // The upload route's own bound, refused mid-stream rather than after
+        // the body is resident (m1-s07).
+        "limit_exceeded" => StatusCode::PAYLOAD_TOO_LARGE,
         "unauthenticated" => StatusCode::UNAUTHORIZED,
         "forbidden" => StatusCode::FORBIDDEN,
         "already_exists" | "open_project_limit" | "resume_window_exceeded" | "state_mutated" => {
@@ -115,6 +138,124 @@ async fn dispatch_stream(
         .map(str::to_owned)
         .or(params.from);
     respond_stream(runtime, name, params.input, last_event_id).await
+}
+
+async fn dispatch_upload(
+    Path(name): Path<String>,
+    Query(params): Query<ReadParams>,
+    State(runtime): State<Arc<LocalRuntime>>,
+    body: Body,
+) -> Response {
+    respond_upload(runtime, name, params.input, body).await
+}
+
+/// The one HTTP rendering of an upload: stream the body to a file this
+/// transport owns, then dispatch the named command against it.
+///
+/// The transport never looks inside `input_json`. It carries bytes and a
+/// name, exactly as every other route does; the only difference is that here
+/// "bytes" means the request body instead of a JSON document (L12).
+pub async fn respond_upload(
+    runtime: Arc<LocalRuntime>,
+    name: String,
+    input_json: Option<String>,
+    body: Body,
+) -> Response {
+    let Some(input_json) = input_json else {
+        return error_response(&ApiError {
+            code: "invalid_input",
+            message: "an upload carries its typed input in the `input` query parameter".to_owned(),
+            retriable: false,
+        });
+    };
+    let staged = match StagedUpload::create().await {
+        Ok(staged) => staged,
+        Err(error) => return error_response(&error),
+    };
+    if let Err(error) = staged.write_body(body).await {
+        return error_response(&error);
+    }
+    let path = staged.path().to_path_buf();
+    let outcome =
+        run_blocking(move || runtime.command_with_upload(&name, &input_json, &path)).await;
+    // The staging file is dropped here, whether the command succeeded or not:
+    // the CAS already holds whatever was accepted, and a temp file that
+    // outlived its request would be user content sitting outside the project
+    // directory the user owns (L4).
+    drop(staged);
+    json_response(outcome)
+}
+
+/// A request body parked on disk for exactly as long as one dispatch takes.
+struct StagedUpload {
+    path: tempfile::TempPath,
+}
+
+impl StagedUpload {
+    async fn create() -> Result<Self, ApiError> {
+        let directory = std::env::var_os(UPLOAD_STAGING_DIR_ENV)
+            .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+        let file = tempfile::Builder::new()
+            .prefix("pos-upload-")
+            .tempfile_in(&directory)
+            .map_err(|error| ApiError {
+                code: "storage_failure",
+                message: format!(
+                    "staging an upload in {} failed: {error}",
+                    directory.display()
+                ),
+                retriable: true,
+            })?;
+        Ok(Self {
+            path: file.into_temp_path(),
+        })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Streams the body through, counting as it goes. Nothing is buffered to
+    /// discover the size: the refusal happens at the byte that crosses the
+    /// bound, which is what makes the cap real at sixteen gibibytes (L8).
+    async fn write_body(&self, body: Body) -> Result<(), ApiError> {
+        use tokio::io::AsyncWriteExt;
+        use tokio_stream::StreamExt;
+        let mut file = tokio::fs::File::create(self.path())
+            .await
+            .map_err(|error| storage_failure("open the upload staging file", &error))?;
+        let mut stream = body.into_data_stream();
+        let mut written = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| ApiError {
+                code: "invalid_input",
+                message: format!("the upload body ended early: {error}"),
+                retriable: true,
+            })?;
+            written = written.saturating_add(chunk.len() as u64);
+            if written > UPLOAD_BYTES_MAX {
+                return Err(ApiError {
+                    code: "limit_exceeded",
+                    message: format!("an upload is at most {UPLOAD_BYTES_MAX} bytes"),
+                    retriable: false,
+                });
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| storage_failure("write the upload staging file", &error))?;
+        }
+        file.flush()
+            .await
+            .map_err(|error| storage_failure("flush the upload staging file", &error))
+    }
+}
+
+fn storage_failure(operation: &'static str, error: &std::io::Error) -> ApiError {
+    ApiError {
+        code: "storage_failure",
+        message: format!("{operation}: {error}"),
+        retriable: true,
+    }
 }
 
 /// Builds the one HTTP rendering of a command dispatch. Public so the

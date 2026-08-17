@@ -6,11 +6,13 @@
 import type { OpenProjectRow } from "../api/gen/api";
 import type { QueryView } from "../api/query";
 import { CapabilityRegistryView } from "../CapabilityRegistryView";
+import { IntakePanel } from "./IntakePanel";
 import { ProjectActions } from "./ProjectActions";
 import type { SeamNotice } from "./seam";
 import { SourceHealthPanel } from "./SourceHealthPanel";
 import type { SourceHealthController } from "./useSourceHealth";
 import { TranscriptPanel } from "./TranscriptPanel";
+import type { IntakeController } from "./useIntake";
 import type { TranscriptController } from "./useTranscript";
 import { RunFeedPanel } from "../runs/RunFeedPanel";
 import type { EchoRunController } from "../runs/useEchoRun";
@@ -24,6 +26,7 @@ interface HomeScreenProps {
   readonly echoRun: EchoRunController;
   readonly sourceHealth: SourceHealthController;
   readonly transcript: TranscriptController;
+  readonly intake: IntakeController;
 }
 
 export function HomeScreen({
@@ -35,6 +38,7 @@ export function HomeScreen({
   echoRun,
   sourceHealth,
   transcript,
+  intake,
 }: HomeScreenProps) {
   return (
     <main className="stage">
@@ -57,6 +61,7 @@ export function HomeScreen({
         <ProjectHome project={selected} />
       )}
 
+      <IntakePanel projectSelected={selected !== null} controller={intake} />
       <SourceHealthPanel projectSelected={selected !== null} controller={sourceHealth} />
       <TranscriptPanel projectSelected={selected !== null} controller={transcript} />
       <RunFeedPanel project={selected} controller={echoRun} />

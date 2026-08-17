@@ -1,25 +1,28 @@
-//! The m1-s01/m1-s02 surface slice: evidence and stage reads, per-source
-//! health, and the reprocess command.
+//! The ingest surface slice: evidence and stage reads, per-source health,
+//! the reprocess command, and — since m1-s07 — the intake command that puts
+//! bytes into a project in the first place.
 //!
-//! Three entries, and the split is deliberate. `evidence.list` and
-//! `source.health` are what the browser and the source settings screen read;
-//! `ingest.reprocess` is the one write, because re-running the pipeline is a
-//! decision a human makes. Submission is *not* here: uploads and watch
-//! folders are m1-s07's surface, and registering a half-designed intake
-//! command now would freeze the wrong shape.
+//! `evidence.list` and `source.health` are what the browser and the source
+//! settings screen read. `ingest.reprocess` re-runs the pipeline, because
+//! that is a decision a human makes. `ingest.submit` is the front door: a
+//! drag-drop, a file picker, a folder import, and both `pos-bench` gate
+//! scenarios all arrive here, which is the point — a gate that measured a
+//! private fast path would be measuring something no user can do.
 
 use crate::ApiError;
 use crate::ingest_runtime;
 use crate::project_ops;
 use pos_domain::{
     DomainEvent, EVIDENCE_LIST_ROW_COUNT_MAX, EvidenceListFilter, EvidenceReadError,
-    EvidenceRecord, EvidenceStatus, IngestStage, SourceHealthRecord, StageRecord,
+    EvidenceRecord, EvidenceStatus, ExternalRef, IngestStage, SourceHealthRecord, StageRecord,
     TRANSCRIPT_SPEAKER_COUNT_MAX, TRANSCRIPT_SPEAKER_NAME_CHARS_MAX,
     TranscriptSegmentSpeakerSetBody, TranscriptSpeakerNamedBody, TranscriptTextCorrectedBody,
     list_evidence, list_source_health, list_stages, list_transcript_segments,
     list_transcript_speakers, read_evidence,
 };
-use pos_foundation::{DeviceId, EvidenceId, ProjectId, SourceId, SystemWallClock, UserId};
+use pos_foundation::{
+    DeviceId, EvidenceId, ProjectId, SourceId, SystemWallClock, UserId, WallClock,
+};
 use pos_ingest::{IngestError, IngestPipeline, PipelineConfig, ReprocessRequest, StageRegistry};
 use pos_log::{Actor, ProjectLog};
 use pos_sched::{BackoffPolicy, JobQueue, QueueConfig, SchedulerMetrics, SplitMixJitter};
@@ -257,6 +260,78 @@ pub struct IngestReprocessInput {
     /// Why, recorded on the event. A reprocess with no stated reason is an
     /// unexplained rewrite of derived state.
     pub reason: String,
+}
+
+/// `ingest.submit` — a file, or a folder of files, becomes Evidence.
+///
+/// Two ways to say where the bytes are, and exactly one of them per call:
+/// `filePath` names something on the machine the runtime is running on
+/// (desktop drag-drop, the CLI, `pos-bench`), and *no* `filePath` means the
+/// bytes rode in with the call itself over the upload route a browser uses.
+/// Naming both is a caller bug, not a preference to resolve.
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct IngestSubmitInput {
+    pub path: String,
+    /// A file or a directory. A directory is walked, bounded and ordered.
+    #[serde(default)]
+    pub file_path: Option<String>,
+    /// What to call the item. For an upload that carries its bytes this is
+    /// the browser's file name; for a `filePath` call it overrides the name
+    /// on disk. Rendered as text, never used as a path (L6).
+    #[serde(default)]
+    pub file_name: Option<String>,
+    /// The selection inside the upload connector these items belong to, so a
+    /// watch folder and a drag-drop can be told apart on the source-health
+    /// card. Defaults to [`UPLOAD_SOURCE_SCOPE_DEFAULT`].
+    #[serde(default)]
+    pub source_scope: Option<String>,
+}
+
+/// What one file's intake decided.
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestSubmitRow {
+    /// The file's own name, echoed as data so a batch report is readable.
+    /// Never the full path: a report is rendered and shared, and the rest of
+    /// the path is the user's filesystem, not the project's evidence.
+    pub file_name: String,
+    pub evidence_id: Option<String>,
+    /// What the sniffer decided the bytes are — content, never extension.
+    pub media_kind: Option<String>,
+    #[ts(type = "number")]
+    pub byte_size: u64,
+    /// `added`, `duplicate`, or `refused`.
+    pub outcome: String,
+    pub refused_code: Option<String>,
+    pub refused_detail: Option<String>,
+}
+
+/// The batch summary. Counts are complete; [`IngestSubmitReport::items`] is
+/// bounded, and says so.
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestSubmitReport {
+    pub source_id: String,
+    pub added_count: u32,
+    /// Files whose exact bytes are already in this project. Not an error and
+    /// not silence: re-dropping a file a partner already imported is the most
+    /// common thing that happens to this command, and it must read as "you
+    /// already have this" rather than as success or as failure.
+    pub duplicate_count: u32,
+    pub refused_count: u32,
+    /// Entries the walk excluded by its own rules — dot-files, symlinks,
+    /// nested projects.
+    pub skipped_count: u32,
+    /// Whether the walk stopped at [`pos_ingest::INTAKE_FILE_COUNT_MAX`] or
+    /// [`pos_ingest::INTAKE_DEPTH_MAX`] short of the whole tree.
+    pub truncated: bool,
+    pub items: Vec<IngestSubmitRow>,
+    /// The row bound this answer honoured, in-band so a caller can tell a
+    /// full report from a trimmed one (L8).
+    pub row_count_max: u32,
+    /// Whether a pool in this process will claim what was just queued.
+    pub background_workers_running: bool,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -556,6 +631,219 @@ pub fn source_health(input: &SourceHealthInput) -> Result<String, ApiError> {
     project_ops::to_json(&SourceHealthReport {
         sources: rows.iter().map(source_health_row).collect(),
     })
+}
+
+/// The connector kind every intake item carries. One kind, so the upload
+/// path has one source-health row per scope rather than one per screen that
+/// happens to call it.
+pub const UPLOAD_SOURCE_KIND: &str = "upload";
+
+/// The scope an intake item lands in when the caller states none.
+pub const UPLOAD_SOURCE_SCOPE_DEFAULT: &str = "uploads";
+
+/// Characters a source scope may carry. It is part of the derived source id,
+/// so it is identity, not prose.
+const SOURCE_SCOPE_CHARS_MAX: usize = 120;
+
+/// Rows one submit report renders. A folder import may cover up to
+/// [`pos_ingest::INTAKE_FILE_COUNT_MAX`] files; the counts stay exact while
+/// the per-file list stays a page (L8: the bound is visible, never silent).
+const INGEST_SUBMIT_ROW_COUNT_MAX: u32 = 200;
+
+/// `ingest.submit` — bytes become Evidence, and the pipeline starts.
+///
+/// `staged` is the upload route's half of the contract: the transport has
+/// already streamed the request body to a file it owns, and hands the path
+/// here rather than decoding the caller's JSON to inject it. A transport that
+/// reshaped an input would be the L12 bug this seam exists to prevent.
+pub fn ingest_submit(
+    identity_device: DeviceId,
+    identity_user: UserId,
+    project_id: ProjectId,
+    queue: &Arc<JobQueue>,
+    background_workers_running: bool,
+    input: &IngestSubmitInput,
+    staged: Option<&std::path::Path>,
+) -> Result<String, ApiError> {
+    let root = intake_root(input, staged)?;
+    let source_scope = source_scope(input)?;
+    let plan = pos_ingest::plan_intake(&root).map_err(|error| ingest_error(&error))?;
+    let log = project_ops::open_log(std::path::Path::new(&input.path))?;
+    queue
+        .ensure_schema(&log)
+        .map_err(|error| sched_error(&error))?;
+    let pipeline = IngestPipeline::new(
+        PipelineConfig::for_device(identity_device),
+        Arc::clone(queue),
+        ingest_runtime::stage_registry(),
+    );
+    let source_id = pos_ingest::derive_source_id(UPLOAD_SOURCE_KIND, &source_scope);
+    let mut report = IngestSubmitReport {
+        source_id: source_id.to_hex(),
+        added_count: 0,
+        duplicate_count: 0,
+        refused_count: 0,
+        skipped_count: plan.skipped_count,
+        truncated: plan.truncated,
+        items: Vec::new(),
+        row_count_max: INGEST_SUBMIT_ROW_COUNT_MAX,
+        background_workers_running,
+    };
+    // A stated file name belongs to a single-file call. Applying it to every
+    // item of a folder import would name twelve recordings the same thing.
+    let stated_name = (plan.files.len() == 1)
+        .then_some(input.file_name.as_deref())
+        .flatten();
+    for file_path in &plan.files {
+        let row = submit_one(SubmitOne {
+            pipeline: &pipeline,
+            log: &log,
+            project_id,
+            user: identity_user,
+            source_scope: &source_scope,
+            file_path,
+            stated_name,
+        });
+        match row.outcome.as_str() {
+            "added" => report.added_count = report.added_count.saturating_add(1),
+            "duplicate" => report.duplicate_count = report.duplicate_count.saturating_add(1),
+            _ => report.refused_count = report.refused_count.saturating_add(1),
+        }
+        if report.items.len() < INGEST_SUBMIT_ROW_COUNT_MAX as usize {
+            report.items.push(row);
+        }
+    }
+    project_ops::to_json(&report)
+}
+
+/// The arguments of one file's intake. Bundled because every one of them is
+/// needed and a seven-argument function is a signature longer than its body.
+#[derive(Clone, Copy)]
+struct SubmitOne<'a> {
+    pipeline: &'a IngestPipeline,
+    log: &'a ProjectLog,
+    project_id: ProjectId,
+    user: UserId,
+    source_scope: &'a str,
+    file_path: &'a std::path::Path,
+    stated_name: Option<&'a str>,
+}
+
+/// Ingests one file, turning every failure into a *row* rather than into a
+/// failed batch. One unreadable file in a folder of two hundred must not cost
+/// the other hundred and ninety-nine — and the reason it failed has to reach
+/// the person who dropped it.
+fn submit_one(request: SubmitOne<'_>) -> IngestSubmitRow {
+    let file_name = request.stated_name.map_or_else(
+        || {
+            request
+                .file_path
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+        },
+        str::to_owned,
+    );
+    let file_name = pos_ingest::intake_title(&file_name);
+    let mut intake = match pos_ingest::open_file(request.file_path) {
+        Ok(intake) => intake,
+        Err(error) => return refused_row(file_name, 0, &error),
+    };
+    let submission = pos_ingest::EvidenceSubmission {
+        source_kind: UPLOAD_SOURCE_KIND.to_owned(),
+        source_scope: request.source_scope.to_owned(),
+        // An empty external id means "address this by its content", which is
+        // what makes re-dropping the same file a visible duplicate instead of
+        // a second copy (`pipeline::resolve_external_ref`).
+        external: ExternalRef {
+            external_id: String::new(),
+            external_url: None,
+            external_version: None,
+        },
+        media_kind: intake.media_kind,
+        shape: intake.shape,
+        occurred_ts_ms: intake
+            .modified_ms
+            .unwrap_or_else(|| SystemWallClock.now_ms()),
+        author: None,
+        title: Some(file_name.clone()),
+        thread_ref: None,
+        actor: Actor::User(request.user),
+    };
+    let byte_size = intake.byte_size;
+    let media_kind = intake.media_kind.as_str().to_owned();
+    match request.pipeline.submit(
+        request.log,
+        request.project_id,
+        &SystemWallClock,
+        &submission,
+        &mut intake.content,
+    ) {
+        Ok(outcome) => IngestSubmitRow {
+            file_name,
+            evidence_id: Some(outcome.evidence_id().to_hex()),
+            media_kind: Some(media_kind),
+            byte_size,
+            outcome: if outcome.is_duplicate() {
+                "duplicate".to_owned()
+            } else {
+                "added".to_owned()
+            },
+            refused_code: None,
+            refused_detail: None,
+        },
+        Err(error) => refused_row(file_name, byte_size, &error),
+    }
+}
+
+fn refused_row(file_name: String, byte_size: u64, error: &IngestError) -> IngestSubmitRow {
+    IngestSubmitRow {
+        file_name,
+        evidence_id: None,
+        media_kind: None,
+        byte_size,
+        outcome: "refused".to_owned(),
+        refused_code: Some(error.code().to_owned()),
+        refused_detail: Some(error.to_string()),
+    }
+}
+
+/// Resolves where the bytes are. Exactly one of the two ways, always.
+fn intake_root(
+    input: &IngestSubmitInput,
+    staged: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, ApiError> {
+    match (staged, input.file_path.as_deref()) {
+        (Some(path), None) => Ok(path.to_path_buf()),
+        (None, Some(path)) if !path.is_empty() => Ok(std::path::PathBuf::from(path)),
+        (Some(_), Some(_)) => Err(ApiError {
+            code: "invalid_input",
+            message: "a submit carries bytes or names a filePath, never both".to_owned(),
+            retriable: false,
+        }),
+        _ => Err(ApiError {
+            code: "invalid_input",
+            message: "a submit needs a filePath, or bytes on the upload route".to_owned(),
+            retriable: false,
+        }),
+    }
+}
+
+fn source_scope(input: &IngestSubmitInput) -> Result<String, ApiError> {
+    let scope = input
+        .source_scope
+        .clone()
+        .unwrap_or_else(|| UPLOAD_SOURCE_SCOPE_DEFAULT.to_owned());
+    if scope.is_empty() || scope.chars().count() > SOURCE_SCOPE_CHARS_MAX {
+        return Err(ApiError {
+            code: "invalid_input",
+            message: format!(
+                "sourceScope is 1..={SOURCE_SCOPE_CHARS_MAX} characters; it is part of the \
+                 derived source id"
+            ),
+            retriable: false,
+        });
+    }
+    Ok(scope)
 }
 
 /// `ingest.reprocess` — re-run the pipeline from a stage, never re-fetch.

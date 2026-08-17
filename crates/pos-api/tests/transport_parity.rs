@@ -105,6 +105,14 @@ fn project_rows(directory: &tempfile::TempDir) -> Vec<(&'static str, String, boo
         ),
     )
     .expect("fixture manifest writes");
+    // A file to ingest through the intake command. Markdown, so the sniffer
+    // classifies it from its own bytes and NORMALIZE has real structure.
+    let upload = directory.path().join("parity-note.md");
+    std::fs::write(
+        &upload,
+        b"# Parity\n\nOne note, ingested through the front door.\n",
+    )
+    .expect("fixture upload writes");
     vec![
         (
             CommandName::ProjectCreate.as_str(),
@@ -244,6 +252,21 @@ fn project_rows(directory: &tempfile::TempDir) -> Vec<(&'static str, String, boo
                 pass: 0,
                 segment_index: 0,
                 speaker_index: 1,
+            })
+            .expect("input serializes"),
+            true,
+        ),
+        (
+            // Real bytes through the real front door (m1-s07). The report is
+            // a pure function of the content — the evidence id is derived
+            // from the CAS hash and the source id from the scope — so both
+            // transports must produce identical bytes for it.
+            CommandName::IngestSubmit.as_str(),
+            input_json(&pos_api::IngestSubmitInput {
+                path: path.clone(),
+                file_path: Some(upload.display().to_string()),
+                file_name: None,
+                source_scope: None,
             })
             .expect("input serializes"),
             true,
@@ -783,6 +806,81 @@ fn no_cloud_provider_can_appear_in_a_public_build_snapshot() {
 
 /// The exported directory is itself a valid project: re-inspectable and
 /// verify-clean (F2/F45 — no lock-in from the first commit).
+#[test]
+fn intake_is_byte_identical_across_transports_and_dedupes_on_content() {
+    let runtime = runtime();
+    let directory = tempfile::tempdir().expect("tempdir");
+    let upload = directory.path().join("interview-notes.md");
+    std::fs::write(&upload, b"# Intake\n\nThe same bytes, two projects.\n")
+        .expect("fixture writes");
+
+    let project = |label: &str| {
+        let path = directory.path().join(label).display().to_string();
+        ipc_command(
+            &runtime,
+            CommandName::ProjectCreate.as_str(),
+            &input_json(&ProjectCreateInput {
+                path: path.clone(),
+                name: Some("Intake parity".to_owned()),
+                template: "generic".to_owned(),
+            })
+            .expect("input serializes"),
+        )
+        .expect("create resolves");
+        path
+    };
+    let submit_input = |path: &str| {
+        input_json(&pos_api::IngestSubmitInput {
+            path: path.to_owned(),
+            file_path: Some(upload.display().to_string()),
+            file_name: None,
+            source_scope: None,
+        })
+        .expect("input serializes")
+    };
+
+    let ipc_path = project("intake-ipc.pos");
+    let http_path = project("intake-http.pos");
+    let ipc = ipc_command(
+        &runtime,
+        CommandName::IngestSubmit.as_str(),
+        &submit_input(&ipc_path),
+    )
+    .expect("ingest.submit over IPC");
+    let http = http_command(
+        &runtime,
+        CommandName::IngestSubmit.as_str(),
+        &submit_input(&http_path),
+    )
+    .expect("ingest.submit over HTTP");
+    assert_eq!(
+        ipc, http,
+        "ingest.submit differs between transports; a transport reshaped a result"
+    );
+    assert!(
+        ipc.contains("\"addedCount\":1"),
+        "one file, one item: {ipc}"
+    );
+    assert!(
+        ipc.contains("\"mediaKind\":\"markdown\""),
+        "the sniffer reads the bytes, not the extension: {ipc}"
+    );
+
+    // The same file again, into the project that already holds it. This is
+    // the most common thing that happens to this command, and it must read as
+    // "you already have this" rather than as a second copy.
+    let again = ipc_command(
+        &runtime,
+        CommandName::IngestSubmit.as_str(),
+        &submit_input(&ipc_path),
+    )
+    .expect("a re-drop resolves");
+    assert!(
+        again.contains("\"duplicateCount\":1") && again.contains("\"addedCount\":0"),
+        "a re-drop of identical bytes is a visible duplicate, not a second item: {again}"
+    );
+}
+
 #[test]
 fn an_export_reopens_and_verifies_clean() {
     let runtime = runtime();

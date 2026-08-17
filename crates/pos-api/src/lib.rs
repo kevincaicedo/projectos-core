@@ -30,10 +30,11 @@ pub use gateway_ops::{
 };
 pub use ingest_ops::{
     EvidenceListInput, EvidenceListReport, EvidenceRow, EvidenceStageRow, IngestReprocessInput,
-    IngestReprocessReport, SourceHealthInput, SourceHealthReport, SourceHealthRow,
-    TranscriptCorrectInput, TranscriptEditReport, TranscriptGetInput, TranscriptReport,
-    TranscriptSegmentRow, TranscriptSpeakerAssignInput, TranscriptSpeakerNameInput,
-    TranscriptSpeakerRow,
+    IngestReprocessReport, IngestSubmitInput, IngestSubmitReport, IngestSubmitRow,
+    SourceHealthInput, SourceHealthReport, SourceHealthRow, TranscriptCorrectInput,
+    TranscriptEditReport, TranscriptGetInput, TranscriptReport, TranscriptSegmentRow,
+    TranscriptSpeakerAssignInput, TranscriptSpeakerNameInput, TranscriptSpeakerRow,
+    UPLOAD_SOURCE_KIND, UPLOAD_SOURCE_SCOPE_DEFAULT,
 };
 pub use project_ops::{ProjectCreateInput, ProjectExportInput, ProjectPathInput, ProjectSeedInput};
 pub use run_ops::{
@@ -51,7 +52,8 @@ pub use pos_foundation::{ProjectId, RunId, SystemWallClock as FoundationClock, U
 // (m0-s15); re-exported so a shell still depends on `pos-api` alone (L12).
 pub use pos_foundation::telemetry;
 pub use session::{
-    HealthReport, OPEN_PROJECT_COUNT_MAX, OpenProjectRow, ProjectCloseReport, ProjectListReport,
+    HealthReport, IngestBufferReport, OPEN_PROJECT_COUNT_MAX, OpenProjectRow, ProjectCloseReport,
+    ProjectListReport,
 };
 pub use stream::{
     ResumeWindow, SSE_RETRY_MS, STREAM_RESUME_WINDOW_LEN, StreamFrame, parse_resume_cursor,
@@ -100,7 +102,13 @@ use std::task::{Context, Poll, Waker};
 /// `transcript.speaker-assign` are the three edits. The ASR output is never
 /// rewritten: every row carries `asrText` beside `text`, so "the original is
 /// recoverable" is something a shell can render rather than a claim.
-pub const API_SURFACE_VERSION: u16 = 11;
+/// v12: m1-s07 opens the front door — `ingest.submit` puts bytes into a
+/// project from a path (desktop, CLI, bench) or from the request body (the
+/// browser's upload route), and `health` reports what the ingest buffers
+/// actually cost so [ADR-0008]'s bound 1 is readable rather than inferred.
+///
+/// [ADR-0008]: ../../../docs/adr/0008-ingest-memory-budget-splits-buffers-from-model-weights.md
+pub const API_SURFACE_VERSION: u16 = 12;
 
 /// Bounded item budget for the M0 connector-host liveness tick (L8). The socket
 /// itself caps this at 32; the runtime asks for less than it is allowed.
@@ -208,6 +216,10 @@ pub enum CommandName {
     RunResume,
     /// Checksummed, consent-gated model download (m0-s11).
     ModelsPull,
+    /// A file or a folder of files becomes Evidence (m1-s07). The one way
+    /// bytes enter a project, so every shell and both gate scenarios drive
+    /// the same path.
+    IngestSubmit,
     /// Re-run the ingestion pipeline from a stage (m1-s01). Never re-fetches
     /// from the source — that is the whole point of the command.
     IngestReprocess,
@@ -219,7 +231,7 @@ pub enum CommandName {
 }
 
 impl CommandName {
-    pub const COUNT: usize = 14;
+    pub const COUNT: usize = 15;
     pub const ALL: [Self; Self::COUNT] = [
         Self::ProjectCreate,
         Self::ProjectExport,
@@ -231,6 +243,7 @@ impl CommandName {
         Self::RunPause,
         Self::RunResume,
         Self::ModelsPull,
+        Self::IngestSubmit,
         Self::IngestReprocess,
         Self::TranscriptCorrect,
         Self::TranscriptSpeakerName,
@@ -250,6 +263,7 @@ impl CommandName {
             Self::RunPause => "run.pause",
             Self::RunResume => "run.resume",
             Self::ModelsPull => "models.pull",
+            Self::IngestSubmit => "ingest.submit",
             Self::IngestReprocess => "ingest.reprocess",
             Self::TranscriptCorrect => "transcript.correct",
             Self::TranscriptSpeakerName => "transcript.speaker-name",
@@ -547,6 +561,66 @@ impl LocalRuntime {
         result
     }
 
+    /// Dispatches a command whose bytes arrived with the request rather than
+    /// living on this machine — the browser upload path.
+    ///
+    /// The transport streams the request body to a file it owns and passes
+    /// the path; it never decodes or rewrites the caller's input, which is
+    /// what keeps "a transport selects an operation and forwards bytes" true
+    /// for a request that carries four gigabytes (L12).
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::unknown_command`] for any name but `ingest.submit`, and
+    /// whatever the command itself refuses with.
+    pub fn command_with_upload(
+        &self,
+        name: &str,
+        input_json: &str,
+        staged: &std::path::Path,
+    ) -> Result<String, ApiError> {
+        let span = api_span(
+            SpanName::ApiCommand,
+            CommandName::parse(name).map(CommandName::as_str),
+        );
+        let result = match CommandName::parse(name) {
+            Some(CommandName::IngestSubmit) => project_ops::parse_input(input_json)
+                .and_then(|input| self.ingest_submit(&input, Some(staged))),
+            // Every other command's input is a small typed document; a body
+            // on one of them is a caller mistake, and answering it as if the
+            // bytes were welcome would hide that.
+            _ => Err(ApiError::unknown_command(name)),
+        };
+        finish_api_span(span, result.as_ref().err());
+        result
+    }
+
+    /// The intake command needs the acting identity and the project id for
+    /// the same reason reprocess does, and additionally wakes the pool: an
+    /// upload whose first stage sat until the next idle poll would look
+    /// broken for no reason a user could see.
+    fn ingest_submit(
+        &self,
+        input: &ingest_ops::IngestSubmitInput,
+        staged: Option<&std::path::Path>,
+    ) -> Result<String, ApiError> {
+        let log = project_ops::open_log(std::path::Path::new(&input.path))?;
+        let project_id = ingest_ops::project_id_of(&log)?;
+        let report = ingest_ops::ingest_submit(
+            self.identity.device,
+            self.identity.user,
+            project_id,
+            &self.queue,
+            self.workers.is_some(),
+            input,
+            staged,
+        )?;
+        if let Some(workers) = self.workers.as_ref() {
+            workers.wake();
+        }
+        Ok(report)
+    }
+
     /// The reprocess command needs the acting identity and the project the
     /// directory holds, neither of which belongs in a wire input: the actor
     /// is the session's, and the project id is a fact in the log.
@@ -624,6 +698,9 @@ impl LocalRuntime {
             }
             Some(CommandName::ModelsPull) => {
                 gateway_ops::models_pull(&project_ops::parse_input(input_json)?)
+            }
+            Some(CommandName::IngestSubmit) => {
+                self.ingest_submit(&project_ops::parse_input(input_json)?, None)
             }
             Some(CommandName::IngestReprocess) => {
                 self.ingest_reprocess(&project_ops::parse_input(input_json)?)
@@ -741,6 +818,7 @@ impl LocalRuntime {
             format_version: pos_store::FORMAT_VERSION,
             open_project_count: count,
             background_workers: self.background_worker_status(),
+            ingest_buffers: pos_ingest::buffer_residency().into(),
         })
     }
 

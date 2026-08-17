@@ -514,3 +514,69 @@ button:disabled {
   font: inherit;
   padding: var(--space-1);
 }
+
+/* The intake panel (m1-s07). The drop target is a dashed well rather than a
+   button: the gesture it invites is dropping, and a control that looks like a
+   button teaches the wrong one. The hover state changes the rule and the
+   tint, never the size — a target that grows under the pointer moves away
+   from the file being dropped on it. */
+.intake-drop {
+  align-items: center;
+  border: 1px dashed var(--line-default);
+  border-radius: var(--radius-card);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-3);
+  text-align: center;
+}
+
+.intake-drop-over {
+  background: var(--accent-green-tint);
+  border-color: var(--accent-green-tint-strong);
+}
+
+.intake-drop p {
+  color: var(--ink-secondary);
+  margin: 0;
+}
+
+/* The browser file input is replaced by its label so both shells present the
+   same affordance; the input stays in the accessibility tree rather than
+   being removed from it. */
+.intake-file-label {
+  background: var(--surface-raised);
+  border: 1px solid var(--line-default);
+  border-radius: var(--radius-control);
+  color: var(--ink-secondary);
+  cursor: pointer;
+  font-size: var(--size-meta);
+  padding: var(--space-1) var(--space-2);
+}
+
+.intake-file-label input {
+  height: 1px;
+  opacity: 0;
+  position: absolute;
+  width: 1px;
+}
+
+.intake-items {
+  list-style: none;
+  margin: var(--space-2) 0;
+  padding: 0;
+}
+
+.intake-items li {
+  border-top: 1px solid var(--line-soft);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  padding: var(--space-1) 0;
+}
+
+/* A refusal is the one row that needs to be found in a list of two hundred. */
+.intake-items li[data-intake-item="refused"] {
+  border-left: 2px solid var(--signal-clay);
+  padding-left: var(--space-2);
+}

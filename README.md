@@ -45,6 +45,18 @@ just dev-desktop   # the native shell
 `just ci` runs everything CI runs, so a green local run is a real prediction
 rather than a hope.
 
+## Put something in it
+
+```sh
+cargo run -p pos -- create ./demo.pos --name "Demo"
+cargo run -p pos -- ingest submit ./demo.pos ~/Interviews/kickoff.m4a
+cargo run -p pos -- evidence list ./demo.pos --with-stages
+```
+
+`ingest submit` takes a file or a folder. What each file *is* comes from its
+bytes, not its name, and dropping the same file twice is a visible no-op rather
+than a second copy. The desktop and web shells drive the same command.
+
 ## How this repository is governed
 
 Most of the rules here are checked by a machine, because a rule a machine

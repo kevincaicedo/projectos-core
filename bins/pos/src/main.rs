@@ -124,6 +124,30 @@ enum EvidenceCommand {
 
 #[derive(Subcommand)]
 enum IngestCommand {
+    /// Ingest a file, or every file in a folder, into a project (m1-s07).
+    /// What each file *is* comes from its bytes, never from its name.
+    Submit {
+        directory: PathBuf,
+        /// The file or folder to ingest.
+        file: PathBuf,
+        /// What to call a single file. Ignored for a folder: naming twelve
+        /// recordings the same thing is worse than using their own names.
+        #[arg(long)]
+        title: Option<String>,
+        /// The selection inside the upload connector these items belong to,
+        /// so a batch import and a drag-drop are distinguishable on the
+        /// source-health card.
+        #[arg(long)]
+        source_scope: Option<String>,
+        /// Queue the work and exit without running it. The jobs stay durable
+        /// in the project and the next shell to open it claims them.
+        #[arg(long)]
+        no_drain: bool,
+        /// How long to run the queued work before giving up and saying what
+        /// is left.
+        #[arg(long, default_value_t = WORKER_DRAIN_MS_MAX_DEFAULT / MS_PER_SEC)]
+        drain_secs: u64,
+    },
     /// Re-run the pipeline from a stage. Never re-fetches from the source:
     /// the bytes already stored are the Evidence.
     Reprocess {
@@ -211,7 +235,7 @@ const fn queues_background_work(command: &CliCommand) -> bool {
     matches!(
         command,
         CliCommand::Ingest {
-            command: IngestCommand::Reprocess { .. }
+            command: IngestCommand::Reprocess { .. } | IngestCommand::Submit { .. }
         }
     )
 }
@@ -305,6 +329,38 @@ fn run(runtime: &LocalRuntime, command: CliCommand) -> Result<ExitCode, String> 
             };
             let report = dispatch_query(runtime, QueryName::SourceHealth, &input)?;
             println!("{report}");
+            Ok(ExitCode::SUCCESS)
+        }
+        CliCommand::Ingest {
+            command:
+                IngestCommand::Submit {
+                    directory,
+                    file,
+                    title,
+                    source_scope,
+                    no_drain,
+                    drain_secs,
+                },
+        } => {
+            let path = path_text(&directory)?;
+            let project = ProjectPathInput { path: path.clone() };
+            // Open first, for the same reason reprocess does: the pool serves
+            // the projects this process has open.
+            dispatch_command(runtime, CommandName::ProjectOpen, &project)?;
+            let input = pos_api::IngestSubmitInput {
+                path,
+                file_path: Some(path_text(&file)?),
+                file_name: title,
+                source_scope,
+            };
+            let report = dispatch_command(runtime, CommandName::IngestSubmit, &input)?;
+            println!("{report}");
+            if !no_drain {
+                render_drain(&runtime.drain_background_workers(drain_secs * MS_PER_SEC));
+            }
+            if let Err(message) = dispatch_command(runtime, CommandName::ProjectClose, &project) {
+                eprintln!("pos ingest submit: closing the project failed: {message}");
+            }
             Ok(ExitCode::SUCCESS)
         }
         CliCommand::Ingest {

@@ -68,8 +68,12 @@ async function installIpc(
   page: import("@playwright/test").Page,
   queries: Record<string, QueryAnswer>,
   options: {
-    readonly commands?: Record<string, string>;
+    readonly commands?: Record<string, QueryAnswer>;
     readonly streamFrames?: readonly string[];
+    /// What the native file picker returns (m1-s07). Present means "this
+    /// shell has a dialog"; absent leaves the desktop picker unavailable,
+    /// which is what the web bundle sees.
+    readonly dialogFiles?: readonly string[];
   } = {},
 ) {
   await page.addInitScript(
@@ -89,6 +93,9 @@ async function installIpc(
       });
       Object.defineProperty(window, "__TAURI__", {
         value: {
+          dialog: {
+            open: () => Promise.resolve(fixtures.dialogFiles ?? null),
+          },
           core: {
             invoke: (command: string, args?: Record<string, unknown>) => {
               if (command === "api_stream") {
@@ -139,6 +146,7 @@ const HEALTH = JSON.stringify({
   formatVersion: 1,
   openProjectCount: 1,
   backgroundWorkers: { running: true, registeredProjectCount: 1, lastError: null },
+  ingestBuffers: { residentBytes: 262_144, peakBytes: 1_966_080, pipelineBytesMax: 67_108_864 },
 });
 
 const EMPTY_LIST = JSON.stringify({ projects: [], openProjectCountMax: 64 });
@@ -223,7 +231,6 @@ const EDIT_OK = JSON.stringify({
   pass: 0,
   segmentIndex: 0,
 });
-
 
 const ONE_PROJECT = JSON.stringify({
   projects: [
@@ -462,6 +469,55 @@ const DEAD_LETTERS = JSON.stringify({
   rowCountMax: 20,
 });
 
+/// The intake reports the runtime returns for the same file, dropped twice
+/// (m1-s07). The second is the whole point: identical bytes are a *visible*
+/// no-op, never a second copy and never a failure.
+const INTAKE_ADDED = JSON.stringify({
+  sourceId: "cc".repeat(16),
+  addedCount: 1,
+  duplicateCount: 0,
+  refusedCount: 0,
+  skippedCount: 0,
+  truncated: false,
+  items: [
+    {
+      fileName: "kickoff-interview.m4a",
+      evidenceId: "a1b2c3d4e5f600000000000000000001",
+      mediaKind: "audio",
+      byteSize: 48_234_496,
+      outcome: "added",
+      refusedCode: null,
+      refusedDetail: null,
+    },
+  ],
+  rowCountMax: 200,
+  backgroundWorkersRunning: true,
+});
+
+const INTAKE_DUPLICATE = JSON.stringify({
+  sourceId: "cc".repeat(16),
+  addedCount: 0,
+  duplicateCount: 1,
+  refusedCount: 0,
+  skippedCount: 0,
+  truncated: false,
+  items: [
+    {
+      fileName: "kickoff-interview.m4a",
+      evidenceId: "a1b2c3d4e5f600000000000000000001",
+      mediaKind: "audio",
+      byteSize: 48_234_496,
+      outcome: "duplicate",
+      refusedCode: null,
+      refusedDetail: null,
+    },
+  ],
+  rowCountMax: 200,
+  backgroundWorkersRunning: true,
+});
+
+const NO_RECORDINGS = JSON.stringify({ evidence: [], rowCountMax: 20 });
+
 test.describe("the M0 shell", () => {
   test("an empty session teaches instead of showing a blank panel", async ({ page }) => {
     await installIpc(page, {
@@ -497,6 +553,57 @@ test.describe("the M0 shell", () => {
     await expect(home).toContainText("Demo Project");
     await expect(home).toContainText("head seq 7");
     await expect(page.locator("[data-teaching='project']")).toBeVisible();
+  });
+
+  /// m1-s07's dedup criterion, end to end: the same file dropped twice is one
+  /// item, and the second drop says so. This is the most common thing that
+  /// happens to the intake command — a partner re-imports a folder — and the
+  /// failure mode it guards against is a silent second copy of a recording
+  /// every citation would then be ambiguous about.
+  ///
+  /// The two dispatches are scripted as a sequence for the m0-s09 reason: the
+  /// UI re-reads rather than patching local state, so a test that could pass
+  /// against a locally mutated view would be testing the component.
+  test("a file dropped twice is ingested once and says so the second time", async ({ page }) => {
+    await installIpc(
+      page,
+      {
+        "project.list": ONE_PROJECT,
+        health: HEALTH,
+        "capability.snapshot": SNAPSHOT_FIXTURE,
+        "source.health": NO_SOURCE_HEALTH,
+        "evidence.list": NO_RECORDINGS,
+      },
+      {
+        commands: { "ingest.submit": [INTAKE_ADDED, INTAKE_DUPLICATE] },
+        dialogFiles: ["/Users/founder/Interviews/kickoff-interview.m4a"],
+      },
+    );
+    await page.goto("/");
+    await page.locator("[data-project-row]").first().click();
+
+    const panel = page.locator("[data-intake='ready']");
+    await expect(panel).toBeVisible();
+    await panel.locator("[data-intake-choose='desktop']").click();
+
+    const first = page.locator("[data-intake-summary='added']");
+    await expect(first).toBeVisible();
+    await expect(first).toContainText("1 ingested");
+    const added = page.locator("[data-intake-item='added']");
+    await expect(added).toContainText("kickoff-interview.m4a");
+    // The media kind came from the bytes, not from the extension.
+    await expect(added.locator("[data-intake-media]")).toHaveAttribute(
+      "data-intake-media",
+      "audio",
+    );
+
+    await panel.locator("[data-intake-choose='desktop']").click();
+
+    const second = page.locator("[data-intake-summary='no-new-evidence']");
+    await expect(second).toBeVisible();
+    await expect(second).toContainText("1 already ingested");
+    await expect(page.locator("[data-intake-item='duplicate']")).toContainText("already ingested");
+    await expect(page.locator("[data-intake-item='added']")).toHaveCount(0);
   });
 
   /// m1-s01's DLQ criterion: a dead-lettered item shows its stage, its

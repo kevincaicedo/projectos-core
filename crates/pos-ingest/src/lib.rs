@@ -45,8 +45,10 @@
 
 mod audio;
 mod budget;
+mod captions;
 mod chunk;
 mod identity;
+mod intake;
 mod normalize;
 mod pipeline;
 mod reprocess;
@@ -54,11 +56,20 @@ mod segment;
 mod transcribe;
 
 pub use audio::{AudioError, AudioSource};
-pub use budget::{BoundedStream, STAGE_BUFFER_BYTES_MAX_DEFAULT, STAGE_READ_BYTES, StreamBudget};
+pub use budget::{
+    BoundedStream, BufferResidency, PIPELINE_BUFFER_BYTES_MAX, STAGE_BUFFER_BYTES_MAX_DEFAULT,
+    STAGE_READ_BYTES, StreamBudget, buffer_residency, reset_buffer_peak,
+};
+pub use captions::{CAPTION_BLOCK_BYTES_MAX, CAPTION_CUE_COUNT_MAX};
 pub use chunk::{
     BoundaryRule, CHUNK_COUNT_MAX, ChunkParams, ChunkStage, TOKEN_BYTES_ESTIMATE, chunk_params_for,
 };
 pub use identity::{ContentHasher, derive_chunk_id, derive_evidence_id, derive_source_id};
+pub use intake::{
+    INTAKE_DEPTH_MAX, INTAKE_FILE_BYTES_MAX, INTAKE_FILE_COUNT_MAX, INTAKE_TEXT_BYTES_MAX,
+    INTAKE_TITLE_CHARS_MAX, IntakeFile, IntakePlan, SNIFF_PREFIX_BYTES, intake_title, open_file,
+    plan_intake, shape_for, sniff_intake,
+};
 pub use normalize::{NormalizeStage, RECORD_BYTES_MAX, sniff_media_kind};
 pub use pipeline::{
     EvidenceSubmission, IngestPipeline, PipelineConfig, STAGE_RETRY_COUNT_MAX, StageContext,

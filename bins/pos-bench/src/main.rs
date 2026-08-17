@@ -38,8 +38,10 @@ enum BenchCommand {
     Run {
         #[arg(long)]
         scenario: ScenarioName,
-        #[arg(long, default_value = "../docs/gates/m0")]
-        out: PathBuf,
+        /// Where the artifact is written. Defaults per scenario to the
+        /// milestone directory its gate row belongs to.
+        #[arg(long)]
+        out: Option<PathBuf>,
         #[arg(long, default_value = "RM-LAPTOP-01")]
         machine: String,
         #[arg(long, default_value_t = REPLICATE_COUNT_DEFAULT)]
@@ -58,6 +60,11 @@ enum BenchCommand {
         /// "nothing" is a claim and the reader deserves to judge it.
         #[arg(long, default_value = "developer shell only; no build running")]
         background_workload: String,
+        /// The recording the transcription row measures. Gitignored and
+        /// machine-local by nature, so the artifact records the derived
+        /// evidence id and the duration rather than this path.
+        #[arg(long, default_value = "../tmp/interview.m4a")]
+        audio: PathBuf,
     },
     /// One cold replicate of the project-open row. Spawned by `run`; a fresh
     /// process per replicate is how "cold" is made true rather than asserted.
@@ -75,6 +82,12 @@ enum ScenarioName {
     DesktopColdStart50,
     /// §18: UI interaction p95 < 100 ms (palette open, project switch).
     UiInteractionP95,
+    /// §18: a GB-scale single file streams with pipeline buffers < 64 MB and
+    /// total process RSS < 1.0 GB (ADR-0008 bounds 1 and 3).
+    IngestBuffers8gb,
+    /// §18: local transcription runs at ≥ 5x realtime on the reference
+    /// laptop (m1-s03).
+    TranscribeRealtime,
 }
 
 impl ScenarioName {
@@ -83,6 +96,8 @@ impl ScenarioName {
             Self::ProjectOpen1m => "m0.project-open-1m",
             Self::DesktopColdStart50 => "m0.desktop-cold-start-50",
             Self::UiInteractionP95 => "m0.ui-interaction-p95",
+            Self::IngestBuffers8gb => "m1.ingest-buffers-8gb",
+            Self::TranscribeRealtime => "m1.transcribe-realtime",
         }
     }
 
@@ -91,8 +106,72 @@ impl ScenarioName {
             // The cold-start row is m0-s07's acceptance criterion, measured by
             // this harness; the other two are m0-s16's own.
             Self::DesktopColdStart50 => "m0-s07",
+            // The buffer row is m1-s01's acceptance criterion and the
+            // realtime row is m1-s03's; both became measurable when m1-s07
+            // opened an intake path a gate is allowed to drive.
+            Self::IngestBuffers8gb => "m1-s01",
+            Self::TranscribeRealtime => "m1-s03",
             _ => "m0-s16",
         }
+    }
+
+    /// Where this scenario's artifact belongs when the caller states no
+    /// output directory. Gate evidence is filed by milestone.
+    const fn default_out(self) -> &'static str {
+        match self {
+            Self::IngestBuffers8gb | Self::TranscribeRealtime => "../docs/gates/m1",
+            _ => "../docs/gates/m0",
+        }
+    }
+}
+
+/// Which side of the threshold passes.
+///
+/// Latency rows want *at most*; throughput rows — realtime factor, bytes per
+/// second — want *at least*. One field, because a harness that assumed every
+/// gate is a latency gate would silently invert the verdict on the first one
+/// that is not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Bound {
+    AtMost,
+    AtLeast,
+}
+
+/// A stated gate threshold, in the series' own unit.
+#[derive(Clone, Copy, Debug)]
+struct Threshold {
+    bound: Bound,
+    value: f64,
+}
+
+impl Threshold {
+    const fn at_most(value: f64) -> Self {
+        Self {
+            bound: Bound::AtMost,
+            value,
+        }
+    }
+
+    const fn at_least(value: f64) -> Self {
+        Self {
+            bound: Bound::AtLeast,
+            value,
+        }
+    }
+
+    fn holds(self, measured: f64) -> bool {
+        match self.bound {
+            Bound::AtMost => measured < self.value,
+            Bound::AtLeast => measured >= self.value,
+        }
+    }
+
+    fn render(self, unit: &str) -> String {
+        let sign = match self.bound {
+            Bound::AtMost => "<",
+            Bound::AtLeast => "≥",
+        };
+        format!("{sign} {} {unit}", self.value)
     }
 }
 
@@ -103,21 +182,26 @@ struct Series {
     unit: &'static str,
     samples: Vec<f64>,
     aggregation: &'static str,
-    threshold_ms: Option<f64>,
+    threshold: Option<Threshold>,
 }
 
 impl Series {
     fn value(&self) -> f64 {
         match self.aggregation {
             "p95" => percentile(&self.samples, 0.95),
+            "max" => self
+                .samples
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max),
             _ => median(&self.samples),
         }
     }
 
     fn verdict(&self) -> &'static str {
-        match self.threshold_ms {
+        match self.threshold {
             None => "informational",
-            Some(threshold) if self.value() < threshold => "pass",
+            Some(threshold) if threshold.holds(self.value()) => "pass",
             Some(_) => "fail",
         }
     }
@@ -145,10 +229,12 @@ fn main() -> ExitCode {
             desktop_binary,
             ui_measurements,
             background_workload,
+            audio,
         } => {
             let request = RunRequest {
                 scenario,
-                out,
+                out: out.unwrap_or_else(|| PathBuf::from(scenario.default_out())),
+                audio,
                 machine,
                 replicates,
                 dataset,
@@ -178,6 +264,7 @@ fn main() -> ExitCode {
 struct RunRequest {
     scenario: ScenarioName,
     out: PathBuf,
+    audio: PathBuf,
     machine: String,
     replicates: u32,
     dataset: PathBuf,
@@ -237,7 +324,7 @@ fn measure(request: &RunRequest) -> Result<(Vec<Series>, String), Box<dyn std::e
                     unit: "ms",
                     samples,
                     aggregation: "p95",
-                    threshold_ms: Some(500.0),
+                    threshold: Some(Threshold::at_most(500.0)),
                 }],
                 format!(
                     "synthetic:{}-events:seeded",
@@ -265,27 +352,108 @@ fn measure(request: &RunRequest) -> Result<(Vec<Series>, String), Box<dyn std::e
                         unit: "ms",
                         samples: shell,
                         aggregation: "p95",
-                        threshold_ms: None,
+                        threshold: None,
                     },
                     Series {
                         label: "page: navigation start → project list painted",
                         unit: "ms",
                         samples: page,
                         aggregation: "p95",
-                        threshold_ms: None,
+                        threshold: None,
                     },
                     Series {
                         label: "cold start → interactive (stated upper bound: shell p95 + page p95)",
                         unit: "ms",
                         samples: combined,
                         aggregation: "median",
-                        threshold_ms: Some(1_500.0),
+                        threshold: Some(Threshold::at_most(1_500.0)),
                     },
                 ],
                 format!(
                     "synthetic:{}-projects:seeded",
                     scenarios::COLD_START_PROJECT_COUNT
                 ),
+            ))
+        }
+        ScenarioName::IngestBuffers8gb => {
+            let corpus = scenarios::ensure_ingest_dataset(
+                &request.dataset,
+                scenarios::INGEST_SINGLE_FILE_BYTES,
+                scenarios::INGEST_TEXT_BYTES,
+            )?;
+            let mut buffers = Vec::new();
+            let mut rss = Vec::new();
+            let mut throughput = Vec::new();
+            for replicate in 0..request.replicates {
+                let measured =
+                    scenarios::measure_ingest_buffers(&request.dataset, &corpus, replicate)?;
+                buffers.push(mib(measured.buffer_peak_bytes));
+                rss.push(mib(measured.rss_peak_bytes));
+                throughput.push(rate_mib_per_second(
+                    measured.bytes_ingested,
+                    measured.wall_ms,
+                ));
+            }
+            Ok((
+                vec![
+                    // ADR-0008 bound 1 — the one that fails a pull request,
+                    // because a peak here means a stage stopped streaming.
+                    Series {
+                        label: "pipeline buffer residency (peak, summed across stages)",
+                        unit: "MiB",
+                        samples: buffers,
+                        aggregation: "max",
+                        threshold: Some(Threshold::at_most(64.0)),
+                    },
+                    // ADR-0008 bound 3 — the ceiling a user feels. Model
+                    // weights are not loaded on this corpus; the transcription
+                    // row is where they are.
+                    Series {
+                        label: "process RSS during the run (peak, 1 Hz sample)",
+                        unit: "MiB",
+                        samples: rss,
+                        aggregation: "max",
+                        threshold: Some(Threshold::at_most(1024.0)),
+                    },
+                    Series {
+                        label: "ingest throughput",
+                        unit: "MiB/s",
+                        samples: throughput,
+                        aggregation: "median",
+                        threshold: None,
+                    },
+                ],
+                format!(
+                    "synthetic:{}-opaque-bytes+{}-markdown-bytes:deterministic",
+                    scenarios::INGEST_SINGLE_FILE_BYTES,
+                    scenarios::INGEST_TEXT_BYTES
+                ),
+            ))
+        }
+        ScenarioName::TranscribeRealtime => {
+            let mut factors = Vec::new();
+            let mut identity = String::new();
+            let mut audio_ms_total = 0_u64;
+            for replicate in 0..request.replicates {
+                let measured =
+                    scenarios::measure_transcription(&request.dataset, &request.audio, replicate)?;
+                factors.push(realtime_factor(measured.audio_ms, measured.wall_ms));
+                audio_ms_total = measured.audio_ms;
+                identity = measured.evidence_id;
+            }
+            Ok((
+                vec![Series {
+                    label: "local transcription speed (audio duration ÷ stage wall time)",
+                    unit: "x realtime",
+                    samples: factors,
+                    aggregation: "median",
+                    threshold: Some(Threshold::at_least(5.0)),
+                }],
+                // The recording is gitignored and lives on one machine, so the
+                // artifact identifies it by what is reproducible: the derived
+                // evidence id (a function of the content hash) and how long it
+                // actually is. A path would be neither checkable nor falsifiable.
+                format!("audio:evidence-{identity}:{audio_ms_total}ms"),
             ))
         }
         ScenarioName::UiInteractionP95 => {
@@ -300,14 +468,14 @@ fn measure(request: &RunRequest) -> Result<(Vec<Series>, String), Box<dyn std::e
                         unit: "ms",
                         samples: palette,
                         aggregation: "p95",
-                        threshold_ms: Some(100.0),
+                        threshold: Some(Threshold::at_most(100.0)),
                     },
                     Series {
                         label: "project switch",
                         unit: "ms",
                         samples: switch,
                         aggregation: "p95",
-                        threshold_ms: Some(100.0),
+                        threshold: Some(Threshold::at_most(100.0)),
                     },
                 ],
                 "in-page measurement over the production bundle".to_owned(),
@@ -347,7 +515,11 @@ fn render_json(header: &ArtifactHeader, series: &[Series], passed: bool) -> Stri
                 "unit": row.unit,
                 "aggregation": row.aggregation,
                 "value": round2(row.value()),
-                "thresholdMs": row.threshold_ms,
+                "threshold": row.threshold.map(|threshold| serde_json::json!({
+                    "bound": match threshold.bound { Bound::AtMost => "at_most", Bound::AtLeast => "at_least" },
+                    "value": threshold.value,
+                    "unit": row.unit,
+                })),
                 "verdict": row.verdict(),
                 "samples": row.samples.iter().map(|value| round2(*value)).collect::<Vec<_>>(),
             })
@@ -417,8 +589,8 @@ fn render_markdown(header: &ArtifactHeader, series: &[Series], passed: bool) -> 
             row.aggregation,
             row.value(),
             row.unit,
-            row.threshold_ms
-                .map_or_else(|| "—".to_owned(), |threshold| format!("< {threshold} ms")),
+            row.threshold
+                .map_or_else(|| "—".to_owned(), |threshold| threshold.render(row.unit)),
             row.verdict(),
         ));
     }
@@ -454,6 +626,40 @@ fn round2(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
+/// Bytes as mebibytes, which is the unit every memory bound in §18 is stated
+/// in — converting at the edge keeps one unit in the artifact.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "memory figures are megabytes at f64 precision; the raw bytes are the source"
+)]
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "throughput is a ratio of two measured integers; f64 is the reporting type"
+)]
+fn rate_mib_per_second(bytes: u64, wall_ms: u64) -> f64 {
+    if wall_ms == 0 {
+        return f64::NAN;
+    }
+    mib(bytes) / (wall_ms as f64 / 1000.0)
+}
+
+/// Audio seconds decoded per wall-clock second. The §18 row is stated this
+/// way round, so the harness computes it this way round.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "both operands are millisecond counts; the ratio is the reported number"
+)]
+fn realtime_factor(audio_ms: u64, wall_ms: u64) -> f64 {
+    if wall_ms == 0 {
+        return f64::NAN;
+    }
+    audio_ms as f64 / wall_ms as f64
+}
+
 fn median(samples: &[f64]) -> f64 {
     percentile(samples, 0.5)
 }
@@ -483,7 +689,7 @@ fn percentile(samples: &[f64], quantile: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScenarioName, Series, percentile};
+    use super::{ScenarioName, Series, Threshold, percentile};
 
     #[test]
     fn nearest_rank_percentiles_quote_a_sample_that_actually_happened() {
@@ -503,7 +709,7 @@ mod tests {
             unit: "ms",
             samples: vec![400.0, 900.0],
             aggregation: "p95",
-            threshold_ms: Some(500.0),
+            threshold: Some(Threshold::at_most(500.0)),
         };
         assert_eq!(over.verdict(), "fail");
         let under = Series {
@@ -512,10 +718,32 @@ mod tests {
         };
         assert_eq!(under.verdict(), "pass");
         let informational = Series {
-            threshold_ms: None,
+            threshold: None,
             ..under
         };
         assert_eq!(informational.verdict(), "informational");
+    }
+
+    /// A throughput gate reads the other way, and a harness that assumed
+    /// every threshold is a ceiling would report a fast transcription as a
+    /// failure and a slow one as a pass.
+    #[test]
+    fn an_at_least_threshold_passes_above_it_and_fails_below() {
+        let fast = Series {
+            label: "transcription realtime factor",
+            unit: "x",
+            samples: vec![18.8, 15.19, 16.52],
+            aggregation: "median",
+            threshold: Some(Threshold::at_least(5.0)),
+        };
+        assert_eq!(fast.verdict(), "pass");
+        let slow = Series {
+            samples: vec![4.9, 3.1, 4.2],
+            ..fast
+        };
+        assert_eq!(slow.verdict(), "fail");
+        assert_eq!(Threshold::at_least(5.0).render("x"), "≥ 5 x");
+        assert_eq!(Threshold::at_most(500.0).render("ms"), "< 500 ms");
     }
 
     #[test]

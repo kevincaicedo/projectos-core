@@ -79,6 +79,39 @@ export async function apiCommand(name: string, inputJson: string): Promise<Dispa
   });
 }
 
+/// Dispatches a command whose bytes are a file the browser holds (m1-s07).
+///
+/// This is the one place the two transports genuinely differ, and the reason
+/// is physical rather than architectural: the desktop shell has the file's
+/// *path* and the core opens it, while a browser has only the bytes and has
+/// to put them on the wire. Both end at the same registry command, so the
+/// report a user sees is the same bytes either way (L12).
+export async function apiUpload(
+  name: string,
+  inputJson: string,
+  file: File,
+): Promise<DispatchOutcome> {
+  if (activeTransport() === "tauri-ipc") {
+    // Unreachable through the desktop drop zone, which sends paths. Reported
+    // rather than silently mis-dispatched, because a shell that quietly did
+    // something else here would be the parity bug this comment exists about.
+    return {
+      kind: "failed",
+      transport: "tauri-ipc",
+      error: {
+        code: "invalid_input",
+        message: "The desktop shell ingests files by path, not by upload.",
+        retriable: false,
+      },
+    };
+  }
+  return fetchHttp(`/api/upload/${name}?input=${encodeURIComponent(inputJson)}`, {
+    method: "POST",
+    headers: { accept: "application/json", "content-type": "application/octet-stream" },
+    body: file,
+  });
+}
+
 export interface StreamHandlers {
   readonly onMessage: (message: SseMessage) => void;
   readonly onError: (error: ApiErrorEnvelope) => void;

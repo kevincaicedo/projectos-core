@@ -77,6 +77,40 @@ pub struct HealthReport {
     /// enqueues work into a runtime with no pool is the exact silence this
     /// field exists to break.
     pub background_workers: crate::workers::WorkerStatusReport,
+    /// What the ingestion buffers cost right now (m1-s07, ADR-0008 bound 1).
+    pub ingest_buffers: IngestBufferReport,
+}
+
+/// The one number that says whether streaming still works.
+///
+/// It is here rather than in a bench-only hook for two reasons. A long-running
+/// process must be able to report its own per-subsystem memory (STYLE
+/// §efficiency), and a gate that reads its measurement through the same
+/// surface a user reads is a gate measuring the product rather than a private
+/// path beside it.
+#[derive(Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestBufferReport {
+    /// Bytes every live pipeline stream is holding at this instant.
+    #[ts(type = "number")]
+    pub resident_bytes: u64,
+    /// The worst moment since this process started. Judged against
+    /// `pipelineBytesMax`; a peak at the bound means a stage stopped
+    /// streaming, which is the regression the bound exists to catch.
+    #[ts(type = "number")]
+    pub peak_bytes: u64,
+    #[ts(type = "number")]
+    pub pipeline_bytes_max: u64,
+}
+
+impl From<pos_ingest::BufferResidency> for IngestBufferReport {
+    fn from(residency: pos_ingest::BufferResidency) -> Self {
+        Self {
+            resident_bytes: residency.resident_bytes,
+            peak_bytes: residency.peak_bytes,
+            pipeline_bytes_max: residency.pipeline_bytes_max,
+        }
+    }
 }
 
 /// Bounded, deterministic session table. Interior mutability because the

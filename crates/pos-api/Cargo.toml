@@ -12,7 +12,9 @@ workspace = true
 # The axum HTTP+SSE transport (m0-s06). A feature rather than a default so the
 # desktop shell, which dispatches over Tauri IPC, does not link a web server.
 # This is transport selection, not a capability switch — no cfg(cloud) shape.
-http = ["dep:axum", "dep:tokio-stream", "tokio/net"]
+# `fs`/`io-util` arrive with m1-s07's upload route: a request body that may be
+# gigabytes is streamed to a staging file, never buffered in the handler.
+http = ["dep:axum", "dep:tokio-stream", "tokio/net", "tokio/fs", "tokio/io-util"]
 
 [dependencies]
 pos-foundation = { path = "../pos-foundation" }
