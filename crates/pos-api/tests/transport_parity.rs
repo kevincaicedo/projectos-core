@@ -195,6 +195,60 @@ fn project_rows(directory: &tempfile::TempDir) -> Vec<(&'static str, String, boo
             false,
         ),
         (
+            // An evidence id this project does not hold: both transports must
+            // answer with the identical typed `not_found`, which is the row
+            // that catches a transport inventing its own error shape.
+            QueryName::TranscriptGet.as_str(),
+            input_json(&pos_api::TranscriptGetInput {
+                path: path.clone(),
+                evidence_id: "00000000000000000000000000000001".to_owned(),
+                pass: None,
+                after_segment_index: None,
+                row_count_max: Some(10),
+            })
+            .expect("input serializes"),
+            false,
+        ),
+        (
+            // The three transcript edits append against an evidence id that
+            // does not exist. The append succeeds — a projection `Update` on a
+            // missing row is a deterministic no-op (m1-s03), which is exactly
+            // what makes replay total — so the row compares a success shape.
+            CommandName::TranscriptCorrect.as_str(),
+            input_json(&pos_api::TranscriptCorrectInput {
+                path: path.clone(),
+                evidence_id: "00000000000000000000000000000001".to_owned(),
+                pass: 0,
+                segment_index: 0,
+                text: "contract row".to_owned(),
+            })
+            .expect("input serializes"),
+            true,
+        ),
+        (
+            CommandName::TranscriptSpeakerName.as_str(),
+            input_json(&pos_api::TranscriptSpeakerNameInput {
+                path: path.clone(),
+                evidence_id: "00000000000000000000000000000001".to_owned(),
+                speaker_index: 1,
+                name: "Contract Row".to_owned(),
+            })
+            .expect("input serializes"),
+            true,
+        ),
+        (
+            CommandName::TranscriptSpeakerAssign.as_str(),
+            input_json(&pos_api::TranscriptSpeakerAssignInput {
+                path: path.clone(),
+                evidence_id: "00000000000000000000000000000001".to_owned(),
+                pass: 0,
+                segment_index: 0,
+                speaker_index: 1,
+            })
+            .expect("input serializes"),
+            true,
+        ),
+        (
             // A project with no Evidence yet: the reprocess reports zero
             // requeued rather than refusing, which is the honest answer and
             // the one both transports must agree on byte for byte.
@@ -231,6 +285,11 @@ fn project_rows(directory: &tempfile::TempDir) -> Vec<(&'static str, String, boo
         ),
     ]
 }
+
+/// Contract rows whose whole point is the typed refusal. Reading a transcript
+/// for an evidence id a project does not hold is a caller bug, and both
+/// transports must say so identically rather than one 404ing and one 500ing.
+const ROWS_THAT_ANSWER_TYPED_ERRORS: [&str; 1] = ["transcript.get"];
 
 #[test]
 fn the_contract_suite_covers_the_whole_surface() {
@@ -734,6 +793,18 @@ fn an_export_reopens_and_verifies_clean() {
         } else {
             runtime.query_with_input(name, &input)
         };
+        if ROWS_THAT_ANSWER_TYPED_ERRORS.contains(&name) {
+            // These rows exist so the two transports are compared on an
+            // *error* shape, which is where a transport is most tempted to
+            // invent its own envelope. This test is about the export being a
+            // valid project, so it asserts the refusal is typed and moves on.
+            let error = result.expect_err("this row is declared to refuse");
+            assert_eq!(
+                error.code, "not_found",
+                "{name} refused with the wrong code"
+            );
+            continue;
+        }
         result.unwrap_or_else(|error| panic!("{name} failed: {error}"));
     }
     let export_path = directory.path().join("parity-export.pos");

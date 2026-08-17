@@ -6,15 +6,19 @@
 //! drift on failure semantics.
 
 mod anthropic;
+mod cloud_stt;
 mod google;
 mod openai_wire;
+mod whisper_local;
 
 pub use anthropic::AnthropicAdapter;
+pub use cloud_stt::CloudSttAdapter;
 pub use google::GoogleAdapter;
 pub use openai_wire::{
     EndpointProfile, EndpointServer, OpenAiAdapter, OpenAiCompatibleAdapter, OpenRouterAdapter,
     QualificationReport, list_models, qualify_openai_compatible,
 };
+pub use whisper_local::WhisperLocalTranscriber;
 
 use crate::transport::{HttpHead, TransportError};
 use crate::weather::Weather;

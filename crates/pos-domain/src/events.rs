@@ -5,8 +5,10 @@
 //! newer project opens under an older build instead of failing closed.
 
 use crate::ingest::{
-    EvidenceAddedBody, EvidenceChunkedBody, EvidenceReprocessRequestedBody, IngestStageFailedBody,
-    IngestStageFinishedBody, IngestStageStartedBody,
+    EvidenceAddedBody, EvidenceChunkedBody, EvidenceReprocessRequestedBody,
+    EvidenceTranscribedBody, IngestStageFailedBody, IngestStageFinishedBody,
+    IngestStageStartedBody, TranscriptSegmentSpeakerSetBody, TranscriptSpeakerNamedBody,
+    TranscriptTextCorrectedBody,
 };
 use pos_foundation::{
     AccountId, ArtifactId, CheckpointId, CronId, ExecutionLeaseId, GateReceiptId, JobId, ProjectId,
@@ -781,6 +783,10 @@ pub enum DomainEvent {
     IngestStageFailed(IngestStageFailedBody),
     EvidenceChunked(EvidenceChunkedBody),
     EvidenceReprocessRequested(EvidenceReprocessRequestedBody),
+    EvidenceTranscribed(EvidenceTranscribedBody),
+    TranscriptSpeakerNamed(TranscriptSpeakerNamedBody),
+    TranscriptSegmentSpeakerSet(TranscriptSegmentSpeakerSetBody),
+    TranscriptTextCorrected(TranscriptTextCorrectedBody),
 }
 
 impl DomainEvent {
@@ -819,6 +825,10 @@ impl DomainEvent {
             Self::IngestStageFailed(_) => "IngestStageFailed",
             Self::EvidenceChunked(_) => "EvidenceChunked",
             Self::EvidenceReprocessRequested(_) => "EvidenceReprocessRequested",
+            Self::EvidenceTranscribed(_) => "EvidenceTranscribed",
+            Self::TranscriptSpeakerNamed(_) => "TranscriptSpeakerNamed",
+            Self::TranscriptSegmentSpeakerSet(_) => "TranscriptSegmentSpeakerSet",
+            Self::TranscriptTextCorrected(_) => "TranscriptTextCorrected",
         }
     }
 
@@ -1032,6 +1042,19 @@ impl DomainEvent {
             | Self::EvidenceReprocessRequested(EvidenceReprocessRequestedBody::V1 {
                 evidence_id,
                 ..
+            })
+            // Transcript facts and their edits all belong to one Evidence
+            // item. Segments are not separate entities: they are positions
+            // inside the recording, and a citation resolves through the chunk
+            // that covers them (m1-s12), not through a segment id.
+            | Self::EvidenceTranscribed(EvidenceTranscribedBody::V1 { evidence_id, .. })
+            | Self::TranscriptSpeakerNamed(TranscriptSpeakerNamedBody::V1 { evidence_id, .. })
+            | Self::TranscriptSegmentSpeakerSet(TranscriptSegmentSpeakerSetBody::V1 {
+                evidence_id,
+                ..
+            })
+            | Self::TranscriptTextCorrected(TranscriptTextCorrectedBody::V1 {
+                evidence_id, ..
             }) => vec![entity_ref("evidence", evidence_id.into_bytes())],
             // A chunk batch touches every chunk it creates: the L2 why-chain
             // is what a citation walks backwards, and the batch is already
@@ -1087,6 +1110,10 @@ impl DomainEvent {
             Self::IngestStageFinished(inner) => ciborium::into_writer(inner, &mut body),
             Self::IngestStageFailed(inner) => ciborium::into_writer(inner, &mut body),
             Self::EvidenceChunked(inner) => ciborium::into_writer(inner, &mut body),
+            Self::EvidenceTranscribed(inner) => ciborium::into_writer(inner, &mut body),
+            Self::TranscriptSpeakerNamed(inner) => ciborium::into_writer(inner, &mut body),
+            Self::TranscriptSegmentSpeakerSet(inner) => ciborium::into_writer(inner, &mut body),
+            Self::TranscriptTextCorrected(inner) => ciborium::into_writer(inner, &mut body),
             Self::EvidenceReprocessRequested(inner) => ciborium::into_writer(inner, &mut body),
         };
         encoded.expect("CBOR encoding of typed bodies into a Vec cannot fail"); // INVARIANT: bodies contain only owned serde-friendly values and the writer is a Vec.
@@ -1142,6 +1169,16 @@ impl DomainEvent {
             "IngestStageFinished" => Self::IngestStageFinished(read("IngestStageFinished", body)?),
             "IngestStageFailed" => Self::IngestStageFailed(read("IngestStageFailed", body)?),
             "EvidenceChunked" => Self::EvidenceChunked(read("EvidenceChunked", body)?),
+            "EvidenceTranscribed" => Self::EvidenceTranscribed(read("EvidenceTranscribed", body)?),
+            "TranscriptSpeakerNamed" => {
+                Self::TranscriptSpeakerNamed(read("TranscriptSpeakerNamed", body)?)
+            }
+            "TranscriptSegmentSpeakerSet" => {
+                Self::TranscriptSegmentSpeakerSet(read("TranscriptSegmentSpeakerSet", body)?)
+            }
+            "TranscriptTextCorrected" => {
+                Self::TranscriptTextCorrected(read("TranscriptTextCorrected", body)?)
+            }
             "EvidenceReprocessRequested" => {
                 Self::EvidenceReprocessRequested(read("EvidenceReprocessRequested", body)?)
             }

@@ -301,6 +301,7 @@ fn a_large_single_file_flows_through_every_stage_within_the_buffer_budget() {
     // follows the *budget*, so squeezing it proves more than raising it.
     let mut config = PipelineConfig::for_device(common::DEVICE);
     config.buffer_bytes_max = 512 * 1024;
+    let buffer_bytes_max = config.buffer_bytes_max;
     let pipeline = IngestPipeline::new(
         config,
         Arc::clone(&queue),
@@ -311,7 +312,7 @@ fn a_large_single_file_flows_through_every_stage_within_the_buffer_budget() {
 
     let text = document_text(3_000);
     assert!(
-        text.len() > 4 * config.buffer_bytes_max,
+        text.len() > 4 * buffer_bytes_max,
         "the fixture must be several buffers deep, not one"
     );
     let item = submission("doc-large", EvidenceShape::Document, MediaKind::Markdown);

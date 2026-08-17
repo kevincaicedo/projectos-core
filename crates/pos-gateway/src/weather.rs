@@ -49,6 +49,12 @@ pub enum Weather {
     /// The byte transport failed below HTTP semantics (connect, TLS-less
     /// socket, mid-stream drop). Carries no provider payload.
     Transport { reason: String },
+    /// The policy authorized this dispatch, but the gateway composed no
+    /// transport for the selection it needs — a deployment that allows cloud
+    /// models without a cloud transport. Typed rather than silent, because
+    /// "authorized and then nothing happened" is the worst answer available
+    /// (m1-s03).
+    TransportUnavailable { selection: &'static str },
     /// The cost ledger could not record the call. Surfaced loudly even when
     /// the model answered, because an unmetered call is an accounting hole
     /// the honest-ledger AC exists to prevent.
@@ -79,6 +85,7 @@ impl Weather {
             Self::UnsupportedField { .. } => "unsupported_field",
             Self::InvalidRequest { .. } => "invalid_request",
             Self::Transport { .. } => "transport_failure",
+            Self::TransportUnavailable { .. } => "transport_unavailable",
             Self::LedgerFailure { .. } => "ledger_failure",
             Self::NotYetSupported { .. } => "not_yet_supported",
         }
@@ -133,6 +140,11 @@ impl fmt::Display for Weather {
                 write!(formatter, "request violates the gateway contract: {reason}")
             }
             Self::Transport { reason } => write!(formatter, "transport failure: {reason}"),
+            Self::TransportUnavailable { selection } => write!(
+                formatter,
+                "no {selection} transport is composed in this gateway; the dispatch was authorized \
+                 but has nothing to travel on"
+            ),
             Self::LedgerFailure { reason } => {
                 write!(formatter, "cost ledger write failed: {reason}")
             }

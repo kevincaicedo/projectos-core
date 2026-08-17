@@ -13,7 +13,7 @@ use pos_foundation::{ManualWallClock, ProjectId};
 use pos_gateway::{
     CallAttribution, ChatMessage, CompletionRequest, EvalCase, Gateway, GatewayConfig,
     MemoryLedger, MemorySecretStore, MessageRole, ModelPolicy, PromptFile, PromptRegistry,
-    RoutingTier, VecSink, load_cases, run_suite,
+    RoutingTier, Transports, VecSink, load_cases, run_suite,
 };
 use std::path::PathBuf;
 
@@ -48,7 +48,7 @@ fn dispatch_case(prompt: &PromptFile, case: &EvalCase) -> Result<String, pos_gat
         all_providers(),
         &secrets,
         &ledger,
-        &transport,
+        Transports::new(&transport, &transport),
         &clock,
     );
     let request = CompletionRequest {

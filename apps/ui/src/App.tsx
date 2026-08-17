@@ -12,6 +12,7 @@ import { Palette } from "./palette/Palette";
 import { paletteCommands, type PaletteActions } from "./palette/registry";
 import { useEchoRun } from "./runs/useEchoRun";
 import { useSourceHealth } from "./screens/useSourceHealth";
+import { useTranscript } from "./screens/useTranscript";
 import { dispatchQueryNotice, runFeedNotice, type SeamNotice } from "./screens/seam";
 import { HomeScreen } from "./screens/HomeScreen";
 import { ContextPanel } from "./shell/ContextPanel";
@@ -44,6 +45,7 @@ export function App() {
   const selected = openRows.find((row) => row.projectId === selectedProjectId) ?? null;
   const echoRun = useEchoRun(selected?.path ?? null);
   const sourceHealth = useSourceHealth(selected?.path ?? null);
+  const transcript = useTranscript(selected?.path ?? null);
 
   const reconcile = useCallback(() => {
     projects.refetch();
@@ -172,6 +174,7 @@ export function App() {
         onChanged={reconcile}
         echoRun={echoRun}
         sourceHealth={sourceHealth}
+        transcript={transcript}
       />
       <div className="dock-placeholder" title="The voice dock arrives with M2" aria-hidden="true">
         ◦

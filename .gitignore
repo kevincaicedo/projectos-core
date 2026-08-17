@@ -2,3 +2,6 @@ target/
 node_modules/
 dist/
 .DS_Store
+# Model artifacts are pulled, never committed (m0-s11): hundreds of MB,
+# BLAKE3-pinned in models/manifest.json, and licensed by their upstream.
+models/pulled/

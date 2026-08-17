@@ -5,8 +5,14 @@
 //! ## Invariant inventory (STYLE — state machine in prose)
 //!
 //! 1. **Policy before I/O.** `ModelPolicy::authorize` runs before credential
-//!    resolution and before the transport is touched. A refused dispatch
+//!    resolution and before the transport is *selected*. A refused dispatch
 //!    performs zero network I/O (proven by `tests/policy_no_network.rs`).
+//!    **Selection follows the declared locality** (m1-s03, ADR-0006): the
+//!    gateway holds a [`Transports`] set, and which one a dispatch gets is
+//!    [`TransportSelection::for_locality`] of the choice's endpoint — never
+//!    the URL, never a default. Under `local_only` the policy gate has already
+//!    refused every `Remote` choice, so the selection is provably
+//!    `device_local` or `in_process`, and the same oracle asserts both halves.
 //! 2. **Exactly one ledger record per dispatch**, on success and on every
 //!    weather path, always fully attributed (proven by
 //!    `tests/ledger_property.rs`).
@@ -23,7 +29,8 @@ use crate::policy::{ModelChoice, ModelPolicy, ModelRouting, RoutingTier};
 use crate::provider::{
     CompletionRequest, CompletionSink, CompletionUsage, OUTPUT_TOKENS_REQUEST_MAX, Provider,
 };
-use crate::transport::HttpTransport;
+use crate::transcribe::{TranscribeRequest, TranscribeUsage, Transcriber, TranscriptSink};
+use crate::transport::{TransportSelection, Transports};
 use crate::weather::Weather;
 use pos_foundation::WallClock;
 use pos_foundation::telemetry::{Parent, Span, SpanDetail, SpanField, SpanName, SpanValue};
@@ -46,7 +53,8 @@ pub struct Gateway<'runtime> {
     providers: Vec<Box<dyn Provider + 'runtime>>,
     secrets: &'runtime dyn SecretStore,
     ledger: &'runtime dyn CostLedger,
-    transport: &'runtime dyn HttpTransport,
+    transports: Transports<'runtime>,
+    transcriber: Option<&'runtime dyn Transcriber>,
     clock: &'runtime dyn WallClock,
 }
 
@@ -73,7 +81,7 @@ impl<'runtime> Gateway<'runtime> {
         providers: Vec<Box<dyn Provider + 'runtime>>,
         secrets: &'runtime dyn SecretStore,
         ledger: &'runtime dyn CostLedger,
-        transport: &'runtime dyn HttpTransport,
+        transports: Transports<'runtime>,
         clock: &'runtime dyn WallClock,
     ) -> Self {
         Self {
@@ -81,9 +89,31 @@ impl<'runtime> Gateway<'runtime> {
             providers,
             secrets,
             ledger,
-            transport,
+            transports,
+            transcriber: None,
             clock,
         }
+    }
+
+    /// Composes the transcription engine this gateway routes to (m1-s03).
+    /// Separate from [`Self::new`] because most gateways never transcribe, and
+    /// a `None` that refuses typed beats a stub that silently answers nothing.
+    #[must_use]
+    pub const fn with_transcriber(mut self, transcriber: &'runtime dyn Transcriber) -> Self {
+        self.transcriber = Some(transcriber);
+        self
+    }
+
+    /// The transport this choice would select, as a value.
+    ///
+    /// Public because it is the m0-s10 policy oracle's assertion target: after
+    /// [ADR-0006] the `local_only` guarantee is "dispatch selects a transport
+    /// that cannot egress", and a guarantee nothing can read is a comment.
+    ///
+    /// [ADR-0006]: ../../../../docs/adr/0006-transcription-and-tls-dependencies.md
+    #[must_use]
+    pub const fn transport_selection(choice: &ModelChoice) -> TransportSelection {
+        TransportSelection::for_locality(choice.endpoint.locality())
     }
 
     #[must_use]
@@ -161,6 +191,141 @@ impl<'runtime> Gateway<'runtime> {
         outcome
     }
 
+    /// One window of audio through the same chokepoint (m1-s03).
+    ///
+    /// Identical order to [`Self::complete`] — policy, credentials, transport
+    /// selection, exactly one ledger row — because transcription is a model
+    /// call and the four invariants above are not per-modality. The route is
+    /// `routing.transcribe`, not a tier: whisper-vs-cloud is a modality and a
+    /// privacy decision, never a thinking-effort one.
+    ///
+    /// # Errors
+    ///
+    /// Typed [`Weather`]. [`Weather::NotYetSupported`] when this gateway
+    /// composed no transcriber, and [`Weather::InvalidRequest`] when it has an
+    /// engine but no route — two different wiring mistakes, named apart.
+    pub fn transcribe(
+        &self,
+        attribution: &CallAttribution,
+        request: &TranscribeRequest<'_>,
+        sink: &mut dyn TranscriptSink,
+    ) -> Result<TranscribeUsage, Weather> {
+        let Some(choice) = self.config.routing.transcribe.as_ref() else {
+            // No route at all is a caller/wiring bug before any policy
+            // question exists — there is nothing to authorize and nothing to
+            // attribute, so it is not a ledger row.
+            return Err(Weather::InvalidRequest {
+                reason: "this project has no transcription route configured".to_owned(),
+            });
+        };
+        // The engine's label when there is one, the route's family when there
+        // is not. Resolved before dispatch so a missing engine still produces
+        // an attributed ledger row — invariant 2 has no exceptions.
+        let engine = self
+            .transcriber
+            .map_or_else(|| choice.family.as_str(), Transcriber::label);
+        let span = Span::open(
+            SpanName::GatewayCall,
+            SpanDetail::from_static(engine),
+            Parent::Current,
+        );
+        span.set(
+            SpanField::Project,
+            SpanValue::Id(attribution.project.into_bytes()),
+        );
+        span.set(
+            SpanField::CredentialClass,
+            SpanValue::Label(choice.credential.label()),
+        );
+        let started_ts_ms = self.clock.now_ms();
+        let outcome = self.run_transcribe(choice, request, sink);
+        let wall_ms = self.clock.now_ms().saturating_sub(started_ts_ms);
+        span.set(SpanField::DurationMs, SpanValue::Millis(wall_ms));
+        if let Err(weather) = &outcome {
+            span.set(SpanField::Outcome, SpanValue::Label(weather.code()));
+        }
+        let ledgered = self.record_transcribe(
+            attribution,
+            choice,
+            engine,
+            &outcome,
+            wall_ms,
+            started_ts_ms,
+        );
+        match &ledgered {
+            Ok(()) if outcome.is_ok() => span.finish("ok"),
+            Err(weather) => span.finish(weather.code()),
+            Ok(()) => drop(span),
+        }
+        ledgered?;
+        outcome
+    }
+
+    fn run_transcribe(
+        &self,
+        choice: &ModelChoice,
+        request: &TranscribeRequest<'_>,
+        sink: &mut dyn TranscriptSink,
+    ) -> Result<TranscribeUsage, Weather> {
+        // Invariant 1: policy first — ahead of the engine check too, so a
+        // `local_only` project routed at a cloud STT endpoint is refused for
+        // the reason that matters rather than for whatever the wiring happens
+        // to be missing.
+        self.config.policy.authorize(choice)?;
+        let Some(transcriber) = self.transcriber else {
+            return Err(Weather::NotYetSupported {
+                capability: "transcribe",
+                arrives_with: "a transcription engine composed into this gateway",
+            });
+        };
+        let auth = self.resolve_auth(&choice.credential)?;
+        let selection = Self::transport_selection(choice);
+        let transport = self.transports.resolve(selection)?;
+        transcriber.transcribe(&auth, request, transport, sink)
+    }
+
+    /// Invariant 2, for the transcription path.
+    ///
+    /// Tokens are zero because audio has none, and the honest unit — audio
+    /// duration — is already metered by the pipeline's own
+    /// `IngestStageFinished` (`wall_ms`, `bytes_read`, `item_count`). One
+    /// number, one owner (m0-s15). When managed STT pricing lands, that is a
+    /// `ModelCallCompleted` v2 with an audio field, not a second meter.
+    fn record_transcribe(
+        &self,
+        attribution: &CallAttribution,
+        choice: &ModelChoice,
+        engine: &'static str,
+        outcome: &Result<TranscribeUsage, Weather>,
+        wall_ms: u64,
+        ts_ms: u64,
+    ) -> Result<(), Weather> {
+        let outcome_code = match outcome {
+            Ok(_) => "ok".to_owned(),
+            Err(weather) => weather.code().to_owned(),
+        };
+        let record = ModelCallRecord {
+            project: attribution.project,
+            feature: attribution.feature.clone(),
+            agent: attribution.agent.clone(),
+            provider: engine,
+            credential_class: choice.credential.label(),
+            model: choice.model.clone(),
+            tokens_in: 0,
+            tokens_out: 0,
+            wall_ms,
+            provider_cost_kind: ModelCallRecord::cost_kind_for(&choice.credential, false),
+            usd_micros: 0,
+            outcome: outcome_code,
+            ts_ms,
+        };
+        self.ledger
+            .record(&record)
+            .map_err(|error| Weather::LedgerFailure {
+                reason: error.reason,
+            })
+    }
+
     /// Policy → budget → credentials → adapter → transport. Extracted so the
     /// ledger write in [`Self::complete`] wraps every path uniformly.
     fn run_call(
@@ -191,7 +356,16 @@ impl<'runtime> Gateway<'runtime> {
                     choice.family.as_str()
                 ),
             })?;
-        provider.complete(&auth, request, self.transport, sink)
+        // Invariant 1a: selection follows the declared locality, and it
+        // happens *after* the policy gate — so a refused dispatch never even
+        // names a transport, let alone touches one.
+        let selection = Self::transport_selection(choice);
+        let transport = self.transports.resolve(selection)?.ok_or({
+            Weather::TransportUnavailable {
+                selection: selection.as_str(),
+            }
+        })?;
+        provider.complete(&auth, request, transport, sink)
     }
 
     fn resolve_auth(&self, credential: &CredentialClass) -> Result<CallAuth, Weather> {
@@ -237,7 +411,7 @@ impl<'runtime> Gateway<'runtime> {
             project: attribution.project,
             feature: attribution.feature.clone(),
             agent: attribution.agent.clone(),
-            provider: choice.family,
+            provider: choice.family.as_str(),
             credential_class: choice.credential.label(),
             model: request.model.clone(),
             tokens_in,
@@ -278,13 +452,12 @@ impl<'runtime> Gateway<'runtime> {
                 ),
             ),
         };
-        let egress_warning = match choice.endpoint.locality() {
-            crate::policy::EndpointLocality::DeviceLocal => None,
-            crate::policy::EndpointLocality::Remote => Some(format!(
+        let egress_warning = choice.endpoint.locality().leaves_device().then(|| {
+            format!(
                 "prompt and evidence bytes leave this device for {}",
                 choice.endpoint.base_url()
-            )),
-        };
+            )
+        });
         PreflightReport {
             provider: choice.family.as_str(),
             credential_class: choice.credential.label(),

@@ -17,7 +17,7 @@ use pos_gateway::{
     CallAttribution, ChatMessage, CompletionRequest, CredentialClass, EndpointConfig,
     EndpointLocality, Gateway, GatewayConfig, HttpHead, HttpRequestPlan, HttpTransport,
     MemorySecretStore, MessageRole, ModelChoice, ModelPolicy, ModelRouting, ProviderFamily,
-    ResponseHandler, RoutingTier, SecretRef, TransportError, VecSink,
+    ResponseHandler, RoutingTier, SecretRef, TransportError, Transports, VecSink,
 };
 use std::path::Path;
 
@@ -105,17 +105,17 @@ fn dispatch_calls(project_root: &Path, count: usize, fail_last: bool) -> Vec<Str
         let gateway = Gateway::new(
             GatewayConfig {
                 policy: ModelPolicy::CloudAllowed,
-                routing: ModelRouting {
-                    frontier: byok_openai_choice(&secret_ref),
-                    fast: byok_openai_choice(&secret_ref),
-                },
+                routing: ModelRouting::thinking_only(
+                    byok_openai_choice(&secret_ref),
+                    byok_openai_choice(&secret_ref),
+                ),
             },
             vec![Box::new(pos_gateway::OpenAiAdapter {
                 base_url: "https://api.openai.com".to_owned(),
             })],
             &secrets,
             &ledger,
-            &transport,
+            Transports::new(&transport, &transport),
             &clock,
         );
         let request = CompletionRequest {

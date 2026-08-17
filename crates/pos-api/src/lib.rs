@@ -15,6 +15,7 @@ mod gateway_ops;
 #[cfg(feature = "http")]
 pub mod http;
 mod ingest_ops;
+mod ingest_runtime;
 mod project_ops;
 mod run_ops;
 mod sched_ops;
@@ -30,6 +31,9 @@ pub use gateway_ops::{
 pub use ingest_ops::{
     EvidenceListInput, EvidenceListReport, EvidenceRow, EvidenceStageRow, IngestReprocessInput,
     IngestReprocessReport, SourceHealthInput, SourceHealthReport, SourceHealthRow,
+    TranscriptCorrectInput, TranscriptEditReport, TranscriptGetInput, TranscriptReport,
+    TranscriptSegmentRow, TranscriptSpeakerAssignInput, TranscriptSpeakerNameInput,
+    TranscriptSpeakerRow,
 };
 pub use project_ops::{ProjectCreateInput, ProjectExportInput, ProjectPathInput, ProjectSeedInput};
 pub use run_ops::{
@@ -90,7 +94,13 @@ use std::task::{Context, Poll, Waker};
 /// `project.close` joins the commands, `health` reports whether this process
 /// claims queued jobs, and `ingest.reprocess` says whether anything will run
 /// what it queued.
-pub const API_SURFACE_VERSION: u16 = 10;
+/// v11: m1-s03 adds the transcript surface — `transcript.get` reads a
+/// recording's decoded speech with any correction over it, and
+/// `transcript.correct` / `transcript.speaker-name` /
+/// `transcript.speaker-assign` are the three edits. The ASR output is never
+/// rewritten: every row carries `asrText` beside `text`, so "the original is
+/// recoverable" is something a shell can render rather than a claim.
+pub const API_SURFACE_VERSION: u16 = 11;
 
 /// Bounded item budget for the M0 connector-host liveness tick (L8). The socket
 /// itself caps this at 32; the runtime asks for less than it is allowed.
@@ -127,10 +137,12 @@ pub enum QueryName {
     EvidenceList,
     /// Per-source, per-stage ingestion health (m1-s01).
     SourceHealth,
+    /// One page of a recording's transcript, with its speakers (m1-s03).
+    TranscriptGet,
 }
 
 impl QueryName {
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 11;
     pub const ALL: [Self; Self::COUNT] = [
         Self::CapabilitySnapshot,
         Self::ProjectInspect,
@@ -142,6 +154,7 @@ impl QueryName {
         Self::Health,
         Self::EvidenceList,
         Self::SourceHealth,
+        Self::TranscriptGet,
     ];
 
     #[must_use]
@@ -157,6 +170,7 @@ impl QueryName {
             Self::Health => "health",
             Self::EvidenceList => "evidence.list",
             Self::SourceHealth => "source.health",
+            Self::TranscriptGet => "transcript.get",
         }
     }
 
@@ -197,10 +211,15 @@ pub enum CommandName {
     /// Re-run the ingestion pipeline from a stage (m1-s01). Never re-fetches
     /// from the source — that is the whole point of the command.
     IngestReprocess,
+    /// The three transcript edits (m1-s03). Each is an appended fact that
+    /// projects *over* the model's output; none of them rewrites it.
+    TranscriptCorrect,
+    TranscriptSpeakerName,
+    TranscriptSpeakerAssign,
 }
 
 impl CommandName {
-    pub const COUNT: usize = 11;
+    pub const COUNT: usize = 14;
     pub const ALL: [Self; Self::COUNT] = [
         Self::ProjectCreate,
         Self::ProjectExport,
@@ -213,6 +232,9 @@ impl CommandName {
         Self::RunResume,
         Self::ModelsPull,
         Self::IngestReprocess,
+        Self::TranscriptCorrect,
+        Self::TranscriptSpeakerName,
+        Self::TranscriptSpeakerAssign,
     ];
 
     #[must_use]
@@ -229,6 +251,9 @@ impl CommandName {
             Self::RunResume => "run.resume",
             Self::ModelsPull => "models.pull",
             Self::IngestReprocess => "ingest.reprocess",
+            Self::TranscriptCorrect => "transcript.correct",
+            Self::TranscriptSpeakerName => "transcript.speaker-name",
+            Self::TranscriptSpeakerAssign => "transcript.speaker-assign",
         }
     }
 
@@ -504,6 +529,9 @@ impl LocalRuntime {
             Some(QueryName::SourceHealth) => {
                 ingest_ops::source_health(&project_ops::parse_input(input_json)?)
             }
+            Some(QueryName::TranscriptGet) => {
+                ingest_ops::transcript_get(&project_ops::parse_input(input_json)?)
+            }
             None => Err(ApiError::unknown_query(name)),
         }
     }
@@ -600,6 +628,21 @@ impl LocalRuntime {
             Some(CommandName::IngestReprocess) => {
                 self.ingest_reprocess(&project_ops::parse_input(input_json)?)
             }
+            Some(CommandName::TranscriptCorrect) => ingest_ops::transcript_correct(
+                self.identity.device,
+                self.identity.user,
+                &project_ops::parse_input(input_json)?,
+            ),
+            Some(CommandName::TranscriptSpeakerName) => ingest_ops::transcript_speaker_name(
+                self.identity.device,
+                self.identity.user,
+                &project_ops::parse_input(input_json)?,
+            ),
+            Some(CommandName::TranscriptSpeakerAssign) => ingest_ops::transcript_speaker_assign(
+                self.identity.device,
+                self.identity.user,
+                &project_ops::parse_input(input_json)?,
+            ),
             Some(CommandName::RunStart) => run_ops::start(
                 &self.identity,
                 &self.clock,

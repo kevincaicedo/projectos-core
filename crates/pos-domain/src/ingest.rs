@@ -628,6 +628,112 @@ pub enum IngestStageFailedBody {
     },
 }
 
+/// Transcript segments one [`EvidenceTranscribedBody`] carries.
+///
+/// Smaller than the chunk batch because a segment carries its *text* while a
+/// chunk carries a byte range: 64 phrases of speech is a comfortable event,
+/// 4096 would not be. The batch is also the durability grain — a `kill -9`
+/// mid-transcription costs at most the window in flight (m1-s03).
+pub const TRANSCRIPT_BATCH_COUNT_MAX: usize = 64;
+
+/// Bytes one transcript segment may carry. The gateway's `Transcriber` seam
+/// states the same bound; repeating it here is deliberate, because the log
+/// must refuse an oversized fact even if some future adapter forgets to.
+pub const TRANSCRIPT_SEGMENT_TEXT_BYTES_MAX: usize = 16 * 1024;
+
+/// Speakers one recording may have. A meeting with more than this many
+/// distinct voices is a conference, and a bound that is never hit is still
+/// the difference between bounded and unbounded (L8).
+pub const TRANSCRIPT_SPEAKER_COUNT_MAX: u32 = 64;
+
+/// Characters a user-assigned speaker name may hold.
+pub const TRANSCRIPT_SPEAKER_NAME_CHARS_MAX: usize = 128;
+
+/// The speaker every segment starts life assigned to: unattributed.
+///
+/// v1 has no diarization, and inventing "Speaker A / Speaker B" from a pause
+/// would be a fabricated attribution on evidence a citation points at (L3).
+/// Turn *boundaries* are detected; who spoke is the user's to say.
+pub const TRANSCRIPT_SPEAKER_UNASSIGNED: u32 = 0;
+
+/// One decoded stretch of speech, as the log records it.
+///
+/// The ASR text is the durable fact and is never rewritten: a user's
+/// correction is a separate event that projects *over* this one, so the
+/// original output stays recoverable (m1-s03's editable-transcript AC).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TranscriptSegmentFact {
+    /// 0-based position in the recording, in time order. Stable within a
+    /// pass, which is what makes an edit addressable.
+    pub segment_index: u32,
+    /// Milliseconds from the start of the media, at the 10 ms resolution the
+    /// M1 §3.2 transcription contract states.
+    pub start_ms: u64,
+    pub end_ms: u64,
+    /// The pause before this segment was long enough to read as a turn
+    /// boundary. A detected boundary, never a claimed identity.
+    pub starts_turn: bool,
+    pub text: String,
+}
+
+/// A bounded batch of transcript segments from one TRANSCRIBE window.
+///
+/// Committing per window rather than per item is what makes transcription
+/// resumable: the segments already in the log are facts the next attempt does
+/// not redo, so a `kill -9` costs the window in flight and nothing else.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum EvidenceTranscribedBody {
+    V1 {
+        evidence_id: EvidenceId,
+        pass: u32,
+        /// 0-based window index within this pass.
+        batch_index: u32,
+        segments: Vec<TranscriptSegmentFact>,
+    },
+}
+
+/// A user named a speaker in a recording.
+///
+/// No `pass`: a name is about a person, and re-transcribing with a better
+/// model does not change who was in the room. Contrast the two events below,
+/// which are about specific decoded segments and therefore are pass-scoped.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TranscriptSpeakerNamedBody {
+    V1 {
+        evidence_id: EvidenceId,
+        speaker_index: u32,
+        name: String,
+    },
+}
+
+/// A user attributed a segment to a speaker.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TranscriptSegmentSpeakerSetBody {
+    V1 {
+        evidence_id: EvidenceId,
+        pass: u32,
+        segment_index: u32,
+        speaker_index: u32,
+    },
+}
+
+/// A user corrected a segment's text.
+///
+/// Pass-scoped on purpose. A correction says "the model heard this wrong
+/// here"; re-transcribing with a different model produces different segments,
+/// and carrying the correction onto one of them would put a user's words on
+/// audio they never checked. Reprocessing therefore drops corrections, which
+/// is a stated limitation rather than a silent one.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TranscriptTextCorrectedBody {
+    V1 {
+        evidence_id: EvidenceId,
+        pass: u32,
+        segment_index: u32,
+        text: String,
+    },
+}
+
 /// One chunk, as the log records it. `content_hash` is the untruncated
 /// BLAKE3 of the normalized content *without* the evidence id, which is what
 /// lets EMBED (m1-s04) embed identical content once no matter how many

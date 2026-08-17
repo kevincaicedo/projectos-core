@@ -9,6 +9,11 @@
 //! - `proj_chunks` — the atoms citations point at, forever.
 //! - `proj_source_health` — per (source, stage) counters the settings screen
 //!   renders without scanning evidence.
+//! - `proj_transcript_segment` / `proj_transcript_speaker` (m1-s03) — decoded
+//!   speech and the user's corrections over it. The ASR text is written once
+//!   and never assigned again; an edit lands in a *separate column*, so the
+//!   original output is recoverable by reading the row rather than by
+//!   replaying the log.
 //!
 //! ## Two rules these applies encode
 //!
@@ -31,8 +36,10 @@
 use crate::events::DomainEvent;
 use crate::ingest::{
     ChunkFact, EvidenceAddedBody, EvidenceChunkedBody, EvidenceReprocessRequestedBody,
-    EvidenceStatus, IngestStage, IngestStageDisposition, IngestStageFailedBody,
-    IngestStageFinishedBody, IngestStageOutput, IngestStageStartedBody,
+    EvidenceStatus, EvidenceTranscribedBody, IngestStage, IngestStageDisposition,
+    IngestStageFailedBody, IngestStageFinishedBody, IngestStageOutput, IngestStageStartedBody,
+    TRANSCRIPT_SPEAKER_UNASSIGNED, TranscriptSegmentFact, TranscriptSegmentSpeakerSetBody,
+    TranscriptSpeakerNamedBody, TranscriptTextCorrectedBody,
 };
 use pos_log::{
     ApplyError, ColumnDef, ColumnKind, Event, IndexDef, Projection, RowWrite, SqlValue, TableDef,
@@ -662,6 +669,223 @@ fn chunk_row(event: &Event, evidence_id: [u8; 16], pass: u32, chunk: &ChunkFact)
     }
 }
 
+/// Decoded speech, one row per segment per pass.
+///
+/// Three events write here and none of them ever assigns `asr_text` twice:
+/// TRANSCRIBE upserts the row, and the two edit events touch only
+/// `edited_text` / `speaker_index` through partial updates. That is what makes
+/// "the raw ASR output stays immutable, edits project over it" a property of
+/// the schema rather than a promise in a comment (m1-s03).
+struct TranscriptSegmentProjection;
+
+const TRANSCRIPT_SEGMENT_TABLE: TableDef = TableDef {
+    name: "proj_transcript_segment",
+    version: 1,
+    key_columns: &[
+        ColumnDef {
+            name: "evidence_id",
+            kind: ColumnKind::Blob,
+        },
+        // The pass is part of the key, not a filter: a re-transcription is a
+        // different reading of the same audio, and overwriting the old one
+        // would delete the text a stored citation was resolved against.
+        ColumnDef {
+            name: "pass",
+            kind: ColumnKind::Integer,
+        },
+        ColumnDef {
+            name: "segment_index",
+            kind: ColumnKind::Integer,
+        },
+    ],
+    value_columns: &[
+        ColumnDef {
+            name: "start_ms",
+            kind: ColumnKind::Integer,
+        },
+        ColumnDef {
+            name: "end_ms",
+            kind: ColumnKind::Integer,
+        },
+        ColumnDef {
+            name: "starts_turn",
+            kind: ColumnKind::Integer,
+        },
+        ColumnDef {
+            name: "speaker_index",
+            kind: ColumnKind::Integer,
+        },
+        // Written by TRANSCRIBE and by nothing else, ever.
+        ColumnDef {
+            name: "asr_text",
+            kind: ColumnKind::Text,
+        },
+        // NULL until a human corrects this segment. The viewer renders
+        // `edited_text` when present and `asr_text` otherwise, so the
+        // original is one column away rather than one replay away.
+        ColumnDef {
+            name: "edited_text",
+            kind: ColumnKind::Text,
+        },
+        ColumnDef {
+            name: "created_seq",
+            kind: ColumnKind::Integer,
+        },
+    ],
+    indexes: &[
+        // The viewer reads a recording in time order; the resume path reads
+        // the last committed segment. Both are this index.
+        IndexDef {
+            name: "idx_proj_transcript_segment_time",
+            columns: &["evidence_id", "pass", "start_ms"],
+        },
+    ],
+};
+
+impl Projection for TranscriptSegmentProjection {
+    fn table(&self) -> &TableDef {
+        &TRANSCRIPT_SEGMENT_TABLE
+    }
+
+    fn apply(&self, event: &Event) -> Result<Vec<RowWrite>, ApplyError> {
+        match event.kind.as_str() {
+            "EvidenceTranscribed" => {
+                let Some(DomainEvent::EvidenceTranscribed(EvidenceTranscribedBody::V1 {
+                    evidence_id,
+                    pass,
+                    segments,
+                    ..
+                })) = decode_for(&TRANSCRIPT_SEGMENT_TABLE, event)?
+                else {
+                    return Ok(Vec::new());
+                };
+                Ok(segments
+                    .iter()
+                    .map(|segment| segment_row(event, evidence_id.into_bytes(), pass, segment))
+                    .collect())
+            }
+            "TranscriptTextCorrected" => {
+                let Some(DomainEvent::TranscriptTextCorrected(TranscriptTextCorrectedBody::V1 {
+                    evidence_id,
+                    pass,
+                    segment_index,
+                    text: corrected,
+                })) = decode_for(&TRANSCRIPT_SEGMENT_TABLE, event)?
+                else {
+                    return Ok(Vec::new());
+                };
+                Ok(vec![RowWrite::Update {
+                    key: segment_key(evidence_id.into_bytes(), pass, segment_index),
+                    assignments: vec![("edited_text", text(&corrected))],
+                }])
+            }
+            "TranscriptSegmentSpeakerSet" => {
+                let Some(DomainEvent::TranscriptSegmentSpeakerSet(
+                    TranscriptSegmentSpeakerSetBody::V1 {
+                        evidence_id,
+                        pass,
+                        segment_index,
+                        speaker_index,
+                    },
+                )) = decode_for(&TRANSCRIPT_SEGMENT_TABLE, event)?
+                else {
+                    return Ok(Vec::new());
+                };
+                Ok(vec![RowWrite::Update {
+                    key: segment_key(evidence_id.into_bytes(), pass, segment_index),
+                    assignments: vec![("speaker_index", integer_u32(speaker_index))],
+                }])
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+}
+
+fn segment_key(evidence_id: [u8; 16], pass: u32, segment_index: u32) -> Vec<SqlValue> {
+    vec![
+        id_blob(evidence_id),
+        integer_u32(pass),
+        integer_u32(segment_index),
+    ]
+}
+
+fn segment_row(
+    event: &Event,
+    evidence_id: [u8; 16],
+    pass: u32,
+    segment: &TranscriptSegmentFact,
+) -> RowWrite {
+    RowWrite::Upsert {
+        key: segment_key(evidence_id, pass, segment.segment_index),
+        values: vec![
+            integer_u64(segment.start_ms),
+            integer_u64(segment.end_ms),
+            SqlValue::Integer(i64::from(segment.starts_turn)),
+            integer_u32(TRANSCRIPT_SPEAKER_UNASSIGNED),
+            text(&segment.text),
+            SqlValue::Null,
+            seq_value(event),
+        ],
+    }
+}
+
+/// Names a user gave the voices in a recording. Not pass-scoped: who was in
+/// the room does not change when a better model re-reads the audio.
+struct TranscriptSpeakerProjection;
+
+const TRANSCRIPT_SPEAKER_TABLE: TableDef = TableDef {
+    name: "proj_transcript_speaker",
+    version: 1,
+    key_columns: &[
+        ColumnDef {
+            name: "evidence_id",
+            kind: ColumnKind::Blob,
+        },
+        ColumnDef {
+            name: "speaker_index",
+            kind: ColumnKind::Integer,
+        },
+    ],
+    value_columns: &[
+        ColumnDef {
+            name: "name",
+            kind: ColumnKind::Text,
+        },
+        ColumnDef {
+            name: "created_seq",
+            kind: ColumnKind::Integer,
+        },
+    ],
+    indexes: &[],
+};
+
+impl Projection for TranscriptSpeakerProjection {
+    fn table(&self) -> &TableDef {
+        &TRANSCRIPT_SPEAKER_TABLE
+    }
+
+    fn apply(&self, event: &Event) -> Result<Vec<RowWrite>, ApplyError> {
+        if event.kind.as_str() != "TranscriptSpeakerNamed" {
+            return Ok(Vec::new());
+        }
+        let Some(DomainEvent::TranscriptSpeakerNamed(TranscriptSpeakerNamedBody::V1 {
+            evidence_id,
+            speaker_index,
+            name,
+        })) = decode_for(&TRANSCRIPT_SPEAKER_TABLE, event)?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![RowWrite::Upsert {
+            key: vec![
+                id_blob(evidence_id.into_bytes()),
+                integer_u32(speaker_index),
+            ],
+            values: vec![text(&name), seq_value(event)],
+        }])
+    }
+}
+
 /// Per-source, per-stage counters the settings screen renders directly.
 ///
 /// The source id is denormalized out of `EvidenceAdded` and *not* re-read
@@ -856,5 +1080,7 @@ pub fn projections() -> Vec<Box<dyn Projection>> {
         Box::new(EvidenceStagesProjection),
         Box::new(ChunksProjection),
         Box::new(SourceHealthProjection),
+        Box::new(TranscriptSegmentProjection),
+        Box::new(TranscriptSpeakerProjection),
     ]
 }

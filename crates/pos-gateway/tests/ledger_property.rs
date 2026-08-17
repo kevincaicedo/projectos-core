@@ -16,7 +16,7 @@ use pos_foundation::{ManualWallClock, ProjectId};
 use pos_gateway::{
     CallAttribution, ChatMessage, CompletionRequest, Gateway, GatewayConfig, MemoryLedger,
     MessageRole, ModelPolicy, ProviderCostKind, RoutingTier, SecretRef, SecretStore,
-    TransportError, VecSink,
+    TransportError, Transports, VecSink,
 };
 use proptest::prelude::*;
 
@@ -138,7 +138,7 @@ proptest! {
             all_providers(),
             &secrets,
             &ledger,
-            &transport,
+            Transports::new(&transport, &transport),
             &clock,
         );
 

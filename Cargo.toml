@@ -81,6 +81,21 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # ts-rs generates the apps/ui API types from the Rust wire types (L12); the
 # serde-compat default keeps the emitted TS aligned with the serde wire names.
 ts-rs = "12"
+# The reviewed TLS transport (m1-s03, ADR-0006 §1). Default features off: we
+# take `rustls` (which brings the ring provider and the webpki root store) and
+# nothing else — no gzip, no cookies, no proxy support. The feature list is
+# part of the reviewed supply chain.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+# Audio demuxing and decoding (ADR-0006 §3). Codecs are enumerated rather than
+# `all`: every one is attack surface over untrusted bytes (L6), so the list is
+# exactly the containers a design partner drops — m4a/mp4, mp3, wav, flac,
+# ogg, and mkv/webm screen recordings.
+symphonia = { version = "0.6", default-features = false, features = ["aac", "alac", "isomp4", "mp3", "wav", "pcm", "flac", "ogg", "vorbis", "mkv"] }
+# Pinned exactly, and that pin is load-bearing: this crate builds whisper.cpp,
+# whose ABI changes between versions, and ADR-0006 §2 took it as stated debt in
+# place of vendoring the FFI leaf. No GPU feature is enabled — the §18 gate is
+# stated for CPU on the reference laptop.
+whisper-rs = "=0.16.0"
 
 [workspace.lints.rust]
 # -D warnings everywhere (STYLE "Tooling as law"); never weaken to merge.

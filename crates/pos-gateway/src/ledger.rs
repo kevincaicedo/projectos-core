@@ -6,7 +6,6 @@
 //! projection query.
 
 use crate::credentials::CredentialClass;
-use crate::provider::ProviderFamily;
 use pos_foundation::ProjectId;
 
 /// Who pays for a call and how sure we are about the number (m0-s10):
@@ -48,7 +47,12 @@ pub struct ModelCallRecord {
     pub project: ProjectId,
     pub feature: String,
     pub agent: Option<String>,
-    pub provider: ProviderFamily,
+    /// The engine label: a [`ProviderFamily`] name for a wire call, or a
+    /// [`crate::Transcriber`]'s label for an in-process model. A `&'static str`
+    /// rather than the family enum because transcription can run inside this
+    /// process, and "openai-compatible" would be a lie in the cost report
+    /// (m1-s03). The durable cost event already stores it as text.
+    pub provider: &'static str,
     pub credential_class: &'static str,
     pub model: String,
     pub tokens_in: u64,

@@ -4,16 +4,29 @@
 //! runnable from recorded fixtures and the zero-network-I/O policy test
 //! provable — a dispatch the policy refuses never reaches a transport at all.
 //!
-//! The one live transport in core today, [`LoopbackHttpTransport`], is
-//! loopback-only *by construction*: it refuses any non-loopback host with a
-//! typed error before connecting. Local endpoint qualification (Ollama,
-//! LM Studio, vLLM) needs exactly this much; the cloud-capable TLS transport
-//! is a deliberate later dependency review owned by the first story that can
-//! actually run a live cloud smoke (m1-s03), recorded as
-//! visible debt in `docs/progress.md`. Until then, core is structurally
-//! incapable of cloud egress — the strongest possible form of L9's
-//! `local_only` guarantee.
+//! ## Two transports, and why the choice is a value
+//!
+//! [`LoopbackHttpTransport`] is loopback-only *by construction*: it speaks
+//! `http` and refuses any host that does not resolve to a loopback address,
+//! before connecting. [`TlsHttpTransport`] is its mirror image: it speaks
+//! `https` only, so no credential ever crosses the wire in cleartext.
+//!
+//! Until m1-s03 the loopback transport was the *only* one, which made
+//! "`local_only` cannot egress" a property of the build. [ADR-0006] adds the
+//! TLS transport and states the weakening plainly: the guarantee becomes
+//!
+//! > under `local_only`, dispatch **selects** a transport that is structurally
+//! > incapable of reaching a non-loopback host.
+//!
+//! [`TransportSelection`] is what makes that sentence checkable. The gateway
+//! holds a [`Transports`] set rather than one transport, resolves the
+//! selection from the endpoint's declared locality, and the m0-s10 policy
+//! oracle asserts the *selection* — not merely the absence of an alternative.
+//!
+//! [ADR-0006]: ../../../../docs/adr/0006-transcription-and-tls-dependencies.md
 
+use crate::policy::EndpointLocality;
+use crate::weather::Weather;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
@@ -185,9 +198,115 @@ pub trait HttpTransport {
     ) -> Result<(), TransportError>;
 }
 
-/// The scheme/host/port/path of a plan URL. Only `http` parses: `https`
-/// requires the TLS transport this crate deliberately does not have yet, and
-/// naming that refusal beats a confusing connect error.
+/// Which transport a dispatch selected, as a value.
+///
+/// The gateway used to hold exactly one transport, so "`local_only` cannot
+/// egress" was true because nothing else existed. [ADR-0006] adds a TLS
+/// transport and replaces that with a typed selection; this enum is the thing
+/// the policy oracle asserts, which is the compensating control the ADR makes
+/// non-optional.
+///
+/// [ADR-0006]: ../../../../docs/adr/0006-transcription-and-tls-dependencies.md
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportSelection {
+    /// No transport at all — the model runs inside this process (local
+    /// whisper). The strongest local-only statement available: there is no
+    /// socket to refuse.
+    InProcess,
+    /// [`LoopbackHttpTransport`], which refuses every non-loopback host.
+    DeviceLocal,
+    /// [`TlsHttpTransport`]. Only a policy-authorized remote endpoint reaches
+    /// it, and only over `https`.
+    Remote,
+}
+
+impl TransportSelection {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InProcess => "in_process",
+            Self::DeviceLocal => "device_local",
+            Self::Remote => "remote",
+        }
+    }
+
+    /// The selection an endpoint's declared locality implies. Total, and
+    /// derived from the *declaration* rather than from the URL, so a config
+    /// that lied about locality would have been refused at construction
+    /// (`EndpointConfig::new`) rather than sniffed here.
+    #[must_use]
+    pub const fn for_locality(locality: EndpointLocality) -> Self {
+        match locality {
+            EndpointLocality::InProcess => Self::InProcess,
+            EndpointLocality::DeviceLocal => Self::DeviceLocal,
+            EndpointLocality::Remote => Self::Remote,
+        }
+    }
+}
+
+/// The transports one gateway may select between.
+///
+/// `remote` is an `Option` because a build or a deployment may compose no
+/// cloud transport at all — and when it does not, a remote dispatch that got
+/// past the policy gate refuses typed instead of silently doing nothing.
+pub struct Transports<'runtime> {
+    device_local: &'runtime dyn HttpTransport,
+    remote: Option<&'runtime dyn HttpTransport>,
+}
+
+impl<'runtime> Transports<'runtime> {
+    /// A gateway that can only reach this device.
+    #[must_use]
+    pub const fn device_local_only(device_local: &'runtime dyn HttpTransport) -> Self {
+        Self {
+            device_local,
+            remote: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn new(
+        device_local: &'runtime dyn HttpTransport,
+        remote: &'runtime dyn HttpTransport,
+    ) -> Self {
+        Self {
+            device_local,
+            remote: Some(remote),
+        }
+    }
+
+    #[must_use]
+    pub const fn has_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    /// The transport for one selection. [`TransportSelection::InProcess`]
+    /// resolves to `None` on purpose: an in-process model must not be handed
+    /// a socket it could accidentally use.
+    ///
+    /// # Errors
+    ///
+    /// [`Weather::TransportUnavailable`] when a remote dispatch is authorized
+    /// but this gateway composed no cloud transport.
+    pub fn resolve(
+        &self,
+        selection: TransportSelection,
+    ) -> Result<Option<&'runtime dyn HttpTransport>, Weather> {
+        match selection {
+            TransportSelection::InProcess => Ok(None),
+            TransportSelection::DeviceLocal => Ok(Some(self.device_local)),
+            TransportSelection::Remote => self.remote.map(Some).ok_or({
+                Weather::TransportUnavailable {
+                    selection: TransportSelection::Remote.as_str(),
+                }
+            }),
+        }
+    }
+}
+
+/// The scheme/host/port/path of a plan URL. Only `http` parses here: `https`
+/// is [`TlsHttpTransport`]'s, and naming that split beats a confusing connect
+/// error.
 struct ParsedUrl {
     host: String,
     port: u16,
@@ -202,7 +321,7 @@ fn parse_http_url(url: &str) -> Result<ParsedUrl, TransportError> {
         let host = rest.split(['/', ':']).next().unwrap_or(rest);
         return Err(TransportError::HostRefused {
             host: host.to_owned(),
-            reason: "https requires the cloud-capable TLS transport (visible debt: m1-s03)",
+            reason: "https is the TLS transport's; this one reaches loopback only",
         });
     }
     let rest = url.strip_prefix("http://").ok_or_else(invalid)?;

@@ -27,6 +27,11 @@ export function useApiQuery<T>(
   inputJson: string | undefined,
   validate: (value: unknown) => T | null,
   isEmpty: (data: T) => boolean,
+  /// Hold the query until the caller has something to ask about — a viewer
+  /// with nothing selected yet. Dispatching anyway would spend a round trip
+  /// to be told the input is invalid, and would render an error where the
+  /// honest state is "nothing chosen".
+  skip = false,
 ): UseApiQueryResult<T> {
   const [view, setView] = useState<QueryView<T>>({ state: "loading" });
   // Monotonic request id: a slow first response must not overwrite a newer
@@ -40,6 +45,10 @@ export function useApiQuery<T>(
   const refetch = useCallback(() => {
     latestRequest.current += 1;
     const request = latestRequest.current;
+    if (skip) {
+      setView({ state: "empty" });
+      return;
+    }
     setView({ state: "loading" });
     void apiQuery(name, inputJson).then((outcome) => {
       if (latestRequest.current !== request) {
@@ -63,7 +72,7 @@ export function useApiQuery<T>(
       }
       setView(isEmptyRef.current(data) ? { state: "empty" } : { state: "success", data });
     });
-  }, [name, inputJson]);
+  }, [name, inputJson, skip]);
 
   useEffect(refetch, [refetch]);
 

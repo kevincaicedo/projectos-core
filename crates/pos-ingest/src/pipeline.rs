@@ -8,6 +8,7 @@ use crate::IngestError;
 use crate::budget::{BoundedStream, STAGE_BUFFER_BYTES_MAX_DEFAULT, StreamBudget};
 use crate::identity::{derive_evidence_id, derive_source_id};
 use crate::segment::SegmentReader;
+use crate::transcribe::{StageLedgers, TranscribeSetup, TranscribeStage, UnmeteredLedgers};
 use pos_domain::{
     CHUNK_BATCH_COUNT_MAX, ChunkFact, DomainEvent, EvidenceAddedBody, EvidenceChunkedBody,
     EvidenceRecord, EvidenceShape, ExternalRef, IngestStage, IngestStageDisposition,
@@ -105,21 +106,59 @@ impl SubmitOutcome {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct PipelineConfig {
     pub device: DeviceId,
     pub buffer_bytes_max: usize,
     pub stage_retry_count_max: u32,
+    /// Where a stage's model calls record their cost (m1-s03). Defaults to
+    /// [`UnmeteredLedgers`], which refuses — a pipeline that only plans work
+    /// never needs one, and a pipeline that runs model stages must be given
+    /// one deliberately rather than silently losing the meter.
+    pub ledgers: Arc<dyn StageLedgers>,
+    /// Credential material for a stage routed at a remote endpoint. Empty by
+    /// default, which is what a local-only pipeline needs.
+    pub secrets: Arc<dyn pos_gateway::SecretStore + Send + Sync>,
+}
+
+impl std::fmt::Debug for PipelineConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PipelineConfig")
+            .field("device", &self.device)
+            .field("buffer_bytes_max", &self.buffer_bytes_max)
+            .field("stage_retry_count_max", &self.stage_retry_count_max)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PipelineConfig {
     #[must_use]
-    pub const fn for_device(device: DeviceId) -> Self {
+    pub fn for_device(device: DeviceId) -> Self {
         Self {
             device,
             buffer_bytes_max: STAGE_BUFFER_BYTES_MAX_DEFAULT,
             stage_retry_count_max: STAGE_RETRY_COUNT_MAX,
+            ledgers: Arc::new(UnmeteredLedgers),
+            secrets: Arc::new(pos_gateway::MemorySecretStore::new()),
         }
+    }
+
+    /// Composes the cost ledger this pipeline's model stages meter into.
+    #[must_use]
+    pub fn with_ledgers(mut self, ledgers: Arc<dyn StageLedgers>) -> Self {
+        self.ledgers = ledgers;
+        self
+    }
+
+    /// Composes the credential store a remote-routed stage resolves through.
+    #[must_use]
+    pub fn with_secrets(
+        mut self,
+        secrets: Arc<dyn pos_gateway::SecretStore + Send + Sync>,
+    ) -> Self {
+        self.secrets = secrets;
+        self
     }
 }
 
@@ -245,17 +284,49 @@ pub struct StageContext<'a> {
     log: &'a ProjectLog,
     clock: &'a dyn WallClock,
     device: DeviceId,
+    project_id: ProjectId,
     job_id: JobId,
     evidence: &'a EvidenceRecord,
     stage: IngestStage,
     pass: u32,
     buffer_bytes_max: usize,
+    config: &'a PipelineConfig,
 }
 
 impl StageContext<'_> {
     #[must_use]
     pub const fn evidence(&self) -> &EvidenceRecord {
         self.evidence
+    }
+
+    #[must_use]
+    pub const fn log(&self) -> &ProjectLog {
+        self.log
+    }
+
+    #[must_use]
+    pub const fn clock(&self) -> &dyn WallClock {
+        self.clock
+    }
+
+    #[must_use]
+    pub const fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+
+    #[must_use]
+    pub fn secrets(&self) -> &dyn pos_gateway::SecretStore {
+        self.config.secrets.as_ref()
+    }
+
+    /// A cost ledger bound to this attempt. Every model call a stage makes
+    /// goes through it, so per-stage cost is the ledger's answer rather than a
+    /// second counter (m0-s15: one number, one owner).
+    #[must_use]
+    pub fn open_ledger(&self) -> Box<dyn pos_gateway::CostLedger + '_> {
+        self.config
+            .ledgers
+            .open(self.log, self.clock, Actor::System(self.job_id))
     }
 
     #[must_use]
@@ -268,9 +339,26 @@ impl StageContext<'_> {
         StreamBudget::new(self.stage, self.buffer_bytes_max)
     }
 
-    /// The original bytes, streamed. NORMALIZE and TRANSCRIBE read this.
+    /// The original bytes, streamed. NORMALIZE reads this.
     pub fn open_content(&self) -> Result<BoundedStream<File>, IngestError> {
         self.open_blob(self.evidence.content_blob)
+    }
+
+    /// The original bytes as a seekable file, for a decoder that owns its own
+    /// buffering.
+    ///
+    /// The one documented exception to P4, and a narrow one: a media demuxer
+    /// must seek (a container's index is not at its start), and `symphonia`
+    /// reads through its own 64 KiB `MediaSourceStream` buffer rather than
+    /// into memory. The bound is still stated and still enforced — by the
+    /// decoder's buffer and by TRANSCRIBE's window — it is just not
+    /// `BoundedStream`'s. Nothing else in this crate may use this.
+    pub fn open_content_file(&self) -> Result<File, IngestError> {
+        Ok(self
+            .log
+            .store()
+            .blobs()
+            .open_blob(BlobHash::from_bytes(self.evidence.content_blob))?)
     }
 
     /// The normalized text, streamed. CHUNK and every later stage read this.
@@ -332,6 +420,28 @@ impl StageContext<'_> {
             batch_index,
             chunks,
         });
+        let request = event.into_request(self.device, Actor::System(self.job_id))?;
+        self.log.append(request, self.clock)?;
+        Ok(())
+    }
+
+    /// Commits one window's transcript segments (m1-s03). Same shape and same
+    /// reason as [`Self::emit_chunks`]: the batch is durable before the next
+    /// window starts, which is what makes transcription resumable.
+    pub fn emit_transcript(
+        &self,
+        batch_index: u32,
+        segments: Vec<pos_domain::TranscriptSegmentFact>,
+    ) -> Result<(), IngestError> {
+        if segments.is_empty() {
+            return Ok(());
+        }
+        let event = crate::transcribe::transcribed_event(
+            self.evidence.evidence_id,
+            self.pass,
+            batch_index,
+            segments,
+        );
         let request = event.into_request(self.device, Actor::System(self.job_id))?;
         self.log.append(request, self.clock)?;
         Ok(())
@@ -504,11 +614,13 @@ impl IngestPipeline {
             log,
             clock,
             device: self.config.device,
+            project_id,
             job_id: job.job_id,
             evidence,
             stage,
             pass,
             buffer_bytes_max: self.config.buffer_bytes_max,
+            config: &self.config,
         };
         match handler.run(&context) {
             Ok(product) => {
@@ -719,9 +831,10 @@ fn blob_byte_size(log: &ProjectLog, hash: BlobHash) -> Result<u64, IngestError> 
 /// m1-s03/s04/s05/s11 land their stages they are added here, and every item
 /// already in a project resumes with `pos ingest reprocess --from-stage`.
 #[must_use]
-pub fn stage_registry_default() -> StageRegistry {
+pub fn stage_registry_default(transcribe: &TranscribeSetup) -> StageRegistry {
     StageRegistry::new()
         .with(Arc::new(crate::normalize::NormalizeStage))
+        .with(Arc::new(TranscribeStage::new(transcribe.clone())))
         .with(Arc::new(crate::chunk::ChunkStage::new()))
 }
 

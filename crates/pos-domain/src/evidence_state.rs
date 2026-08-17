@@ -13,7 +13,7 @@ use crate::ingest::{
 use pos_foundation::{ChunkId, EventSeq, EvidenceId, JobId, SourceId};
 use pos_log::ProjectLog;
 use pos_store::StoreError;
-use pos_store::rusqlite::{OptionalExtension, Row};
+use pos_store::rusqlite::{self, OptionalExtension, Row};
 use std::fmt;
 
 /// Rows one evidence or chunk listing returns (L8). A partner corpus holds
@@ -311,6 +311,163 @@ pub fn list_chunks(
 
 const CHUNK_COLUMNS: &str = "chunk_id, evidence_id, ordinal, kind, byte_start, byte_end, \
      locator_kind, locator_start, locator_end, content_hash, token_count_estimate, pass";
+
+/// One decoded segment of speech, with any correction over it (m1-s03).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranscriptSegmentRecord {
+    pub segment_index: u32,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub starts_turn: bool,
+    pub speaker_index: u32,
+    /// Exactly what the model produced. Never rewritten.
+    pub asr_text: String,
+    /// A human's correction, when one exists.
+    pub edited_text: Option<String>,
+}
+
+impl TranscriptSegmentRecord {
+    /// What a viewer renders: the correction when there is one, the model's
+    /// words otherwise. The original is always still in `asr_text`.
+    #[must_use]
+    pub fn rendered_text(&self) -> &str {
+        self.edited_text.as_deref().unwrap_or(&self.asr_text)
+    }
+
+    #[must_use]
+    pub const fn is_edited(&self) -> bool {
+        self.edited_text.is_some()
+    }
+}
+
+const TRANSCRIPT_SEGMENT_COLUMNS: &str =
+    "segment_index, start_ms, end_ms, starts_turn, speaker_index, asr_text, edited_text";
+
+fn transcript_segment_row(row: &Row<'_>) -> Result<TranscriptSegmentRecord, rusqlite::Error> {
+    Ok(TranscriptSegmentRecord {
+        segment_index: u32::try_from(row.get::<_, i64>(0)?).unwrap_or(0),
+        start_ms: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+        end_ms: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+        starts_turn: row.get::<_, i64>(3)? != 0,
+        speaker_index: u32::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+        asr_text: row.get(5)?,
+        edited_text: row.get(6)?,
+    })
+}
+
+/// One page of a recording's transcript, in time order.
+///
+/// Paged rather than whole because a two-hour interview is thousands of
+/// segments and TRANSCRIBE itself streams them back out to build the text
+/// blob — an unbounded read here would put the whole transcript in memory on
+/// the one path the §18 RSS bound is about (L8).
+///
+/// # Errors
+///
+/// [`EvidenceReadError::Store`] when the projection cannot be read.
+pub fn list_transcript_segments(
+    log: &ProjectLog,
+    evidence_id: EvidenceId,
+    pass: u32,
+    after_segment_index: Option<u32>,
+    row_count_max: u32,
+) -> Result<Vec<TranscriptSegmentRecord>, EvidenceReadError> {
+    let limit = i64::from(row_count_max.min(EVIDENCE_LIST_ROW_COUNT_MAX));
+    let after = i64::from(after_segment_index.map_or(0, |index| index.saturating_add(1)));
+    let sql = format!(
+        "SELECT {TRANSCRIPT_SEGMENT_COLUMNS} FROM proj_transcript_segment \
+         WHERE evidence_id = ?1 AND pass = ?2 AND segment_index >= ?3 \
+         ORDER BY segment_index ASC LIMIT ?4"
+    );
+    let rows = log
+        .store()
+        .db()
+        .with_reader("list transcript segments", |db| {
+            let mut statement = db.prepare_cached(&sql)?;
+            let rows = statement.query_map(
+                pos_store::rusqlite::params![
+                    evidence_id.into_bytes().to_vec(),
+                    i64::from(pass),
+                    after,
+                    limit
+                ],
+                transcript_segment_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?;
+    Ok(rows)
+}
+
+/// Where a resumed TRANSCRIBE attempt picks up: the highest committed segment
+/// index and the millisecond it ended at, or `None` when nothing is committed.
+///
+/// This is the whole of the kill-resume mechanism. The durable segments are
+/// facts; the next attempt decodes from `end_ms` and numbers from
+/// `segment_index + 1`, so no completed segment is transcribed twice.
+///
+/// # Errors
+///
+/// [`EvidenceReadError::Store`] when the projection cannot be read.
+pub fn read_transcript_progress(
+    log: &ProjectLog,
+    evidence_id: EvidenceId,
+    pass: u32,
+) -> Result<Option<(u32, u64)>, EvidenceReadError> {
+    let progress = log
+        .store()
+        .db()
+        .with_reader("read transcript progress", |db| {
+            db.query_row(
+                "SELECT max(segment_index), max(end_ms) FROM proj_transcript_segment \
+                 WHERE evidence_id = ?1 AND pass = ?2",
+                pos_store::rusqlite::params![evidence_id.into_bytes().to_vec(), i64::from(pass)],
+                |row| {
+                    Ok(row
+                        .get::<_, Option<i64>>(0)?
+                        .zip(row.get::<_, Option<i64>>(1)?))
+                },
+            )
+            .optional()
+            .map(Option::flatten)
+        })?;
+    Ok(progress.map(|(index, end_ms)| {
+        (
+            u32::try_from(index).unwrap_or(0),
+            u64::try_from(end_ms).unwrap_or(0),
+        )
+    }))
+}
+
+/// The names a user gave this recording's voices, by speaker index.
+///
+/// # Errors
+///
+/// [`EvidenceReadError::Store`] when the projection cannot be read.
+pub fn list_transcript_speakers(
+    log: &ProjectLog,
+    evidence_id: EvidenceId,
+) -> Result<Vec<(u32, String)>, EvidenceReadError> {
+    let rows = log
+        .store()
+        .db()
+        .with_reader("list transcript speakers", |db| {
+            let mut statement = db.prepare_cached(
+                "SELECT speaker_index, name FROM proj_transcript_speaker \
+                 WHERE evidence_id = ?1 ORDER BY speaker_index ASC",
+            )?;
+            let rows = statement.query_map(
+                pos_store::rusqlite::params![evidence_id.into_bytes().to_vec()],
+                |row| {
+                    Ok((
+                        u32::try_from(row.get::<_, i64>(0)?).unwrap_or(0),
+                        row.get::<_, String>(1)?,
+                    ))
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?;
+    Ok(rows)
+}
 
 /// How many chunk rows share each content hash — the F6 dedup answer.
 /// Returns `(distinct_content_count, chunk_row_count)`, so "identical content

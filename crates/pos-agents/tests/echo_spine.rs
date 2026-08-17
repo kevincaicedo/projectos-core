@@ -14,7 +14,7 @@ use pos_gateway::{
     CredentialClass, EndpointConfig, EndpointLocality, EndpointProfile, Gateway, GatewayConfig,
     HttpHead, HttpRequestPlan, HttpTransport, MemoryLedger, MemorySecretStore, ModelChoice,
     ModelPolicy, ModelRouting, OpenAiCompatibleAdapter, PromptFile, ProviderFamily,
-    ResponseHandler, TransportError,
+    ResponseHandler, TransportError, Transports,
 };
 use pos_log::{Actor, LogConfig, ProjectLog};
 use pos_store::{BlobHash, ProjectStore};
@@ -93,10 +93,7 @@ fn echo_runs_three_checkpointed_steps_with_one_attributed_model_call() {
     let gateway = Gateway::new(
         GatewayConfig {
             policy: ModelPolicy::LocalOnly,
-            routing: ModelRouting {
-                frontier: choice.clone(),
-                fast: choice,
-            },
+            routing: ModelRouting::thinking_only(choice.clone(), choice),
         },
         vec![Box::new(OpenAiCompatibleAdapter {
             base_url: "http://127.0.0.1:11434".to_owned(),
@@ -107,7 +104,7 @@ fn echo_runs_three_checkpointed_steps_with_one_attributed_model_call() {
         })],
         &secrets,
         &ledger,
-        &transport,
+        Transports::device_local_only(&transport),
         &clock,
     );
     let prompt =

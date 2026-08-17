@@ -23,13 +23,15 @@ mod policy;
 mod prompts;
 mod provider;
 mod sse;
+mod tls;
+mod transcribe;
 mod transport;
 mod weather;
 
 pub use adapter::{
-    AnthropicAdapter, EndpointProfile, EndpointServer, GoogleAdapter, OpenAiAdapter,
-    OpenAiCompatibleAdapter, OpenRouterAdapter, QualificationReport, list_models,
-    qualify_openai_compatible,
+    AnthropicAdapter, CloudSttAdapter, EndpointProfile, EndpointServer, GoogleAdapter,
+    OpenAiAdapter, OpenAiCompatibleAdapter, OpenRouterAdapter, QualificationReport,
+    WhisperLocalTranscriber, list_models, qualify_openai_compatible,
 };
 pub use credentials::{
     CallAuth, CredentialClass, MemorySecretStore, SecretError, SecretRef, SecretStore, SecretValue,
@@ -56,8 +58,14 @@ pub use provider::{
     VecSink,
 };
 pub use sse::{SseDecoder, SseEvent, SseParseError};
+pub use tls::TlsHttpTransport;
+pub use transcribe::{
+    AUDIO_SAMPLE_RATE_HZ, SEGMENT_TEXT_BYTES_MAX, TURN_GAP_MS, TranscribeRequest, TranscribeUsage,
+    Transcriber, TranscriptSegment, TranscriptSink, VecTranscriptSink, WINDOW_MS_MAX,
+    WINDOW_MS_MIN, WINDOW_SAMPLE_COUNT_MAX, mark_turns,
+};
 pub use transport::{
     BufferedResponse, HttpHead, HttpMethod, HttpRequestPlan, HttpTransport, LoopbackHttpTransport,
-    ResponseHandler, StreamAbort, TransportError,
+    ResponseHandler, StreamAbort, TransportError, TransportSelection, Transports,
 };
 pub use weather::Weather;

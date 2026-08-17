@@ -190,7 +190,36 @@ pub fn local_fast_choice() -> ModelChoice {
 }
 
 pub fn routing(frontier: ModelChoice, fast: ModelChoice) -> ModelRouting {
-    ModelRouting { frontier, fast }
+    ModelRouting::thinking_only(frontier, fast)
+}
+
+/// A transcription route that runs inside this process — the local whisper
+/// shape, without loading a model.
+pub fn in_process_transcribe_choice() -> ModelChoice {
+    ModelChoice {
+        family: ProviderFamily::OpenAiCompatible,
+        endpoint: EndpointConfig::in_process("whisper-local"),
+        model: "whisper-small".to_owned(),
+        credential: CredentialClass::DeviceSession {
+            adapter: "whisper".to_owned(),
+            device: pos_foundation::DeviceId::from_bytes([9; 16]),
+        },
+        is_pinned_family_base: false,
+    }
+}
+
+/// A cloud STT route at a remote endpoint.
+pub fn cloud_transcribe_choice(secret_ref: &SecretRef) -> ModelChoice {
+    ModelChoice {
+        family: ProviderFamily::OpenAi,
+        endpoint: EndpointConfig::new("https://api.openai.com", EndpointLocality::Remote)
+            .expect("remote endpoint"),
+        model: "whisper-1".to_owned(),
+        credential: CredentialClass::Byok {
+            secret_ref: secret_ref.clone(),
+        },
+        is_pinned_family_base: true,
+    }
 }
 
 pub fn byok_store(secret_ref: &SecretRef, value: &str) -> MemorySecretStore {

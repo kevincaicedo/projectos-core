@@ -424,3 +424,93 @@ button:disabled {
 .dead-letters p {
   margin: var(--space-1) 0 0;
 }
+
+/* The transcript viewer (m1-s03). The gutter is a fixed column so timecodes
+   line up down the page — a transcript a reader scans by time, not a list of
+   sentences. Edited lines carry a left rule rather than a colour badge: the
+   correction is the reader's own, not a system warning. */
+.transcript-recordings {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-3);
+  padding: 0;
+}
+
+.transcript-recordings button {
+  background: var(--surface-raised);
+  border: 1px solid var(--line-default);
+  border-radius: var(--radius-control);
+  color: var(--ink-secondary);
+  cursor: pointer;
+  font-size: var(--size-meta);
+  padding: var(--space-1) var(--space-2);
+}
+
+.transcript-recordings button[aria-pressed="true"] {
+  background: var(--accent-green-tint);
+  border-color: var(--accent-green-tint-strong);
+  color: var(--ink-deep);
+}
+
+.transcript-turns {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.transcript-turn {
+  align-items: baseline;
+  border-left: 2px solid transparent;
+  display: grid;
+  gap: var(--space-2);
+  grid-template-columns: 4rem 8rem 1fr;
+  padding: var(--space-1) 0 var(--space-1) var(--space-2);
+}
+
+/* A detected pause opens a turn; the space is the only cue, because the
+   pause is all v1 actually knows (no diarization). */
+.transcript-turn[data-starts-turn="true"] {
+  margin-top: var(--space-2);
+}
+
+.transcript-turn[data-edited="true"] {
+  border-left-color: var(--accent-green-tint-strong);
+}
+
+.transcript-turn .transcript-text,
+.transcript-turn .transcript-speaker {
+  background: none;
+  border: none;
+  color: var(--ink-primary);
+  cursor: text;
+  font: inherit;
+  padding: 0;
+  text-align: left;
+}
+
+.transcript-turn .transcript-speaker {
+  color: var(--ink-secondary-soft);
+  cursor: pointer;
+  font-size: var(--size-meta);
+}
+
+.transcript-edit {
+  display: flex;
+  gap: var(--space-1);
+}
+
+/* An editor is wider than the column it replaces, so it takes the rest of the
+   row and the words move down a line. Overlapping them would leave a control
+   a pointer cannot reach. */
+.transcript-turn .transcript-speaker-edit {
+  grid-column: 2 / -1;
+}
+
+.transcript-edit input {
+  border: 1px solid var(--line-default);
+  border-radius: var(--radius-control);
+  font: inherit;
+  padding: var(--space-1);
+}

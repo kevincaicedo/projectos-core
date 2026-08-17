@@ -378,6 +378,7 @@ fn check_rust_file(
         telemetry_emission_allowed: telemetry_emission_allowed(root, path),
         registered_kind_detail_allowed: registered_kind_detail_allowed(root, path),
         slurp_policy_enforced: slurp_policy_enforced(root, path),
+        confined_denied: confined_denied(root, path),
         violations,
     };
     visitor.visit_file(&syntax);
@@ -420,6 +421,8 @@ struct PolicyVisitor<'a> {
     telemetry_emission_allowed: bool,
     registered_kind_detail_allowed: bool,
     slurp_policy_enforced: bool,
+    /// Confined third-party crate idents this file may *not* name.
+    confined_denied: Vec<&'static ConfinedCrate>,
     violations: &'a mut Vec<Violation>,
 }
 
@@ -532,6 +535,27 @@ impl PolicyVisitor<'_> {
         });
     }
 
+    /// The m1-s03 vendor-containment rule. Same shape as the telemetry rule:
+    /// one owning module, mechanically enforced, with a seeded fixture.
+    fn check_confined_path(&mut self, ident: &str, line: usize) {
+        let Some(confined) = self
+            .confined_denied
+            .iter()
+            .find(|confined| confined.ident == ident)
+        else {
+            return;
+        };
+        self.violations.push(Violation {
+            policy: "vendor-containment",
+            path: self.path.to_path_buf(),
+            line: Some(line),
+            message: format!(
+                "`{}` is reachable only from {}: {}",
+                confined.ident, confined.owner, confined.reason
+            ),
+        });
+    }
+
     fn check_projection_literal(&mut self, value: &str, line: usize) {
         if self.projection_writes_allowed {
             return;
@@ -580,20 +604,23 @@ impl<'ast> Visit<'ast> for PolicyVisitor<'_> {
     fn visit_path(&mut self, path: &'ast syn::Path) {
         self.check_telemetry_path(path, path.span().start().line);
         self.check_slurp_path(path, path.span().start().line);
+        if let Some(leading) = path.segments.first() {
+            self.check_confined_path(&leading.ident.to_string(), path.span().start().line);
+        }
         syn::visit::visit_path(self, path);
     }
 
     fn visit_use_tree(&mut self, tree: &'ast syn::UseTree) {
-        if let syn::UseTree::Path(used) = tree
-            && !self.telemetry_emission_allowed
-            && used.ident == "tracing"
-        {
-            self.violations.push(Violation {
-                policy: "telemetry-vocabulary",
-                path: self.path.to_path_buf(),
-                line: Some(used.ident.span().start().line),
-                message: TELEMETRY_EMISSION_MESSAGE.to_owned(),
-            });
+        if let syn::UseTree::Path(used) = tree {
+            if !self.telemetry_emission_allowed && used.ident == "tracing" {
+                self.violations.push(Violation {
+                    policy: "telemetry-vocabulary",
+                    path: self.path.to_path_buf(),
+                    line: Some(used.ident.span().start().line),
+                    message: TELEMETRY_EMISSION_MESSAGE.to_owned(),
+                });
+            }
+            self.check_confined_path(&used.ident.to_string(), used.ident.span().start().line);
         }
         syn::visit::visit_use_tree(self, tree);
     }
@@ -697,6 +724,27 @@ const TELEMETRY_EMISSION_MESSAGE: &str = "`tracing` is reachable only from crate
 const REGISTERED_KIND_DETAIL: &str = "from_registered_kind";
 const REGISTERED_KIND_DETAIL_OWNER: &str = "crates/pos-sched/src/pool.rs";
 
+/// The one module that may name `whisper_rs` (m1-s03, ADR-0006 §2).
+///
+/// The founder decision took the `whisper-rs` wrapper instead of vendoring the
+/// whisper.cpp FFI leaf, as stated technical debt. That debt is only payable
+/// if swapping the wrapper stays a one-file change, so the containment is
+/// mechanical rather than a review habit — the same shape as the `tracing`
+/// rule above and for the same reason.
+const VENDOR_CONFINED_CRATES: [ConfinedCrate; 1] = [ConfinedCrate {
+    ident: "whisper_rs",
+    owner: "crates/pos-gateway/src/adapter/whisper_local.rs",
+    reason: "the whisper.cpp binding is confined to one adapter module so a vendored FFI leaf, a \
+             different wrapper, or a cloud adapter replaces exactly one file (ADR-0006 §2); \
+             everything above it speaks pos_gateway::Transcriber",
+}];
+
+struct ConfinedCrate {
+    ident: &'static str,
+    owner: &'static str,
+    reason: &'static str,
+}
+
 /// The calls that read user content whole. `fs::read`/`fs::read_to_string`
 /// are matched by their final path segment, which is why the list mixes
 /// method and function names.
@@ -718,6 +766,17 @@ const SLURP_POLICY_OWNER: &str = "crates/pos-ingest";
 fn slurp_policy_enforced(root: &Path, path: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
     relative.starts_with(SLURP_POLICY_OWNER) && !is_integration_test_path(root, path)
+}
+
+/// The confined crates this file may not name — every one whose owning module
+/// is not this file. Integration tests are held to the rule too: a test that
+/// reached into the wrapper's types would pin them just as hard as production
+/// code would.
+fn confined_denied(root: &Path, path: &Path) -> Vec<&'static ConfinedCrate> {
+    VENDOR_CONFINED_CRATES
+        .iter()
+        .filter(|confined| path != root.join(confined.owner))
+        .collect()
 }
 
 fn telemetry_emission_allowed(root: &Path, path: &Path) -> bool {
@@ -1044,10 +1103,50 @@ mod tests {
             telemetry_emission_allowed: super::telemetry_emission_allowed(root, path),
             registered_kind_detail_allowed: super::registered_kind_detail_allowed(root, path),
             slurp_policy_enforced: super::slurp_policy_enforced(root, path),
+            confined_denied: super::confined_denied(root, path),
             violations: &mut violations,
         };
         visitor.visit_file(&syntax);
         violations
+    }
+
+    /// The m1-s03 vendor-containment rule, with its seeded violations. The
+    /// whole value of ADR-0006's "one adapter module" promise is that this
+    /// fails when someone breaks it.
+    #[test]
+    fn the_whisper_binding_is_reachable_only_from_its_adapter_module() {
+        let elsewhere = "/workspace/crates/pos-ingest/src/transcribe.rs";
+        let seeded = [
+            "use whisper_rs::WhisperContext;",
+            "fn load() { let _ = whisper_rs::WhisperContext::new(); }",
+            "use whisper_rs::{FullParams, SamplingStrategy};",
+            "struct Holder { context: whisper_rs::WhisperContext }",
+        ];
+        for source in seeded {
+            let violations = rust_violations_at(source, elsewhere);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.policy == "vendor-containment"),
+                "naming the whisper binding outside its adapter must fail: {source}"
+            );
+        }
+
+        // The owning module is admitted, and a file that merely mentions the
+        // word in prose is not swept up with it.
+        let owner = "/workspace/crates/pos-gateway/src/adapter/whisper_local.rs";
+        assert!(
+            rust_violations_at(seeded[0], owner).is_empty(),
+            "the adapter module is the one place the binding is legal"
+        );
+        assert!(
+            rust_violations_at(
+                "//! whisper_rs lives behind pos_gateway::Transcriber.\nfn ours() {}",
+                elsewhere
+            )
+            .is_empty(),
+            "a doc comment naming the crate is not a dependency on it"
+        );
     }
 
     /// The m1-s01 streaming rule, with its seeded violations. A checker that

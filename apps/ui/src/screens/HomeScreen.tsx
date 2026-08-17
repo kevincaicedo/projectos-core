@@ -10,6 +10,8 @@ import { ProjectActions } from "./ProjectActions";
 import type { SeamNotice } from "./seam";
 import { SourceHealthPanel } from "./SourceHealthPanel";
 import type { SourceHealthController } from "./useSourceHealth";
+import { TranscriptPanel } from "./TranscriptPanel";
+import type { TranscriptController } from "./useTranscript";
 import { RunFeedPanel } from "../runs/RunFeedPanel";
 import type { EchoRunController } from "../runs/useEchoRun";
 
@@ -21,6 +23,7 @@ interface HomeScreenProps {
   readonly onChanged: () => void;
   readonly echoRun: EchoRunController;
   readonly sourceHealth: SourceHealthController;
+  readonly transcript: TranscriptController;
 }
 
 export function HomeScreen({
@@ -31,6 +34,7 @@ export function HomeScreen({
   onChanged,
   echoRun,
   sourceHealth,
+  transcript,
 }: HomeScreenProps) {
   return (
     <main className="stage">
@@ -54,6 +58,7 @@ export function HomeScreen({
       )}
 
       <SourceHealthPanel projectSelected={selected !== null} controller={sourceHealth} />
+      <TranscriptPanel projectSelected={selected !== null} controller={transcript} />
       <RunFeedPanel project={selected} controller={echoRun} />
       <ProjectActions onChanged={onChanged} focusToken={focusToken} />
       <section className="card">

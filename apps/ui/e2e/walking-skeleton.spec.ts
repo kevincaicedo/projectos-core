@@ -55,9 +55,18 @@ const CAPABILITY_COUNT = 10;
 /// Installs an IPC bridge that answers the registry from fixtures — the
 /// desktop transport's shape, without a webview. `api_query` results are
 /// keyed by query name so the shell's session surface has real bytes.
+/// A query answer, or a sequence of them.
+///
+/// A sequence is what makes the m0-s09 reconciliation rule testable: after a
+/// command the UI re-reads rather than patching local state, so a test that
+/// wants to see an edit appear has to be able to answer the *second* read
+/// differently. The last entry sticks, so a two-entry sequence means
+/// "before, then ever after".
+type QueryAnswer = string | readonly string[];
+
 async function installIpc(
   page: import("@playwright/test").Page,
-  queries: Record<string, string>,
+  queries: Record<string, QueryAnswer>,
   options: {
     readonly commands?: Record<string, string>;
     readonly streamFrames?: readonly string[];
@@ -65,6 +74,7 @@ async function installIpc(
 ) {
   await page.addInitScript(
     (fixtures) => {
+      const reads = new Map<string, number>();
       let callbackId = 0;
       const callbacks = new Map<number, (message: unknown) => void>();
       Object.defineProperty(window, "__TAURI_INTERNALS__", {
@@ -93,9 +103,17 @@ async function installIpc(
                 return Promise.resolve(null);
               }
               const name = String(args?.name ?? "");
-              const answers =
+              const answers: Record<string, string | readonly string[]> =
                 command === "api_query" ? fixtures.queries : (fixtures.commands ?? {});
-              const answer = answers[name];
+              const scripted = answers[name];
+              let answer: string | undefined;
+              if (Array.isArray(scripted)) {
+                const seen = reads.get(name) ?? 0;
+                answer = scripted[Math.min(seen, scripted.length - 1)];
+                reads.set(name, seen + 1);
+              } else if (typeof scripted === "string") {
+                answer = scripted;
+              }
               return answer === undefined
                 ? Promise.reject(
                     JSON.stringify({
@@ -124,6 +142,88 @@ const HEALTH = JSON.stringify({
 });
 
 const EMPTY_LIST = JSON.stringify({ projects: [], openProjectCountMax: 64 });
+
+/// One transcript-shaped recording, as `evidence.list` answers it (m1-s03).
+const ONE_RECORDING = JSON.stringify({
+  evidence: [
+    {
+      evidenceId: "a1b2c3d4e5f600000000000000000001",
+      sourceId: "5c0a11e900000000000000000000beef",
+      sourceKind: "upload",
+      externalId: "interview-01.m4a",
+      externalUrl: null,
+      mediaKind: "audio",
+      shape: "transcript",
+      status: "chunked",
+      canaryLevel: "clean",
+      title: "Design partner interview",
+      author: null,
+      occurredTsMs: 1_772_946_000_000,
+      byteSize: 43_844_726,
+      chunkCount: 12,
+      pass: 0,
+      nextStage: "embed",
+      nextStageOwnerStory: "m1-s04",
+      nextStageAvailable: false,
+      stages: [],
+    },
+  ],
+  rowCountMax: 200,
+});
+
+function transcript(
+  segment: { readonly speakerIndex: number; readonly text: string; readonly edited: boolean },
+  speakers: readonly { readonly speakerIndex: number; readonly name: string }[],
+): string {
+  return JSON.stringify({
+    evidenceId: "a1b2c3d4e5f600000000000000000001",
+    pass: 0,
+    segments: [
+      {
+        segmentIndex: 0,
+        startMs: 0,
+        endMs: 4_200,
+        startsTurn: true,
+        speakerIndex: segment.speakerIndex,
+        text: segment.text,
+        asrText: "the pricing page confused me",
+        edited: segment.edited,
+      },
+      {
+        segmentIndex: 1,
+        startMs: 5_100,
+        endMs: 8_000,
+        startsTurn: true,
+        speakerIndex: 0,
+        text: "so I asked support twice",
+        asrText: "so I asked support twice",
+        edited: false,
+      },
+    ],
+    speakers,
+    rowCountMax: 200,
+  });
+}
+
+const TRANSCRIPT_RAW = transcript(
+  { speakerIndex: 0, text: "the pricing page confused me", edited: false },
+  [],
+);
+const TRANSCRIPT_NAMED = transcript(
+  { speakerIndex: 1, text: "the pricing page confused me", edited: false },
+  [{ speakerIndex: 1, name: "Dana" }],
+);
+const TRANSCRIPT_CORRECTED = transcript(
+  { speakerIndex: 1, text: "the pricing page confused me completely", edited: true },
+  [{ speakerIndex: 1, name: "Dana" }],
+);
+
+const EDIT_OK = JSON.stringify({
+  evidenceId: "a1b2c3d4e5f600000000000000000001",
+  pass: 0,
+  segmentIndex: 0,
+});
+
 
 const ONE_PROJECT = JSON.stringify({
   projects: [
@@ -431,6 +531,76 @@ test.describe("the M0 shell", () => {
     );
     await expect(item).toContainText("4 attempts");
     await expect(item).toContainText("content is not valid UTF-8 at byte offset 12");
+  });
+
+  /// m1-s03's editable-transcript criterion, end to end: rename a speaker,
+  /// fix a word, and the viewer re-renders from the runtime — with the model's
+  /// original words still on screen beside the correction.
+  ///
+  /// The two reads are scripted as a sequence because the UI re-reads after
+  /// every command rather than patching local state (m0-s09's reconciliation
+  /// rule). A test that could pass against a locally mutated view would be
+  /// testing the component, not the loop.
+  test("a transcript edit is logged, re-rendered, and keeps the original ASR", async ({ page }) => {
+    await installIpc(
+      page,
+      {
+        "project.list": ONE_PROJECT,
+        health: HEALTH,
+        "capability.snapshot": SNAPSHOT_FIXTURE,
+        "source.health": NO_SOURCE_HEALTH,
+        "evidence.list": ONE_RECORDING,
+        "transcript.get": [TRANSCRIPT_RAW, TRANSCRIPT_NAMED, TRANSCRIPT_CORRECTED],
+      },
+      { commands: { "transcript.speaker-name": EDIT_OK, "transcript.correct": EDIT_OK } },
+    );
+    await page.goto("/");
+    await page.locator("[data-project-row]").first().click();
+    await page.locator("[data-recording]").first().click();
+
+    // The model's output, before anyone touches it. Nobody is attributed:
+    // v1 detects the pause, not the person.
+    const first = page.locator("[data-segment-index='0']");
+    await expect(first).toBeVisible();
+    await expect(first.locator("[data-segment-time]")).toHaveText("0:00");
+    await expect(first.locator("[data-segment-speaker='0']")).toHaveText("Unattributed");
+    await expect(first).toContainText("the pricing page confused me");
+    await expect(first).toHaveAttribute("data-edited", "false");
+
+    // Name the speaker, and the viewer shows the name the runtime now holds.
+    await first.locator("[data-segment-speaker='0']").click();
+    await first.locator("[data-speaker-input='0']").fill("Dana");
+    await first.locator("[data-speaker-save='0']").click();
+    await expect(first.locator("[data-segment-speaker='0']")).toHaveText("Dana");
+
+    // Fix a word. The correction renders, and so does what the model heard —
+    // "the raw ASR output stays immutable, edits project over it" is a thing
+    // the user can see rather than a claim in a design record.
+    await first.locator("[data-segment-text='0']").click();
+    await first.locator("[data-segment-input='0']").fill("the pricing page confused me completely");
+    await first.locator("[data-segment-save='0']").click();
+    await expect(first).toHaveAttribute("data-edited", "true");
+    await expect(first).toContainText("the pricing page confused me completely");
+    await expect(first.locator("[data-segment-asr='0']")).toContainText(
+      "model heard: the pricing page confused me",
+    );
+  });
+
+  test("a project with no recordings teaches instead of showing an empty viewer", async ({
+    page,
+  }) => {
+    await installIpc(page, {
+      "project.list": ONE_PROJECT,
+      health: HEALTH,
+      "capability.snapshot": SNAPSHOT_FIXTURE,
+      "source.health": NO_SOURCE_HEALTH,
+      "evidence.list": NO_DEAD_LETTERS,
+    });
+    await page.goto("/");
+    await page.locator("[data-project-row]").first().click();
+    await expect(page.locator("[data-transcript-recordings='empty']")).toContainText(
+      "No recordings in this project yet",
+    );
   });
 
   test("source health teaches when a project has ingested nothing", async ({ page }) => {

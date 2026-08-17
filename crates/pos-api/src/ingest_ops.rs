@@ -9,17 +9,18 @@
 //! command now would freeze the wrong shape.
 
 use crate::ApiError;
+use crate::ingest_runtime;
 use crate::project_ops;
 use pos_domain::{
-    EVIDENCE_LIST_ROW_COUNT_MAX, EvidenceListFilter, EvidenceReadError, EvidenceRecord,
-    EvidenceStatus, IngestStage, SourceHealthRecord, StageRecord, list_evidence,
-    list_source_health, list_stages,
+    DomainEvent, EVIDENCE_LIST_ROW_COUNT_MAX, EvidenceListFilter, EvidenceReadError,
+    EvidenceRecord, EvidenceStatus, IngestStage, SourceHealthRecord, StageRecord,
+    TRANSCRIPT_SPEAKER_COUNT_MAX, TRANSCRIPT_SPEAKER_NAME_CHARS_MAX,
+    TranscriptSegmentSpeakerSetBody, TranscriptSpeakerNamedBody, TranscriptTextCorrectedBody,
+    list_evidence, list_source_health, list_stages, list_transcript_segments,
+    list_transcript_speakers, read_evidence,
 };
 use pos_foundation::{DeviceId, EvidenceId, ProjectId, SourceId, SystemWallClock, UserId};
-use pos_ingest::{
-    IngestError, IngestPipeline, PipelineConfig, ReprocessRequest, StageRegistry,
-    stage_registry_default,
-};
+use pos_ingest::{IngestError, IngestPipeline, PipelineConfig, ReprocessRequest, StageRegistry};
 use pos_log::{Actor, ProjectLog};
 use pos_sched::{BackoffPolicy, JobQueue, QueueConfig, SchedulerMetrics, SplitMixJitter};
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,103 @@ pub struct EvidenceListReport {
     /// The bound this answer honoured, in-band so a full page is
     /// distinguishable from a truncated one (L8).
     pub row_count_max: u32,
+}
+
+/// `transcript.get` — one page of a recording's transcript, in time order.
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TranscriptGetInput {
+    pub path: String,
+    pub evidence_id: String,
+    /// Absent means the pass the evidence row is currently on — the reading a
+    /// viewer wants. Naming a pass reads an older transcription, which is what
+    /// makes a stored citation still resolvable after a re-transcription.
+    #[serde(default)]
+    pub pass: Option<u32>,
+    /// Start after this segment index; absent starts at the beginning.
+    #[serde(default)]
+    pub after_segment_index: Option<u32>,
+    #[serde(default)]
+    pub row_count_max: Option<u32>,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptSegmentRow {
+    pub segment_index: u32,
+    #[ts(type = "number")]
+    pub start_ms: u64,
+    #[ts(type = "number")]
+    pub end_ms: u64,
+    /// This segment opens a turn — a detected pause, never a claimed speaker.
+    pub starts_turn: bool,
+    pub speaker_index: u32,
+    /// What a viewer renders: the correction when there is one, the model's
+    /// own words otherwise.
+    pub text: String,
+    /// Exactly what the model produced, always. A viewer showing an edited
+    /// segment can show the original beside it without a second round trip,
+    /// which is what "the original ASR is recoverable" means to a user.
+    pub asr_text: String,
+    pub edited: bool,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptSpeakerRow {
+    pub speaker_index: u32,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptReport {
+    pub evidence_id: String,
+    pub pass: u32,
+    pub segments: Vec<TranscriptSegmentRow>,
+    pub speakers: Vec<TranscriptSpeakerRow>,
+    pub row_count_max: u32,
+}
+
+/// `transcript.correct` — a human fixes a word the model misheard.
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TranscriptCorrectInput {
+    pub path: String,
+    pub evidence_id: String,
+    pub pass: u32,
+    pub segment_index: u32,
+    pub text: String,
+}
+
+/// `transcript.speaker-name` — a human names a voice.
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TranscriptSpeakerNameInput {
+    pub path: String,
+    pub evidence_id: String,
+    pub speaker_index: u32,
+    pub name: String,
+}
+
+/// `transcript.speaker-assign` — a human says who spoke a segment.
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TranscriptSpeakerAssignInput {
+    pub path: String,
+    pub evidence_id: String,
+    pub pass: u32,
+    pub segment_index: u32,
+    pub speaker_index: u32,
+}
+
+/// What an edit returns: enough to re-render the one row that changed.
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptEditReport {
+    pub evidence_id: String,
+    pub pass: u32,
+    pub segment_index: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize, TS)]
@@ -200,7 +298,7 @@ pub fn evidence_list(input: &EvidenceListInput) -> Result<String, ApiError> {
         },
     )
     .map_err(|error| read_error(&error))?;
-    let stages = stage_registry_default();
+    let stages = ingest_runtime::stage_registry();
     let mut evidence = Vec::with_capacity(records.len());
     for record in records {
         let history = if input.with_stages {
@@ -214,6 +312,239 @@ pub fn evidence_list(input: &EvidenceListInput) -> Result<String, ApiError> {
         evidence,
         row_count_max,
     })
+}
+
+/// `transcript.get` — the transcript viewer's read.
+///
+/// # Errors
+///
+/// [`ApiError`] for an unreadable project, a malformed id, or an evidence id
+/// this project does not hold.
+pub fn transcript_get(input: &TranscriptGetInput) -> Result<String, ApiError> {
+    let evidence_id = EvidenceId::from_bytes(parse_id(&input.evidence_id, "evidenceId")?);
+    let log = project_ops::open_log(std::path::Path::new(&input.path))?;
+    let record = read_evidence(&log, evidence_id)
+        .map_err(|error| read_error(&error))?
+        .ok_or_else(|| ApiError {
+            code: "not_found",
+            message: format!("evidence {} is not in this project", input.evidence_id),
+            retriable: false,
+        })?;
+    let pass = input.pass.unwrap_or(record.pass);
+    let row_count_max = input
+        .row_count_max
+        .unwrap_or(TRANSCRIPT_ROW_COUNT_DEFAULT)
+        .min(EVIDENCE_LIST_ROW_COUNT_MAX);
+    let segments = list_transcript_segments(
+        &log,
+        evidence_id,
+        pass,
+        input.after_segment_index,
+        row_count_max,
+    )
+    .map_err(|error| read_error(&error))?;
+    let speakers =
+        list_transcript_speakers(&log, evidence_id).map_err(|error| read_error(&error))?;
+    project_ops::to_json(&TranscriptReport {
+        evidence_id: evidence_id.to_hex(),
+        pass,
+        segments: segments
+            .iter()
+            .map(|segment| TranscriptSegmentRow {
+                segment_index: segment.segment_index,
+                start_ms: segment.start_ms,
+                end_ms: segment.end_ms,
+                starts_turn: segment.starts_turn,
+                speaker_index: segment.speaker_index,
+                text: segment.rendered_text().to_owned(),
+                asr_text: segment.asr_text.clone(),
+                edited: segment.is_edited(),
+            })
+            .collect(),
+        speakers: speakers
+            .into_iter()
+            .map(|(speaker_index, name)| TranscriptSpeakerRow {
+                speaker_index,
+                name,
+            })
+            .collect(),
+        row_count_max,
+    })
+}
+
+/// Rows one `transcript.get` page answers with when the caller states no bound.
+const TRANSCRIPT_ROW_COUNT_DEFAULT: u32 = 200;
+
+/// Characters one correction may carry. A "fix a word" edit is a phrase; a
+/// megabyte pasted into a transcript segment is not an edit (L8).
+const TRANSCRIPT_EDIT_CHARS_MAX: usize = 4 * 1024;
+
+fn checked_edit_text(text: &str, field: &'static str) -> Result<String, ApiError> {
+    if text.chars().count() > TRANSCRIPT_EDIT_CHARS_MAX {
+        return Err(ApiError {
+            code: "invalid_input",
+            message: format!("{field} is longer than {TRANSCRIPT_EDIT_CHARS_MAX} characters"),
+            retriable: false,
+        });
+    }
+    if text
+        .chars()
+        .any(|character| character.is_control() && character != '\n' && character != '\t')
+    {
+        return Err(ApiError {
+            code: "invalid_input",
+            message: format!("{field} carries control characters"),
+            retriable: false,
+        });
+    }
+    Ok(text.to_owned())
+}
+
+/// `transcript.correct` — the correction is an event; the ASR output is not
+/// touched (m1-s03 invariant T1).
+///
+/// # Errors
+///
+/// [`ApiError`] for a malformed id, an over-long or control-bearing text, an
+/// unreadable project, or a log append that fails.
+pub fn transcript_correct(
+    identity_device: DeviceId,
+    identity_user: UserId,
+    input: &TranscriptCorrectInput,
+) -> Result<String, ApiError> {
+    let evidence_id = EvidenceId::from_bytes(parse_id(&input.evidence_id, "evidenceId")?);
+    let text = checked_edit_text(&input.text, "text")?;
+    let log = project_ops::open_log(std::path::Path::new(&input.path))?;
+    append_transcript_event(
+        &log,
+        identity_device,
+        identity_user,
+        DomainEvent::TranscriptTextCorrected(TranscriptTextCorrectedBody::V1 {
+            evidence_id,
+            pass: input.pass,
+            segment_index: input.segment_index,
+            text,
+        }),
+    )?;
+    project_ops::to_json(&TranscriptEditReport {
+        evidence_id: evidence_id.to_hex(),
+        pass: input.pass,
+        segment_index: input.segment_index,
+    })
+}
+
+/// `transcript.speaker-name` — names a voice for this recording.
+///
+/// # Errors
+///
+/// [`ApiError`] for a malformed id, an out-of-range speaker index, an
+/// unusable name, or a log append that fails.
+pub fn transcript_speaker_name(
+    identity_device: DeviceId,
+    identity_user: UserId,
+    input: &TranscriptSpeakerNameInput,
+) -> Result<String, ApiError> {
+    let evidence_id = EvidenceId::from_bytes(parse_id(&input.evidence_id, "evidenceId")?);
+    checked_speaker_index(input.speaker_index)?;
+    let name = checked_edit_text(input.name.trim(), "name")?;
+    if name.is_empty() || name.chars().count() > TRANSCRIPT_SPEAKER_NAME_CHARS_MAX {
+        return Err(ApiError {
+            code: "invalid_input",
+            message: format!(
+                "a speaker name is 1..={TRANSCRIPT_SPEAKER_NAME_CHARS_MAX} characters"
+            ),
+            retriable: false,
+        });
+    }
+    let log = project_ops::open_log(std::path::Path::new(&input.path))?;
+    append_transcript_event(
+        &log,
+        identity_device,
+        identity_user,
+        DomainEvent::TranscriptSpeakerNamed(TranscriptSpeakerNamedBody::V1 {
+            evidence_id,
+            speaker_index: input.speaker_index,
+            name,
+        }),
+    )?;
+    project_ops::to_json(&TranscriptEditReport {
+        evidence_id: evidence_id.to_hex(),
+        // A speaker name is not pass-scoped: who was in the room does not
+        // change when a better model re-reads the audio.
+        pass: 0,
+        segment_index: input.speaker_index,
+    })
+}
+
+/// `transcript.speaker-assign` — says who spoke a segment.
+///
+/// # Errors
+///
+/// [`ApiError`] for a malformed id, an out-of-range speaker index, an
+/// unreadable project, or a log append that fails.
+pub fn transcript_speaker_assign(
+    identity_device: DeviceId,
+    identity_user: UserId,
+    input: &TranscriptSpeakerAssignInput,
+) -> Result<String, ApiError> {
+    let evidence_id = EvidenceId::from_bytes(parse_id(&input.evidence_id, "evidenceId")?);
+    checked_speaker_index(input.speaker_index)?;
+    let log = project_ops::open_log(std::path::Path::new(&input.path))?;
+    append_transcript_event(
+        &log,
+        identity_device,
+        identity_user,
+        DomainEvent::TranscriptSegmentSpeakerSet(TranscriptSegmentSpeakerSetBody::V1 {
+            evidence_id,
+            pass: input.pass,
+            segment_index: input.segment_index,
+            speaker_index: input.speaker_index,
+        }),
+    )?;
+    project_ops::to_json(&TranscriptEditReport {
+        evidence_id: evidence_id.to_hex(),
+        pass: input.pass,
+        segment_index: input.segment_index,
+    })
+}
+
+fn checked_speaker_index(speaker_index: u32) -> Result<(), ApiError> {
+    if speaker_index >= TRANSCRIPT_SPEAKER_COUNT_MAX {
+        return Err(ApiError {
+            code: "invalid_input",
+            message: format!(
+                "speaker index {speaker_index} is past the {TRANSCRIPT_SPEAKER_COUNT_MAX}-speaker \
+                 bound for one recording"
+            ),
+            retriable: false,
+        });
+    }
+    Ok(())
+}
+
+/// Every transcript edit is one appended fact by the user who made it — the
+/// same shape for all three, so the actor and the failure mapping cannot drift
+/// between them.
+fn append_transcript_event(
+    log: &ProjectLog,
+    identity_device: DeviceId,
+    identity_user: UserId,
+    event: DomainEvent,
+) -> Result<(), ApiError> {
+    let request = event
+        .into_request(identity_device, Actor::User(identity_user))
+        .map_err(|error| ApiError {
+            code: "log_failure",
+            message: error.to_string(),
+            retriable: false,
+        })?;
+    log.append(request, &SystemWallClock)
+        .map_err(|error| ApiError {
+            code: "log_failure",
+            message: error.to_string(),
+            retriable: true,
+        })?;
+    Ok(())
 }
 
 /// `source.health` — per-source, per-stage counters for the settings screen.
@@ -257,7 +588,7 @@ pub fn ingest_reprocess(
     let pipeline = IngestPipeline::new(
         PipelineConfig::for_device(identity_device),
         Arc::clone(queue),
-        stage_registry_default(),
+        ingest_runtime::stage_registry(),
     );
     let request = ReprocessRequest {
         evidence_id,
@@ -383,6 +714,16 @@ fn parse_optional<T>(
             retriable: false,
         }),
     }
+}
+
+fn parse_id(value: &str, field: &str) -> Result<[u8; 16], ApiError> {
+    EvidenceId::from_hex(value)
+        .map(EvidenceId::into_bytes)
+        .ok_or_else(|| ApiError {
+            code: "invalid_input",
+            message: format!("{field} must be 32 lowercase hex characters"),
+            retriable: false,
+        })
 }
 
 fn parse_optional_id(value: Option<&str>, field: &str) -> Result<Option<[u8; 16]>, ApiError> {

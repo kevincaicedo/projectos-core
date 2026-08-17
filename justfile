@@ -100,9 +100,27 @@ qualify-gateway-lm-studio model base="http://127.0.0.1:1234":
     POS_QUALIFY_LMSTUDIO_BASE={{base}} POS_QUALIFY_LMSTUDIO_MODEL={{model}} \
       cargo test -p pos-gateway --test live_qualification -- --ignored qualify_live_lm_studio --nocapture
 
+# m1-s03 cloud smoke (NOT in `ci`): one live completion over the reviewed TLS
+# transport. Secret-gated — the key comes from the environment and is never a
+# literal in the repository. With the repository-root `.env` holding
+# OPEN_ROUTER_KEY:
+#   POS_QUALIFY_CLOUD_KEY=$(grep OPEN_ROUTER_KEY ../.env | cut -d= -f2-) just qualify-gateway-cloud
+qualify-gateway-cloud model="openai/gpt-4o-mini" base="https://openrouter.ai/api":
+    POS_QUALIFY_CLOUD_BASE={{base}} POS_QUALIFY_CLOUD_MODEL={{model}} \
+      cargo test -p pos-gateway --test live_qualification -- --ignored qualify_live_cloud --nocapture
+
 qualify-gateway-vllm model base="http://127.0.0.1:8000":
     POS_QUALIFY_VLLM_BASE={{base}} POS_QUALIFY_VLLM_MODEL={{model}} \
       cargo test -p pos-gateway --test live_qualification -- --ignored qualify_live_vllm --nocapture
+
+# m1-s03 qualification lane (NOT in `ci`): real whisper on a real recording,
+# through the real pipeline. Needs `pos models pull whisper-small` and a
+# recording; prints the §18 realtime row, which lands in docs/progress.md.
+#   just qualify-transcribe-local ../tmp/interview.m4a 3
+qualify-transcribe-local audio replicates="1" model="whisper-small" models_dir="models/pulled":
+    POS_QUALIFY_MODELS_DIR={{models_dir}} POS_QUALIFY_WHISPER_MODEL={{model}} \
+      POS_QUALIFY_AUDIO={{audio}} POS_QUALIFY_REPLICATES={{replicates}} \
+      cargo test --release -p pos-ingest --test transcribe_qualification -- --ignored --nocapture
 
 # Regenerates prompts/prompts.lock after adding a prompt version (m0-s11).
 generate-prompt-lock:

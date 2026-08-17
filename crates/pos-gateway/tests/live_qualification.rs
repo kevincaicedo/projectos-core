@@ -5,11 +5,12 @@
 //! [`pos_gateway::QualificationReport`]; the recorded result lands in
 //! `docs/progress.md` as the story's qualification evidence.
 //!
-//! Cloud smokes (Anthropic/OpenAI/Google/OpenRouter live) additionally need
-//! the cloud-capable TLS transport core deliberately does not carry yet
-//! (transport.rs module doc); they join this lane with that transport —
-//! visible debt owned by the first live-cloud story (m0-s13 cloud leg /
-//! m1-s03).
+//! The **cloud smoke** (m1-s03) is the same lane over the reviewed TLS
+//! transport. It is secret-gated: the key arrives as an environment variable
+//! through the ordinary credential path, is never a literal in this file, and
+//! is never printed — [`pos_gateway::SecretValue`] cannot serialize and
+//! `HttpRequestPlan`'s `Debug` redacts header values, so the assertions below
+//! can be loud without the output being dangerous.
 
 #![forbid(unsafe_code)]
 
@@ -81,5 +82,121 @@ fn qualify_live_vllm() {
         EndpointServer::Vllm,
         "POS_QUALIFY_VLLM_BASE",
         "POS_QUALIFY_VLLM_MODEL",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// m1-s03: the secret-gated cloud smoke over the reviewed TLS transport
+// ---------------------------------------------------------------------------
+
+/// One live cloud completion, end to end through the dispatch chokepoint.
+///
+/// This is the first test in the repository whose bytes leave the device, and
+/// it exists to prove exactly that they can — the m0-s10 conformance suite
+/// runs from recorded fixtures precisely so that *this* is the only place a
+/// real cloud call happens.
+#[test]
+#[ignore = "live-cloud lane: `just qualify-gateway-cloud` (needs POS_QUALIFY_CLOUD_KEY)"]
+fn qualify_live_cloud_over_the_tls_transport() {
+    use pos_foundation::{ProjectId, SystemWallClock};
+    use pos_gateway::{
+        CallAttribution, ChatMessage, CompletionRequest, CredentialClass, EndpointConfig,
+        EndpointLocality, Gateway, GatewayConfig, MemoryLedger, MemorySecretStore, MessageRole,
+        ModelChoice, ModelPolicy, ModelRouting, OpenRouterAdapter, ProviderFamily, RoutingTier,
+        SecretRef, TlsHttpTransport, Transports, VecSink,
+    };
+
+    let Ok(key) = std::env::var("POS_QUALIFY_CLOUD_KEY") else {
+        panic!(
+            "POS_QUALIFY_CLOUD_KEY is not set; run this lane via `just qualify-gateway-cloud` \
+             with the key in the environment (never in a file this repository tracks)"
+        );
+    };
+    let base_url = std::env::var("POS_QUALIFY_CLOUD_BASE")
+        .unwrap_or_else(|_| "https://openrouter.ai/api".to_owned());
+    let model = std::env::var("POS_QUALIFY_CLOUD_MODEL")
+        .unwrap_or_else(|_| "openai/gpt-4o-mini".to_owned());
+
+    let secret_ref = SecretRef::new("byok/openrouter/qualification");
+    let secrets = MemorySecretStore::new();
+    secrets.insert(&secret_ref, key);
+    let ledger = MemoryLedger::new();
+    let clock = SystemWallClock;
+    let tls = TlsHttpTransport::new();
+    let loopback = LoopbackHttpTransport;
+    let choice = ModelChoice {
+        family: ProviderFamily::OpenRouter,
+        endpoint: EndpointConfig::new(base_url.clone(), EndpointLocality::Remote)
+            .expect("a remote endpoint config"),
+        model: model.clone(),
+        credential: CredentialClass::Byok {
+            secret_ref: secret_ref.clone(),
+        },
+        is_pinned_family_base: true,
+    };
+    let gateway = Gateway::new(
+        GatewayConfig {
+            policy: ModelPolicy::CloudAllowed,
+            routing: ModelRouting::thinking_only(choice.clone(), choice),
+        },
+        vec![Box::new(OpenRouterAdapter {
+            base_url: base_url.clone(),
+        })],
+        &secrets,
+        &ledger,
+        Transports::new(&loopback, &tls),
+        &clock,
+    );
+
+    let mut sink = VecSink::default();
+    let usage = gateway
+        .complete(
+            RoutingTier::Frontier,
+            &CallAttribution {
+                project: ProjectId::from_bytes([0x5c; 16]),
+                feature: "qualification".to_owned(),
+                agent: None,
+            },
+            &CompletionRequest {
+                model: model.clone(),
+                system: Some("Answer with one word.".to_owned()),
+                messages: vec![ChatMessage {
+                    role: MessageRole::User,
+                    content: "In one word: what colour is a clear midday sky?".to_owned(),
+                }],
+                tools_json: None,
+                reasoning_effort: None,
+                max_output_tokens: 32,
+                timeout_ms: 60_000,
+            },
+            &mut sink,
+        )
+        .unwrap_or_else(|weather| panic!("cloud qualification failed: {weather}"));
+
+    let text = sink.text();
+    println!(
+        "QUALIFICATION cloud base={base_url} model={model} tokens_in={} tokens_out={} \
+         usage_measured={} text={text:?}",
+        usage.tokens_in, usage.tokens_out, usage.measured
+    );
+    assert!(!text.is_empty(), "a live completion produced no text");
+
+    // The dispatch is exactly one attributed ledger row, like every other.
+    let records = ledger.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].outcome, "ok");
+    assert_eq!(records[0].credential_class, "byok");
+
+    // And the key is nowhere a reader could find it: the preflight surface is
+    // the one thing a UI renders about a credential.
+    let preflight = gateway.preflight(RoutingTier::Frontier);
+    let rendered = format!("{preflight:?}");
+    assert!(
+        preflight.egress_warning.is_some(),
+        "a cloud dispatch must warn that bytes leave the device"
+    );
+    assert!(
+        !rendered.contains("sk-"),
+        "the preflight report must never carry key material"
     );
 }

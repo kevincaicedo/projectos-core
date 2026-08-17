@@ -33,8 +33,9 @@
 //! and resumes the next time any process opens the project (L1/L4).
 
 use crate::ApiError;
+use crate::ingest_runtime;
 use pos_foundation::{DeviceId, ProjectId, SystemWallClock, WallClock};
-use pos_ingest::{IngestPipeline, PipelineConfig, stage_job_handlers, stage_registry_default};
+use pos_ingest::{IngestPipeline, PipelineConfig, stage_job_handlers};
 use pos_log::ProjectLog;
 use pos_sched::{
     HandlerRegistry, JobQueue, ProjectRegistry, WorkerPool, WorkerPoolConfig, WorkerPoolHandle,
@@ -153,9 +154,9 @@ impl BackgroundWorkers {
         let projects = Arc::new(ProjectRegistry::new());
         let clock: Arc<dyn WallClock> = Arc::new(SystemWallClock);
         let pipeline = Arc::new(IngestPipeline::new(
-            PipelineConfig::for_device(device),
+            PipelineConfig::for_device(device).with_ledgers(ingest_runtime::stage_ledgers(device)),
             Arc::clone(&queue),
-            stage_registry_default(),
+            ingest_runtime::stage_registry(),
         ));
         let handlers = Arc::new(handler_registry(&pipeline, &projects, &clock)?);
         let pool_config = WorkerPoolConfig {

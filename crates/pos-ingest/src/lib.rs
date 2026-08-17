@@ -43,6 +43,7 @@
 
 #![forbid(unsafe_code)]
 
+mod audio;
 mod budget;
 mod chunk;
 mod identity;
@@ -50,7 +51,9 @@ mod normalize;
 mod pipeline;
 mod reprocess;
 mod segment;
+mod transcribe;
 
+pub use audio::{AudioError, AudioSource};
 pub use budget::{BoundedStream, STAGE_BUFFER_BYTES_MAX_DEFAULT, STAGE_READ_BYTES, StreamBudget};
 pub use chunk::{
     BoundaryRule, CHUNK_COUNT_MAX, ChunkParams, ChunkStage, TOKEN_BYTES_ESTIMATE, chunk_params_for,
@@ -64,6 +67,10 @@ pub use pipeline::{
 };
 pub use reprocess::{REPROCESS_ITEM_COUNT_MAX, ReprocessPlan, ReprocessRequest};
 pub use segment::{SEGMENT_COUNT_MAX, SEGMENT_RECORD_BYTES, Segment, SegmentReader, SegmentWriter};
+pub use transcribe::{
+    StageLedgers, TRANSCRIBE_WINDOW_MS_DEFAULT, TRANSCRIPT_SEGMENT_COUNT_MAX, TranscribeRoute,
+    TranscribeSetup, TranscribeStage, UnmeteredLedgers,
+};
 
 use pos_domain::{EvidenceReadError, IngestStage};
 use pos_log::LogError;

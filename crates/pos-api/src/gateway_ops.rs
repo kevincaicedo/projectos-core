@@ -9,7 +9,7 @@ use pos_domain::{DomainEvent, ModelCallCompletedBody};
 use pos_foundation::WallClock;
 use pos_gateway::{
     CostLedger, LedgerError, LoopbackHttpTransport, ModelCallRecord, ModelManifest, PullConsent,
-    pull_model,
+    TlsHttpTransport, pull_model,
 };
 use pos_log::{Actor, ProjectLog};
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,7 @@ impl CostLedger for EventCostLedger<'_> {
             project_id: record.project,
             feature: record.feature.clone(),
             agent: record.agent.clone(),
-            provider: record.provider.as_str().to_owned(),
+            provider: record.provider.to_owned(),
             credential_class: record.credential_class.to_owned(),
             model: record.model.clone(),
             tokens_in: record.tokens_in,
@@ -342,13 +342,19 @@ pub(crate) fn models_pull(input: &ModelsPullInput) -> Result<String, ApiError> {
     } else {
         PullConsent::Withheld
     };
-    let report = pull_model(
-        entry,
-        consent,
-        &PathBuf::from(&input.dest_dir),
-        &LoopbackHttpTransport,
-    )
-    .map_err(|error| pull_error(&error))?;
+    // The transport follows the URL scheme, which is the same selection rule
+    // the gateway's dispatch uses (m1-s03/ADR-0006): a `file://` or loopback
+    // source never touches the TLS stack, and an `https://` artifact source is
+    // the one thing in the model manager that leaves the device.
+    let tls = TlsHttpTransport::new();
+    let loopback = LoopbackHttpTransport;
+    let transport: &dyn pos_gateway::HttpTransport = if entry.url.starts_with("https://") {
+        &tls
+    } else {
+        &loopback
+    };
+    let report = pull_model(entry, consent, &PathBuf::from(&input.dest_dir), transport)
+        .map_err(|error| pull_error(&error))?;
     project_ops::to_json(&ModelsPullReport {
         name: report.name,
         path: report.path.display().to_string(),
@@ -366,6 +372,8 @@ fn pull_error(error: &pos_gateway::ModelPullError) -> ApiError {
         | ModelPullError::SizeMismatch { .. }
         | ModelPullError::Overrun { .. } => "artifact_rejected",
         ModelPullError::AlreadyPresent { .. } => "already_present",
+        ModelPullError::BudgetExceeded { .. } => "budget_exceeded",
+        ModelPullError::PartialTooLong { .. } => "artifact_rejected",
         ModelPullError::ManifestUnreadable { .. } => "manifest_invalid",
         ModelPullError::Source { .. } => "source_failure",
         ModelPullError::Io { .. } => "storage_failure",

@@ -11,6 +11,11 @@ allow = [
     "MIT",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # Promoted from a per-version exception by m1-s03: ISC is the same
+    # permissive family as the BSD clauses above, and the reviewed TLS graph
+    # (ring, untrusted, rustls-webpki) plus bindgen's libloading now carry it.
+    # Pinning four upstream crates per version bought review churn, not review.
+    "ISC",
     "Zlib",
     "Unicode-3.0",
     "CC0-1.0",
@@ -25,11 +30,34 @@ exceptions = [
     { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
     { crate = "selectors@0.36.1", allow = ["MPL-2.0"] },
     { crate = "target-lexicon@0.12.16", allow = ["Apache-2.0 WITH LLVM-exception"] },
-    # m0-s07's tray reaches libappindicator-sys → libloading. ISC is inside the
-    # policy's Apache-2.0-compatible permissive set (same standing as the
-    # BSD clauses above); it is pinned per-version rather than allow-listed
-    # blanket so a graph change reopens the review.
-    { crate = "libloading@0.7.4", allow = ["ISC"] },
+    # m1-s03 (ADR-0006). Audio decoding is symphonia's; MPL-2.0 is file-level
+    # copyleft, so using the crates unmodified is compatible with shipping
+    # Apache-2.0 — the obligation attaches to their files, which we never edit.
+    # Pinned per version so a symphonia upgrade reopens this review.
+    { crate = "symphonia@0.6.1", allow = ["MPL-2.0"] },
+    { crate = "symphonia-bundle-flac@0.6.1", allow = ["MPL-2.0"] },
+    { crate = "symphonia-bundle-mp3@0.6.1", allow = ["MPL-2.0"] },
+    { crate = "symphonia-codec-aac@0.6.1", allow = ["MPL-2.0"] },
+    { crate = "symphonia-codec-alac@0.6.1", allow = ["MPL-2.0"] },
+    { crate = "symphonia-codec-pcm@0.6.1", allow = ["MPL-2.0"] },
+    { crate = "symphonia-codec-vorbis@0.6.1", allow = ["MPL-2.0"] },
+    { crate = "symphonia-common@0.6.1", allow = ["MPL-2.0"] },
+    { crate = "symphonia-core@0.6.1", allow = ["MPL-2.0"] },
+    { crate = "symphonia-format-isomp4@0.6.1", allow = ["MPL-2.0"] },
+    { crate = "symphonia-format-mkv@0.6.1", allow = ["MPL-2.0"] },
+    { crate = "symphonia-format-ogg@0.6.1", allow = ["MPL-2.0"] },
+    { crate = "symphonia-format-riff@0.6.1", allow = ["MPL-2.0"] },
+    { crate = "symphonia-metadata@0.6.1", allow = ["MPL-2.0"] },
+    # m1-s03 (ADR-0006 §2, founder decision): the whisper.cpp binding we take
+    # instead of vendoring the FFI leaf. The Unlicense is a public-domain
+    # dedication — OSI-approved, FSF-free, no redistribution obligation.
+    # Exactly-pinned in Cargo.toml because ABI pinning is load-bearing here.
+    { crate = "whisper-rs@0.16.0", allow = ["Unlicense"] },
+    { crate = "whisper-rs-sys@0.15.0", allow = ["Unlicense"] },
+    # The Mozilla root-CA bundle rustls verifies against. CDLA-Permissive-2.0
+    # licenses *data*, not code, and imposes no obligation on the binary that
+    # embeds it. Pinned per version so a root-store change is a reviewed event.
+    { crate = "webpki-roots@1.0.9", allow = ["CDLA-Permissive-2.0"] },
 ]
 
 [bans]
@@ -41,6 +69,13 @@ multiple-versions = "deny"
 skip-tree = [
     { crate = "tauri@2.11.5", reason = "reviewed Tauri platform graph" },
     { crate = "tauri-build@2.6.3", reason = "reviewed Tauri build graph" },
+]
+# One exact version, not a tree: `ring` (rustls's crypto provider) pins an
+# older Windows shim than Tauri's plugins do. It is compile weight on a target
+# ProjectOS does not ship at M1, and skipping the exact version keeps every
+# other duplicate inside the TLS graph a hard failure (m1-s03).
+skip = [
+    { crate = "windows-sys@0.52.0", reason = "ring 0.17's Windows shim; Tauri's plugins carry 0.59/0.60" },
 ]
 
 [advisories]

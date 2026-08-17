@@ -23,7 +23,7 @@ use pos_foundation::{ProjectId, RunId, SystemWallClock, WallClock};
 use pos_gateway::{
     CredentialClass, EndpointConfig, EndpointLocality, EndpointProfile, EndpointServer, Gateway,
     GatewayConfig, LoopbackHttpTransport, MemorySecretStore, ModelChoice, ModelPolicy,
-    ModelRouting, OpenAiCompatibleAdapter, PromptFile, ProviderFamily,
+    ModelRouting, OpenAiCompatibleAdapter, PromptFile, ProviderFamily, Transports,
 };
 use pos_log::Actor;
 use serde::{Deserialize, Serialize};
@@ -496,10 +496,7 @@ fn execute_echo_worker(
     let gateway = Gateway::new(
         GatewayConfig {
             policy: ModelPolicy::LocalOnly,
-            routing: ModelRouting {
-                frontier: choice.clone(),
-                fast: choice,
-            },
+            routing: ModelRouting::thinking_only(choice.clone(), choice),
         },
         vec![Box::new(OpenAiCompatibleAdapter {
             base_url: base_url.to_owned(),
@@ -510,7 +507,7 @@ fn execute_echo_worker(
         })],
         &secrets,
         &ledger,
-        &transport,
+        Transports::device_local_only(&transport),
         &clock,
     );
     let tools = echo_tool_registry().map_err(registry_error)?;

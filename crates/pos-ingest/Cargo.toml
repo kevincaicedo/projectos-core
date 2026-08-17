@@ -14,7 +14,12 @@ pos-store = { path = "../pos-store" }
 pos-log = { path = "../pos-log" }
 pos-domain = { path = "../pos-domain" }
 pos-sched = { path = "../pos-sched" }
+pos-gateway = { path = "../pos-gateway" }
+symphonia = { workspace = true }
 
 [dev-dependencies]
+# The qualification lane names the recording it measured by content hash, so a
+# gate artifact stays checkable when the file itself is gitignored.
+blake3 = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }

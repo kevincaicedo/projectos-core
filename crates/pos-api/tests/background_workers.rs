@@ -98,7 +98,10 @@ fn submit_one(path: &str, content: &[u8]) {
     let pipeline = IngestPipeline::new(
         PipelineConfig::for_device(device),
         queue,
-        stage_registry_default(),
+        stage_registry_default(&pos_ingest::TranscribeSetup::local(
+            std::path::PathBuf::from("models/pulled"),
+            "whisper-small",
+        )),
     );
     let submission = EvidenceSubmission {
         source_kind: "upload".to_owned(),

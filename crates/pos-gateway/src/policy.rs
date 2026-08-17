@@ -13,6 +13,10 @@ use crate::weather::Weather;
 /// construction — never sniffed from hostnames at dispatch time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EndpointLocality {
+    /// The model runs inside this process (local whisper, m1-s03). There is
+    /// no URL, no socket, and therefore nothing a policy could leak through —
+    /// the strongest local-only statement the vocabulary can make.
+    InProcess,
     /// A same-device server (Ollama, LM Studio, vLLM on localhost). The
     /// constructor refuses this label for a non-loopback URL, so the label
     /// cannot lie.
@@ -25,9 +29,17 @@ impl EndpointLocality {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::InProcess => "in_process",
             Self::DeviceLocal => "device_local",
             Self::Remote => "remote",
         }
+    }
+
+    /// Whether bytes leave this device. The one question the egress warning
+    /// and the `local_only` gate both ask.
+    #[must_use]
+    pub const fn leaves_device(self) -> bool {
+        matches!(self, Self::Remote)
     }
 }
 
@@ -80,6 +92,12 @@ impl EndpointConfig {
         locality: EndpointLocality,
     ) -> Result<Self, EndpointConfigError> {
         let base_url = base_url.into();
+        if locality == EndpointLocality::InProcess {
+            return Err(EndpointConfigError {
+                reason: "an in-process endpoint has no URL; use EndpointConfig::in_process"
+                    .to_owned(),
+            });
+        }
         let host = url_host(&base_url).ok_or_else(|| EndpointConfigError {
             reason: format!("base URL did not parse: {base_url:?}"),
         })?;
@@ -89,6 +107,20 @@ impl EndpointConfig {
             });
         }
         Ok(Self { base_url, locality })
+    }
+
+    /// An endpoint that *is* this process — a model loaded into our own
+    /// address space (m1-s03's local whisper adapter).
+    ///
+    /// It is a separate constructor rather than a URL with a special scheme
+    /// because there is no URL to get wrong: `component` names the adapter
+    /// for preflight and the ledger, and nothing ever parses or dials it.
+    #[must_use]
+    pub fn in_process(component: &str) -> Self {
+        Self {
+            base_url: format!("in-process:{component}"),
+            locality: EndpointLocality::InProcess,
+        }
     }
 
     #[must_use]
@@ -139,14 +171,14 @@ impl ModelPolicy {
         };
         match self {
             Self::LocalOnly => match choice.endpoint.locality() {
-                EndpointLocality::DeviceLocal => Ok(()),
+                EndpointLocality::InProcess | EndpointLocality::DeviceLocal => Ok(()),
                 EndpointLocality::Remote => Err(violation(format!(
                     "remote endpoint for family {}",
                     choice.family.as_str()
                 ))),
             },
             Self::CloudAllowed => match choice.endpoint.locality() {
-                EndpointLocality::DeviceLocal => Ok(()),
+                EndpointLocality::InProcess | EndpointLocality::DeviceLocal => Ok(()),
                 // Known families at their pinned bases are exactly what the
                 // gateway constructor registers; a custom remote base under
                 // plain cloud_allowed is refused.
@@ -157,7 +189,7 @@ impl ModelPolicy {
                 ))),
             },
             Self::CustomEndpoints { allowed_base_urls } => match choice.endpoint.locality() {
-                EndpointLocality::DeviceLocal => Ok(()),
+                EndpointLocality::InProcess | EndpointLocality::DeviceLocal => Ok(()),
                 EndpointLocality::Remote => {
                     if choice.is_pinned_family_base
                         || allowed_base_urls
@@ -209,13 +241,38 @@ pub struct ModelChoice {
 }
 
 /// The per-tier routing table a project configures.
+///
+/// Transcription is a field rather than a third tier because tiers are about
+/// *how hard the thinking is* and transcription is a different modality: an
+/// interview routes to whisper or to a cloud STT endpoint regardless of what
+/// synthesis costs. It is optional because most gateways never transcribe,
+/// and a `None` that refuses typed beats a placeholder route that dials
+/// something unexpected (m1-s03).
 #[derive(Clone, Debug)]
 pub struct ModelRouting {
     pub frontier: ModelChoice,
     pub fast: ModelChoice,
+    pub transcribe: Option<ModelChoice>,
 }
 
 impl ModelRouting {
+    /// The two thinking tiers with no transcription route — every gateway
+    /// composed before m1-s03, stated once instead of at each call site.
+    #[must_use]
+    pub const fn thinking_only(frontier: ModelChoice, fast: ModelChoice) -> Self {
+        Self {
+            frontier,
+            fast,
+            transcribe: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_transcribe(mut self, choice: ModelChoice) -> Self {
+        self.transcribe = Some(choice);
+        self
+    }
+
     #[must_use]
     pub const fn choice(&self, tier: RoutingTier) -> &ModelChoice {
         match tier {
@@ -304,10 +361,7 @@ mod tests {
 
     #[test]
     fn routing_resolves_tiers_to_their_configured_choice() {
-        let routing = super::ModelRouting {
-            frontier: cloud_choice(true),
-            fast: local_choice(),
-        };
+        let routing = super::ModelRouting::thinking_only(cloud_choice(true), local_choice());
         assert_eq!(
             routing.choice(RoutingTier::Frontier).family,
             ProviderFamily::Anthropic

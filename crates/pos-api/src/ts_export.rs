@@ -17,6 +17,9 @@ use crate::gateway_ops::{
 use crate::ingest_ops::{
     EvidenceListInput, EvidenceListReport, EvidenceRow, EvidenceStageRow, IngestReprocessInput,
     IngestReprocessReport, SourceHealthInput, SourceHealthReport, SourceHealthRow,
+    TranscriptCorrectInput, TranscriptEditReport, TranscriptGetInput, TranscriptReport,
+    TranscriptSegmentRow, TranscriptSpeakerAssignInput, TranscriptSpeakerNameInput,
+    TranscriptSpeakerRow,
 };
 use crate::project_ops::{
     ProjectCreateInput, ProjectCreateReport, ProjectExportInput, ProjectExportReport,
@@ -90,7 +93,15 @@ macro_rules! for_each_exported_type {
             SourceHealthRow,
             SourceHealthReport,
             IngestReprocessInput,
-            IngestReprocessReport
+            IngestReprocessReport,
+            TranscriptGetInput,
+            TranscriptSegmentRow,
+            TranscriptSpeakerRow,
+            TranscriptReport,
+            TranscriptCorrectInput,
+            TranscriptSpeakerNameInput,
+            TranscriptSpeakerAssignInput,
+            TranscriptEditReport
         )
     };
 }

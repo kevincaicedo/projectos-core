@@ -1,3 +1,16 @@
 {
-  "models": []
+  "models": [
+    {
+      "name": "whisper-small",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+      "blake3": "e6d121492eebb6c95df251b26debc64d10db9bbf51060d2ff1855e774cfc364e",
+      "bytes": 487601967
+    },
+    {
+      "name": "whisper-base.en",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+      "blake3": "be283aece4a0efa1e4f2a74b0db6b9f7ca97d40ed71e6e3810293b0d11dd0955",
+      "bytes": 147964211
+    }
+  ]
 }

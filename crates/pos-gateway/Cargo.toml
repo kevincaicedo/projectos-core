@@ -17,6 +17,8 @@ serde_json = { workspace = true }
 # BLAKE3 pins prompts (prompts.lock) and verifies model artifacts — the same
 # hash the CAS already standardizes on (m0-s11).
 blake3 = { workspace = true }
+ureq = { workspace = true }
+whisper-rs = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
