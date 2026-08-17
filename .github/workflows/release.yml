@@ -45,15 +45,21 @@ jobs:
         run: corepack enable pnpm
       - name: Install
         run: pnpm install --frozen-lockfile
-      - name: Tauri Linux system dependencies
+      # Tauri needs the WebKitGTK set; whisper.cpp needs cmake, and its
+      # bindings need libclang for bindgen (m1-s03). Linux is a shipping
+      # target for local transcription, so these are not optional here.
+      - name: Linux system dependencies (Tauri + whisper.cpp)
         if: matrix.runner == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
             build-essential \
+            clang \
+            cmake \
             curl \
             file \
             libayatana-appindicator3-dev \
+            libclang-dev \
             librsvg2-dev \
             libssl-dev \
             libwebkit2gtk-4.1-dev \

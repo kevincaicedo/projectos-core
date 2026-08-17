@@ -21,6 +21,21 @@ Requires the Rust, Node, and pnpm versions pinned by `rust-toolchain.toml`,
 `.node-version`, and `package.json#packageManager`, plus
 [`just`](https://github.com/casey/just).
 
+Local transcription builds whisper.cpp from source, so a C++ toolchain,
+**CMake**, and **libclang** (for the bindings generator) are build
+prerequisites — on every platform that ships it. macOS gets all three from the
+Xcode command-line tools plus `brew install cmake`; on Debian/Ubuntu:
+
+```sh
+sudo apt-get install build-essential clang cmake libclang-dev
+```
+
+**Shipping targets for local transcription at M1: macOS and Linux.** Windows
+builds are not exercised; the capability is declared rather than silently
+absent, and cloud transcription is the path there.
+
+macOS 10.15 or newer, because whisper.cpp's ggml uses C++17 `std::filesystem`.
+
 ```sh
 pnpm install
 just ci            # the merge bar: build, test, policy, boundaries, UI, e2e

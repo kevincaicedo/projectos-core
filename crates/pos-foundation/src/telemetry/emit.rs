@@ -75,8 +75,9 @@ pub(super) fn install(config: TelemetryConfig) -> Result<(), TelemetryError> {
             return Err(TelemetryError {
                 code: "not_yet_supported",
                 message: "OTLP export is configured but not implemented yet; it lands with \
-                          m1-s03, alongside the reviewed TLS transport it shares a supply-chain \
-                          review with (M0-E7 design record §2.3)"
+                          m6-s07. The blocker is layering, not the TLS transport: this crate \
+                          sits below pos-gateway and may not reach it, so the exporter arrives \
+                          as a SpanSink that pos-api composes and installs"
                     .to_owned(),
             });
         }

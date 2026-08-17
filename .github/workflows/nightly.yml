@@ -25,6 +25,16 @@ jobs:
           just-version: "1.47.1"
       - name: Toolchain (pinned by rust-toolchain.toml)
         run: rustup show
+      # `pos-ingest` reaches `pos-gateway`, which builds whisper.cpp (m1-s03).
+      # The ingest matrix below cannot compile without these.
+      - name: Linux system dependencies (whisper.cpp)
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Crash-point matrix (kill -9 × append/snapshot/CAS)
         run: just crash-matrix

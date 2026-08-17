@@ -345,9 +345,15 @@ pub enum TelemetryExport {
     Off,
     Stderr,
     JsonLinesFile(PathBuf),
-    /// Registered, not implemented. See the module doc and the M0-E7 design
-    /// record §2.3; the wire exporter lands with m1-s03's reviewed TLS
-    /// transport, which it shares a supply-chain review with.
+    /// Registered, not implemented. **Owner: m6-s07** (re-owned 2026-08-16).
+    ///
+    /// m1-s03 shipped the reviewed TLS transport and proved that was never
+    /// the blocker: `TlsHttpTransport` lives in `pos-gateway`, this crate
+    /// sits *below* it in the §19 dependency direction, and a TLS client
+    /// down here would also destroy the property that core's egress is one
+    /// reviewable module. The exporter therefore arrives as a [`SpanSink`]
+    /// that `pos-api` composes over the transport and installs — the API
+    /// layer plugging the network into the telemetry system.
     Otlp {
         endpoint: String,
     },
