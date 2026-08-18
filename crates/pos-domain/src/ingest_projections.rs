@@ -35,11 +35,11 @@
 
 use crate::events::DomainEvent;
 use crate::ingest::{
-    ChunkFact, EvidenceAddedBody, EvidenceChunkedBody, EvidenceReprocessRequestedBody,
-    EvidenceStatus, EvidenceTranscribedBody, IngestStage, IngestStageDisposition,
-    IngestStageFailedBody, IngestStageFinishedBody, IngestStageOutput, IngestStageStartedBody,
-    TRANSCRIPT_SPEAKER_UNASSIGNED, TranscriptSegmentFact, TranscriptSegmentSpeakerSetBody,
-    TranscriptSpeakerNamedBody, TranscriptTextCorrectedBody,
+    ChunkEmbeddingFact, ChunkFact, EvidenceAddedBody, EvidenceChunkedBody, EvidenceEmbeddedBody,
+    EvidenceReprocessRequestedBody, EvidenceStatus, EvidenceTranscribedBody, IngestStage,
+    IngestStageDisposition, IngestStageFailedBody, IngestStageFinishedBody, IngestStageOutput,
+    IngestStageStartedBody, TRANSCRIPT_SPEAKER_UNASSIGNED, TranscriptSegmentFact,
+    TranscriptSegmentSpeakerSetBody, TranscriptSpeakerNamedBody, TranscriptTextCorrectedBody,
 };
 use pos_log::{
     ApplyError, ColumnDef, ColumnKind, Event, IndexDef, Projection, RowWrite, SqlValue, TableDef,
@@ -892,6 +892,176 @@ impl Projection for TranscriptSpeakerProjection {
 /// here — an apply function may not read another table (event-sourcing
 /// skill), so every stage event carries the source it belongs to. That is one
 /// 16-byte field per event to keep this projection pure.
+/// One row per `(chunk, model, enrichment version)` — where a chunk's vector
+/// lives in the CAS, and everything a reader needs to use it without opening
+/// the blob first.
+///
+/// **The vectors themselves are not here.** [`EvidenceEmbeddedBody`] states
+/// why: 1.5 GB of `f32` per million chunks belongs in the CAS, where it is
+/// exportable, dedupable, and — unlike an event — collectable when a re-embed
+/// supersedes it ([ADR-0009]). This table is the index *into* that: rebuilt
+/// by replay like every projection, and answering "is this chunk embedded,
+/// under which model, and where are its 384 floats" without a blob read.
+///
+/// The key includes `model_id` and `enrichment_version` rather than just
+/// `chunk_id`, which is what makes a re-embed to a second model *additive*:
+/// both vectors coexist, retrieval picks one by name, and the superseded rows
+/// are collectable as a set rather than by guessing which came first.
+///
+/// [ADR-0009]: ../../../../docs/adr/0009-vectors-are-a-cas-backed-derived-index.md
+struct ChunkEmbeddingProjection;
+
+const CHUNK_EMBEDDING_TABLE: TableDef = TableDef {
+    name: "proj_chunk_embedding",
+    version: 1,
+    key_columns: &[
+        ColumnDef {
+            name: "chunk_id",
+            kind: ColumnKind::Blob,
+        },
+        ColumnDef {
+            name: "model_id",
+            kind: ColumnKind::Text,
+        },
+        ColumnDef {
+            name: "enrichment_version",
+            kind: ColumnKind::Integer,
+        },
+    ],
+    value_columns: &[
+        ColumnDef {
+            name: "evidence_id",
+            kind: ColumnKind::Blob,
+        },
+        ColumnDef {
+            name: "dim",
+            kind: ColumnKind::Integer,
+        },
+        ColumnDef {
+            name: "vectors_blob",
+            kind: ColumnKind::Blob,
+        },
+        ColumnDef {
+            name: "row",
+            kind: ColumnKind::Integer,
+        },
+        ColumnDef {
+            name: "content_hash",
+            kind: ColumnKind::Blob,
+        },
+        ColumnDef {
+            name: "token_count",
+            kind: ColumnKind::Integer,
+        },
+        ColumnDef {
+            name: "truncated",
+            kind: ColumnKind::Integer,
+        },
+        ColumnDef {
+            name: "pass",
+            kind: ColumnKind::Integer,
+        },
+        ColumnDef {
+            name: "created_seq",
+            kind: ColumnKind::Integer,
+        },
+    ],
+    indexes: &[
+        // "Which vectors does this item have, under which models" — the
+        // reprocess planner and the item view both ask exactly this.
+        IndexDef {
+            name: "idx_proj_chunk_embedding_evidence",
+            columns: &["evidence_id", "model_id", "pass"],
+        },
+        // Identical content embeds once (F6): EMBED asks this before
+        // spending, so it has to be an index lookup, not a corpus scan.
+        IndexDef {
+            name: "idx_proj_chunk_embedding_content",
+            columns: &["content_hash", "model_id", "enrichment_version"],
+        },
+        // The GC set: every row of a superseded model, without a scan.
+        IndexDef {
+            name: "idx_proj_chunk_embedding_model",
+            columns: &["model_id", "enrichment_version"],
+        },
+    ],
+};
+
+impl Projection for ChunkEmbeddingProjection {
+    fn table(&self) -> &TableDef {
+        &CHUNK_EMBEDDING_TABLE
+    }
+
+    fn apply(&self, event: &Event) -> Result<Vec<RowWrite>, ApplyError> {
+        if event.kind.as_str() != "EvidenceEmbedded" {
+            return Ok(Vec::new());
+        }
+        let Some(DomainEvent::EvidenceEmbedded(EvidenceEmbeddedBody::V1 {
+            evidence_id,
+            pass,
+            model_id,
+            dim,
+            enrichment_version,
+            vectors_blob,
+            chunks,
+            ..
+        })) = decode_for(&CHUNK_EMBEDDING_TABLE, event)?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(chunks
+            .into_iter()
+            .map(|chunk| {
+                embedding_row(
+                    event,
+                    evidence_id.into_bytes(),
+                    pass,
+                    &model_id,
+                    dim,
+                    enrichment_version,
+                    vectors_blob,
+                    &chunk,
+                )
+            })
+            .collect())
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a projection row is a column list; grouping it into a struct would \
+              add a type whose only purpose is to be destructured here"
+)]
+fn embedding_row(
+    event: &Event,
+    evidence_id: [u8; 16],
+    pass: u32,
+    model_id: &str,
+    dim: u16,
+    enrichment_version: u16,
+    vectors_blob: [u8; 32],
+    chunk: &ChunkEmbeddingFact,
+) -> RowWrite {
+    RowWrite::Upsert {
+        key: vec![
+            id_blob(chunk.chunk_id.into_bytes()),
+            text(model_id),
+            integer_u32(u32::from(enrichment_version)),
+        ],
+        values: vec![
+            id_blob(evidence_id),
+            integer_u32(u32::from(dim)),
+            hash_blob(vectors_blob),
+            integer_u32(chunk.row),
+            hash_blob(chunk.content_hash),
+            integer_u32(chunk.token_count),
+            SqlValue::Integer(i64::from(chunk.truncated)),
+            integer_u32(pass),
+            seq_value(event),
+        ],
+    }
+}
+
 struct SourceHealthProjection;
 
 const SOURCE_HEALTH_TABLE: TableDef = TableDef {
@@ -1079,6 +1249,7 @@ pub fn projections() -> Vec<Box<dyn Projection>> {
         Box::new(EvidenceProjection),
         Box::new(EvidenceStagesProjection),
         Box::new(ChunksProjection),
+        Box::new(ChunkEmbeddingProjection),
         Box::new(SourceHealthProjection),
         Box::new(TranscriptSegmentProjection),
         Box::new(TranscriptSpeakerProjection),

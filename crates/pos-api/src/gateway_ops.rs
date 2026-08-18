@@ -322,10 +322,27 @@ pub struct ModelsPullInput {
 #[serde(rename_all = "camelCase")]
 pub struct ModelsPullReport {
     pub name: String,
+    /// Total across every file, so a caller shows one number for one pull.
+    #[ts(type = "number")]
+    pub bytes: u64,
+    /// One row per file (m1-s04: an ONNX artifact is a graph and a
+    /// vocabulary). Each carries its own verified hash, because "the pull
+    /// succeeded" must mean every file was verified, not the last one.
+    pub files: Vec<ModelsPullFileReport>,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelsPullFileReport {
+    pub name: String,
     pub path: String,
     #[ts(type = "number")]
     pub bytes: u64,
     pub blake3: String,
+    /// This file was on disk from an earlier attempt and was not re-fetched.
+    /// Stated rather than hidden: a "pull succeeded" that downloaded nothing
+    /// should say so.
+    pub already_present: bool,
 }
 
 /// The `models.pull` command: manifest lookup, consent gate, BLAKE3-verified
@@ -334,8 +351,10 @@ pub struct ModelsPullReport {
 pub(crate) fn models_pull(input: &ModelsPullInput) -> Result<String, ApiError> {
     let manifest =
         ModelManifest::load(Path::new(&input.manifest_path)).map_err(|error| pull_error(&error))?;
-    let entry = manifest
-        .entry(&input.name)
+    // Every file the artifact is made of: one for a whisper `.bin`, a graph
+    // plus a vocabulary for an ONNX encoder (m1-s04).
+    let files = manifest
+        .artifact(&input.name)
         .map_err(|error| pull_error(&error))?;
     let consent = if input.consent {
         PullConsent::Given
@@ -348,18 +367,53 @@ pub(crate) fn models_pull(input: &ModelsPullInput) -> Result<String, ApiError> {
     // the one thing in the model manager that leaves the device.
     let tls = TlsHttpTransport::new();
     let loopback = LoopbackHttpTransport;
-    let transport: &dyn pos_gateway::HttpTransport = if entry.url.starts_with("https://") {
-        &tls
-    } else {
-        &loopback
-    };
-    let report = pull_model(entry, consent, &PathBuf::from(&input.dest_dir), transport)
-        .map_err(|error| pull_error(&error))?;
+    let dest = PathBuf::from(&input.dest_dir);
+    let mut reports = Vec::with_capacity(files.len());
+    for entry in files {
+        let transport: &dyn pos_gateway::HttpTransport = if entry.url.starts_with("https://") {
+            &tls
+        } else {
+            &loopback
+        };
+        // Sequential, and it stops at the first real failure: a half-pulled
+        // ONNX artifact is not a usable one, and continuing would leave a
+        // directory that looks present to the stage's `is_file` check.
+        //
+        // A file that is *already* present is not a failure of the artifact,
+        // though — it is the normal state when an earlier attempt got part
+        // way. Refusing the whole pull for it would make a resumed multi-file
+        // artifact permanently unpullable, which is exactly the state m1-s04
+        // hit on its first run.
+        match pull_model(entry, consent, &dest, transport) {
+            Ok(report) => reports.push(ModelsPullFileReport {
+                name: report.name,
+                path: report.path.display().to_string(),
+                bytes: report.bytes,
+                blake3: report.blake3,
+                already_present: false,
+            }),
+            Err(pos_gateway::ModelPullError::AlreadyPresent { path }) => {
+                reports.push(ModelsPullFileReport {
+                    name: entry.name.clone(),
+                    path,
+                    bytes: entry.bytes,
+                    // The manifest's pin, which the earlier pull verified
+                    // before renaming the file into place. Restated rather
+                    // than recomputed: re-hashing 133 MB to tell a user
+                    // nothing changed is a cost with no answer attached, and
+                    // `pos verify` is the command that re-checks artifacts.
+                    blake3: entry.blake3.clone(),
+                    already_present: true,
+                });
+            }
+            Err(error) => return Err(pull_error(&error)),
+        }
+    }
+    let bytes = reports.iter().map(|file| file.bytes).sum();
     project_ops::to_json(&ModelsPullReport {
-        name: report.name,
-        path: report.path.display().to_string(),
-        bytes: report.bytes,
-        blake3: report.blake3,
+        name: input.name.clone(),
+        bytes,
+        files: reports,
     })
 }
 

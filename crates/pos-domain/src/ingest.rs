@@ -767,6 +767,78 @@ pub enum EvidenceChunkedBody {
     },
 }
 
+/// Vectors one EMBED batch produced, as a fact.
+///
+/// ## Why the vectors are not in this event
+///
+/// A million-chunk corpus at 384 dimensions is 1.5 GB of `f32`. Putting that
+/// in the log would make every replay decode it, every snapshot carry it, and
+/// every sync ship it — for data that is *derivable*, and that the milestone
+/// requires be **garbage-collectable** when a re-embed supersedes it. An
+/// event cannot be collected; that is what makes it an event.
+///
+/// So this follows the shape NORMALIZE already set for text: the bytes go to
+/// the **CAS** and the event carries their 32-byte identity. The blob is part
+/// of the project directory, so export stays total (L4) and a fresh clone can
+/// rebuild the vector index from the log plus the CAS — with no model, no
+/// network, and no cost. See [ADR-0009].
+///
+/// [ADR-0009]: ../../../../docs/adr/0009-vectors-are-a-cas-backed-derived-index.md
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum EvidenceEmbeddedBody {
+    V1 {
+        evidence_id: EvidenceId,
+        /// See [`IngestStageStartedBody::V1::source_id`].
+        source_id: SourceId,
+        pass: u32,
+        /// 0-based batch index, so a replayed batch assigns rather than adds.
+        batch_index: u32,
+        /// The model that produced these vectors. On every row, because a
+        /// mixed-model index answers plausible nonsense and no shape check
+        /// can catch it (the milestone's "mixed-model query = typed error").
+        model_id: String,
+        dim: u16,
+        /// Which input shape produced them: `0` is content-only. Beside
+        /// `model_id` because switching enrichment on changes the vectors
+        /// exactly as much as switching models does ([05] §5).
+        ///
+        /// [05]: ../../../../docs/05-intelligence-context-and-data-architecture.md
+        enrichment_version: u16,
+        /// BLAKE3 of the packed little-endian `f32` batch in the CAS,
+        /// `chunks.len() × dim` floats in `chunks` order.
+        vectors_blob: [u8; 32],
+        /// The chunks this batch embedded, in the batch's own order — which
+        /// is also their row order inside `vectors_blob`.
+        chunks: Vec<ChunkEmbeddingFact>,
+    },
+}
+
+/// One chunk's place in an embedding batch.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChunkEmbeddingFact {
+    pub chunk_id: ChunkId,
+    /// Row index inside `vectors_blob`. Explicit rather than positional so a
+    /// reader never depends on `Vec` order surviving a serde round trip.
+    pub row: u32,
+    /// The chunk content this vector is *of*. Carrying it makes the
+    /// duplicate-embedding rule checkable after the fact: two chunks sharing
+    /// a `content_hash` under one `(model_id, enrichment_version)` must share
+    /// a vector, and this is what a checker compares (F6).
+    pub content_hash: [u8; 32],
+    /// Tokens the model actually consumed for this chunk, from the real
+    /// tokenizer — which is what `ChunkFact::token_count_estimate` was an
+    /// estimate *of* (m1-s02 named this story as its owner).
+    pub token_count: u32,
+    /// The content did not fit the model's sequence window and was cut.
+    /// Never silent: a truncated chunk embedded as if whole is the
+    /// silent-truncation lie L8 forbids (m1-s05 surfaces it in `explain`).
+    pub truncated: bool,
+}
+
+/// Vectors one EMBED batch may carry. Bounded by the same event-ref budget as
+/// a chunk batch, because each row contributes a ref.
+pub const EMBED_BATCH_COUNT_MAX: usize = pos_log::EVENT_REFS_COUNT_MAX - 1;
+
 /// A human or a migration asked for the pipeline to run again from a stage.
 /// The pass increments here, which is what makes the re-enqueued stage jobs
 /// new work rather than colliding with the completed ones.

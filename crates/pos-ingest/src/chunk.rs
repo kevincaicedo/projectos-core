@@ -44,6 +44,13 @@ pub const TOKEN_BYTES_ESTIMATE: u64 = 4;
 /// accepts, and it keeps the ordinal inside `u32` (L8: state the limit).
 pub const CHUNK_COUNT_MAX: u64 = 4_000_000;
 
+/// The largest `tokens_max` any shape's [`ChunkParams`] declares.
+///
+/// Asserted against the table below, so adding a shape with a bigger window
+/// fails a test rather than silently exceeding the byte budget EMBED derives
+/// from this (`pipeline::CHUNK_TEXT_BYTES_MAX`).
+pub const CHUNK_TOKENS_MAX_CEILING: u32 = 400;
+
 /// Where a window is allowed to end.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BoundaryRule {

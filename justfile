@@ -235,6 +235,17 @@ bench-m1-transcribe audio replicates="3": bench-build
       ./target/release/pos-bench run --scenario transcribe-realtime \
       --audio {{audio}} --replicates {{replicates}}
 
+# The m1-s04 embedding memory row. Needs bge-small-en-v1.5 pulled and writes
+# ~1.2 GiB of corpus; a million forward passes is hours, not minutes.
+bench-m1-embed replicates="3": bench-build
+    POS_MODELS_DIR=models/pulled \
+      ./target/release/pos-bench run --scenario embed-memory1m \
+      --replicates {{replicates}}
+
+# Pulls the local embedding artifact (graph + vocabulary) with consent.
+pull-embed-model:
+    cargo run --release --quiet -p pos --bin pos -- models pull bge-small-en-v1.5 --yes
+
 # Emits the docs/reference-machines.md fingerprint for the current host. Run on
 # each binding machine and paste the output into its registry row (m0-s02).
 fingerprint-machine machine_id: node-version-check

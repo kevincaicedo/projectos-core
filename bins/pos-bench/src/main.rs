@@ -88,6 +88,9 @@ enum ScenarioName {
     /// §18: local transcription runs at ≥ 5x realtime on the reference
     /// laptop (m1-s03).
     TranscribeRealtime,
+    /// §18: a 1M-chunk corpus embeds locally with pipeline buffers < 64 MB
+    /// and total process RSS < 1.0 GB, weights included (m1-s04, ADR-0008).
+    EmbedMemory1m,
 }
 
 impl ScenarioName {
@@ -98,6 +101,7 @@ impl ScenarioName {
             Self::UiInteractionP95 => "m0.ui-interaction-p95",
             Self::IngestBuffers8gb => "m1.ingest-buffers-8gb",
             Self::TranscribeRealtime => "m1.transcribe-realtime",
+            Self::EmbedMemory1m => "m1.embed-memory-1m",
         }
     }
 
@@ -111,6 +115,7 @@ impl ScenarioName {
             // opened an intake path a gate is allowed to drive.
             Self::IngestBuffers8gb => "m1-s01",
             Self::TranscribeRealtime => "m1-s03",
+            Self::EmbedMemory1m => "m1-s04",
             _ => "m0-s16",
         }
     }
@@ -119,7 +124,9 @@ impl ScenarioName {
     /// output directory. Gate evidence is filed by milestone.
     const fn default_out(self) -> &'static str {
         match self {
-            Self::IngestBuffers8gb | Self::TranscribeRealtime => "../docs/gates/m1",
+            Self::IngestBuffers8gb | Self::TranscribeRealtime | Self::EmbedMemory1m => {
+                "../docs/gates/m1"
+            }
             _ => "../docs/gates/m0",
         }
     }
@@ -430,6 +437,56 @@ fn measure(request: &RunRequest) -> Result<(Vec<Series>, String), Box<dyn std::e
                 ),
             ))
         }
+        ScenarioName::EmbedMemory1m => {
+            let corpus =
+                scenarios::ensure_embed_dataset(&request.dataset, scenarios::EMBED_CHUNK_COUNT)?;
+            let mut buffers = Vec::new();
+            let mut rss = Vec::new();
+            let mut throughput = Vec::new();
+            let mut chunk_count = 0_u64;
+            for replicate in 0..request.replicates {
+                let measured =
+                    scenarios::measure_embed_memory(&request.dataset, &corpus, replicate)?;
+                buffers.push(mib(measured.buffer_peak_bytes));
+                rss.push(mib(measured.rss_peak_bytes));
+                throughput.push(rate_per_second(measured.vector_count, measured.wall_ms));
+                chunk_count = measured.chunk_count;
+            }
+            Ok((
+                vec![
+                    // ADR-0008 bound 1 — the one that fails a pull request.
+                    // The embedding batch is a *buffer* like any other, and
+                    // its budget is stated in padded tokens because ONNX
+                    // Runtime's arena grows and never shrinks.
+                    Series {
+                        label: "pipeline buffer residency (peak, summed across stages)",
+                        unit: "MiB",
+                        samples: buffers,
+                        aggregation: "max",
+                        threshold: Some(Threshold::at_most(64.0)),
+                    },
+                    // ADR-0008 bound 3 — and unlike the 8 GiB row, this one
+                    // has the model loaded: bge-small-en-v1.5 is 226 MiB
+                    // resident from a 133 MB artifact, which is why the
+                    // manifest's declared size is not the resident cost.
+                    Series {
+                        label: "process RSS during the run (peak, 1 Hz sample, weights included)",
+                        unit: "MiB",
+                        samples: rss,
+                        aggregation: "max",
+                        threshold: Some(Threshold::at_most(1024.0)),
+                    },
+                    Series {
+                        label: "embedding throughput",
+                        unit: "chunks/s",
+                        samples: throughput,
+                        aggregation: "median",
+                        threshold: None,
+                    },
+                ],
+                format!("synthetic:{chunk_count}-chunks-markdown:deterministic"),
+            ))
+        }
         ScenarioName::TranscribeRealtime => {
             let mut factors = Vec::new();
             let mut identity = String::new();
@@ -645,6 +702,15 @@ fn rate_mib_per_second(bytes: u64, wall_ms: u64) -> f64 {
         return f64::NAN;
     }
     mib(bytes) / (wall_ms as f64 / 1000.0)
+}
+
+/// Items finished per wall-clock second — the throughput unit for a row whose
+/// work is counted rather than measured in bytes.
+fn rate_per_second(count: u64, wall_ms: u64) -> f64 {
+    if wall_ms == 0 {
+        return f64::NAN;
+    }
+    count as f64 / (wall_ms as f64 / 1000.0)
 }
 
 /// Audio seconds decoded per wall-clock second. The §18 row is stated this

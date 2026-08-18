@@ -731,13 +731,24 @@ const REGISTERED_KIND_DETAIL_OWNER: &str = "crates/pos-sched/src/pool.rs";
 /// if swapping the wrapper stays a one-file change, so the containment is
 /// mechanical rather than a review habit — the same shape as the `tracing`
 /// rule above and for the same reason.
-const VENDOR_CONFINED_CRATES: [ConfinedCrate; 1] = [ConfinedCrate {
-    ident: "whisper_rs",
-    owner: "crates/pos-gateway/src/adapter/whisper_local.rs",
-    reason: "the whisper.cpp binding is confined to one adapter module so a vendored FFI leaf, a \
-             different wrapper, or a cloud adapter replaces exactly one file (ADR-0006 §2); \
-             everything above it speaks pos_gateway::Transcriber",
-}];
+const VENDOR_CONFINED_CRATES: [ConfinedCrate; 2] = [
+    ConfinedCrate {
+        ident: "whisper_rs",
+        owner: "crates/pos-gateway/src/adapter/whisper_local.rs",
+        reason: "the whisper.cpp binding is confined to one adapter module so a vendored FFI \
+                 leaf, a different wrapper, or a cloud adapter replaces exactly one file \
+                 (ADR-0006 §2); everything above it speaks pos_gateway::Transcriber",
+    },
+    // Same rule, same reason, one story later: `ort` is a pre-1.0 release
+    // candidate whose API moves between them (m1-s04, ADR-0009 §1).
+    ConfinedCrate {
+        ident: "ort",
+        owner: "crates/pos-gateway/src/adapter/onnx_embed.rs",
+        reason: "the ONNX Runtime binding is confined to one adapter module so another runtime, \
+                 a vendored leaf, or an API adapter replaces exactly one file (ADR-0009 §1); \
+                 everything above it speaks pos_gateway::Embedder",
+    },
+];
 
 struct ConfinedCrate {
     ident: &'static str,
@@ -1121,6 +1132,9 @@ mod tests {
             "fn load() { let _ = whisper_rs::WhisperContext::new(); }",
             "use whisper_rs::{FullParams, SamplingStrategy};",
             "struct Holder { context: whisper_rs::WhisperContext }",
+            "use ort::session::Session;",
+            "fn run() { let _ = ort::session::Session::builder(); }",
+            "struct Held { session: ort::session::Session }",
         ];
         for source in seeded {
             let violations = rust_violations_at(source, elsewhere);

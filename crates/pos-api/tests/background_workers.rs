@@ -98,10 +98,13 @@ fn submit_one(path: &str, content: &[u8]) {
     let pipeline = IngestPipeline::new(
         PipelineConfig::for_device(device),
         queue,
-        stage_registry_default(&pos_ingest::TranscribeSetup::local(
-            std::path::PathBuf::from("models/pulled"),
-            "whisper-small",
-        )),
+        stage_registry_default(
+            &pos_ingest::TranscribeSetup::local(
+                std::path::PathBuf::from("models/pulled"),
+                "whisper-small",
+            ),
+            &pos_ingest::EmbedSetup::local(std::path::PathBuf::from("models/pulled")),
+        ),
     );
     let submission = EvidenceSubmission {
         source_kind: "upload".to_owned(),
@@ -238,9 +241,20 @@ fn an_open_project_runs_its_queued_stages_with_nothing_here_claiming_them() {
         "{listed}"
     );
     assert!(!listed.contains("\"chunkCount\":0"), "{listed}");
-    // And it stopped honestly at the first stage this build does not own.
-    assert!(listed.contains("\"nextStage\":\"embed\""), "{listed}");
-    assert!(listed.contains("\"nextStageAvailable\":false"), "{listed}");
+    // And it stopped honestly. *Where* it stops depends on whether an
+    // embedding model is pulled on this machine (m1-s04's `stage_registry`
+    // explains why that is a registration question rather than a failure),
+    // so the assertion is the property that holds either way: the run either
+    // named a next stage it cannot run, or it ran EMBED too and named the
+    // stage after it. What it must never do is claim a stage is available and
+    // then not have run it.
+    let stopped_honestly = listed.contains("\"nextStageAvailable\":false")
+        || listed.contains("\"stage\":\"embed\",\"state\":\"done\"");
+    assert!(stopped_honestly, "{listed}");
+    assert!(
+        !listed.contains("\"state\":\"dead\""),
+        "nothing correct may dead-letter: {listed}"
+    );
 
     let drained = runtime.drain_background_workers(OBSERVE_MS_MAX);
     assert!(drained.quiescent, "the queue is not quiescent: {drained:?}");
@@ -356,7 +370,10 @@ fn reprocess_says_whether_a_worker_will_run_what_it_queued() {
     let drained = runtime.drain_background_workers(OBSERVE_MS_MAX);
     assert!(drained.quiescent, "{drained:?}");
     let relisted = evidence_list(&runtime, &path);
-    assert!(relisted.contains("\"status\":\"chunked\""), "{relisted}");
+    assert!(
+        relisted.contains("\"status\":\"chunked\"") || relisted.contains("\"status\":\"embedded\""),
+        "the reprocess pass reached the last stage this machine can run: {relisted}"
+    );
     assert!(
         relisted.contains("\"pass\":1"),
         "the reprocess pass ran: {relisted}"

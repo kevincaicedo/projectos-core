@@ -95,6 +95,39 @@ impl ModelManifest {
                 name: name.to_owned(),
             })
     }
+
+    /// Every file one model artifact is made of, in manifest order.
+    ///
+    /// A whisper model is one `.bin`; an ONNX encoder is a graph *and* its
+    /// vocabulary, and both must be present or neither is usable. Rather than
+    /// give the entry a nested file list — which would fork the pull path,
+    /// its resume rules, and its verification into single- and multi-file
+    /// cases — a multi-file artifact is a **directory of names**:
+    /// `bge-small-en-v1.5/model.onnx` and `bge-small-en-v1.5/vocab.txt` are
+    /// two ordinary entries, each hash-pinned and resumable exactly like
+    /// every other, and `pos models pull bge-small-en-v1.5` pulls both.
+    ///
+    /// The entry name is therefore the artifact's path under the models
+    /// directory, which it already was.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelPullError::UnknownModel`] when nothing matches, so a typo is a
+    /// refusal rather than a silent zero-file pull.
+    pub fn artifact(&self, name: &str) -> Result<Vec<&ModelManifestEntry>, ModelPullError> {
+        let prefix = format!("{name}/");
+        let files: Vec<&ModelManifestEntry> = self
+            .models
+            .iter()
+            .filter(|entry| entry.name == name || entry.name.starts_with(&prefix))
+            .collect();
+        if files.is_empty() {
+            return Err(ModelPullError::UnknownModel {
+                name: name.to_owned(),
+            });
+        }
+        Ok(files)
+    }
 }
 
 /// Explicit consent is an argument, not a default (L5-adjacent): the CLI
@@ -318,6 +351,25 @@ pub fn pull_model(
     )
 }
 
+/// Resolves a `Location` header against the URL that produced it.
+///
+/// Absolute `https` locations pass through; a path-absolute location keeps the
+/// current origin; anything else — `http`, a scheme-relative `//host/path`, a
+/// path-relative fragment — is refused rather than guessed at, because the
+/// point of this check is that a redirect never downgrades the scheme and
+/// never silently reaches a host the manifest did not name.
+fn resolve_redirect(current: &str, location: &str) -> Option<String> {
+    if location.starts_with("https://") {
+        return Some(location.to_owned());
+    }
+    if !location.starts_with('/') || location.starts_with("//") {
+        return None;
+    }
+    let origin_end = current.strip_prefix("https://")?.find('/')?;
+    let origin = &current["https://".len().."https://".len() + origin_end];
+    Some(format!("https://{origin}{location}"))
+}
+
 /// Pulls one model, refusing anything past `budget_bytes` before any I/O.
 ///
 /// Resumes an interrupted pull from its `.pulling` file; see the module doc
@@ -353,8 +405,11 @@ pub fn pull_model_with_budget(
             path: final_path.display().to_string(),
         });
     }
-    std::fs::create_dir_all(dest_dir).map_err(|error| ModelPullError::Io {
-        path: dest_dir.display().to_string(),
+    // The parent, not `dest_dir`: a multi-file artifact's entry name carries
+    // a directory component (see `ModelManifest::artifact`).
+    let parent = final_path.parent().unwrap_or(dest_dir);
+    std::fs::create_dir_all(parent).map_err(|error| ModelPullError::Io {
+        path: parent.display().to_string(),
         reason: error.to_string(),
     })?;
     let temp_path = dest_dir.join(format!("{}.pulling", entry.name));
@@ -491,6 +546,14 @@ fn stream_to_temp(
             headers,
             body: Vec::new(),
             timeout_ms: DOWNLOAD_TIMEOUT_MS,
+            // Derived from the manifest's own declared size, not from the
+            // transport's text-shaped default — every artifact in the catalog
+            // is larger than that, so the default would refuse all of them
+            // (m1-s04 found this: no HTTPS pull could finish). The `+1` lets
+            // the transport deliver one byte past the declaration so the
+            // size-mismatch check below reports an oversized artifact by name
+            // rather than as a framing violation.
+            response_bytes_max: Some(entry.bytes.saturating_add(1)),
         };
         // A redirect and an ignored range both abort the transfer on purpose;
         // both are handled below, from the head the writer kept.
@@ -534,14 +597,21 @@ fn stream_to_temp(
                     ),
                 });
             }
-            if !location.starts_with("https://") {
-                return Err(ModelPullError::Source {
-                    reason: format!(
-                        "artifact source redirected to a non-https location: {location}"
-                    ),
-                });
-            }
-            url = location;
+            // A relative `Location` is resolved against the current origin.
+            // That is *more* restrictive than an absolute one, not less: it
+            // cannot change host, so the redirect stays inside the origin the
+            // manifest named. HuggingFace answers with one of these, which is
+            // how m1-s04 found this path refusing every artifact it hosts.
+            url = match resolve_redirect(&url, &location) {
+                Some(next) => next,
+                None => {
+                    return Err(ModelPullError::Source {
+                        reason: format!(
+                            "artifact source redirected to a non-https location: {location}"
+                        ),
+                    });
+                }
+            };
             continue;
         }
         if head.status >= 300 {

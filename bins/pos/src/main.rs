@@ -148,6 +148,30 @@ enum IngestCommand {
         #[arg(long, default_value_t = WORKER_DRAIN_MS_MAX_DEFAULT / MS_PER_SEC)]
         drain_secs: u64,
     },
+    /// Re-embed a project under a different model (m1-s04).
+    ///
+    /// Sugar over `reprocess --from-stage embed`, and deliberately so: a
+    /// re-embed *is* a managed reprocess, not a second mechanism. The model
+    /// is named here rather than read from configuration so the recorded
+    /// reason says which model, and so the command is reproducible from a
+    /// shell history.
+    Reembed {
+        directory: PathBuf,
+        /// The artifact to embed under, e.g. `bge-small-en-v1.5`. It must be
+        /// pulled: vectors from a model that is not there cannot be computed.
+        #[arg(long)]
+        model: String,
+        /// One item; omitted means every eligible item, up to `--limit`.
+        #[arg(long)]
+        evidence: Option<String>,
+        #[arg(long, default_value_t = 500)]
+        limit: u32,
+        /// Queue the work and exit without running it.
+        #[arg(long)]
+        no_drain: bool,
+        #[arg(long, default_value_t = WORKER_DRAIN_MS_MAX_DEFAULT / MS_PER_SEC)]
+        drain_secs: u64,
+    },
     /// Re-run the pipeline from a stage. Never re-fetches from the source:
     /// the bytes already stored are the Evidence.
     Reprocess {
@@ -235,7 +259,9 @@ const fn queues_background_work(command: &CliCommand) -> bool {
     matches!(
         command,
         CliCommand::Ingest {
-            command: IngestCommand::Reprocess { .. } | IngestCommand::Submit { .. }
+            command: IngestCommand::Reprocess { .. }
+                | IngestCommand::Submit { .. }
+                | IngestCommand::Reembed { .. }
         }
     )
 }
@@ -360,6 +386,42 @@ fn run(runtime: &LocalRuntime, command: CliCommand) -> Result<ExitCode, String> 
             }
             if let Err(message) = dispatch_command(runtime, CommandName::ProjectClose, &project) {
                 eprintln!("pos ingest submit: closing the project failed: {message}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        CliCommand::Ingest {
+            command:
+                IngestCommand::Reembed {
+                    directory,
+                    model,
+                    evidence,
+                    limit,
+                    no_drain,
+                    drain_secs,
+                },
+        } => {
+            // One process, one answer for "which model does EMBED load".
+            // Set before the project opens, because the worker pool composes
+            // its stage handlers at open.
+            pos_api::set_embed_model(model.clone())
+                .map_err(|already| format!("this process already embeds under {already:?}"))?;
+            let path = path_text(&directory)?;
+            let project = ProjectPathInput { path: path.clone() };
+            dispatch_command(runtime, CommandName::ProjectOpen, &project)?;
+            let input = pos_api::IngestReprocessInput {
+                path,
+                from_stage: pos_api::IngestStage::Embed.as_str().to_owned(),
+                evidence_id: evidence,
+                item_count_max: Some(limit),
+                reason: format!("re-embed under {model}"),
+            };
+            let report = dispatch_command(runtime, CommandName::IngestReprocess, &input)?;
+            println!("{report}");
+            if !no_drain {
+                render_drain(&runtime.drain_background_workers(drain_secs * MS_PER_SEC));
+            }
+            if let Err(message) = dispatch_command(runtime, CommandName::ProjectClose, &project) {
+                eprintln!("pos ingest reembed: closing the project failed: {message}");
             }
             Ok(ExitCode::SUCCESS)
         }

@@ -19,6 +19,12 @@ serde_json = { workspace = true }
 blake3 = { workspace = true }
 ureq = { workspace = true }
 whisper-rs = { workspace = true }
+# The local embedding runtime, confined to one adapter module by the
+# `vendor-containment` check-discipline rule (m1-s04, ADR-0009).
+ort = { workspace = true }
+# NFD for the WordPiece normalizer; see `wordpiece.rs` for why the algorithm
+# is ours and only the Unicode table is not.
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

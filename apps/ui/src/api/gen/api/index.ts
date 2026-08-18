@@ -22,6 +22,7 @@ export * from "./IngestSubmitRow";
 export * from "./JobListInput";
 export * from "./JobListReport";
 export * from "./JobRow";
+export * from "./ModelsPullFileReport";
 export * from "./ModelsPullInput";
 export * from "./ModelsPullReport";
 export * from "./OpenProjectRow";

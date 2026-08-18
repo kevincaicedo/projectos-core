@@ -35,20 +35,22 @@ pub use events::{
     RunValidationRecordedBody, RunValidationRef, RunValidationStatus,
 };
 pub use evidence_state::{
-    ChunkRecord, EVIDENCE_LIST_ROW_COUNT_MAX, EvidenceListFilter, EvidenceReadError,
-    EvidenceRecord, SourceHealthRecord, StageRecord, StageState, TranscriptSegmentRecord,
-    count_chunks_by_content, list_chunks, list_evidence, list_source_health, list_stages,
-    list_transcript_segments, list_transcript_speakers, read_evidence, read_transcript_progress,
+    ChunkEmbeddingRecord, ChunkRecord, EVIDENCE_LIST_ROW_COUNT_MAX, EmbeddingModelRow,
+    EvidenceListFilter, EvidenceReadError, EvidenceRecord, SourceHealthRecord, StageRecord,
+    StageState, TranscriptSegmentRecord, count_chunks_by_content, find_embedding_by_content,
+    list_chunk_embeddings, list_chunks, list_embedding_models, list_evidence, list_source_health,
+    list_stages, list_transcript_segments, list_transcript_speakers, read_evidence,
+    read_transcript_progress,
 };
 pub use ingest::{
-    CHUNK_BATCH_COUNT_MAX, CanaryLevel, ChunkFact, ChunkKind, EvidenceAddedBody,
-    EvidenceChunkedBody, EvidenceReprocessRequestedBody, EvidenceShape, EvidenceStatus,
-    EvidenceTranscribedBody, ExternalRef, IngestStage, IngestStageDisposition,
-    IngestStageFailedBody, IngestStageFinishedBody, IngestStageOutput, IngestStageStartedBody,
-    Locator, MediaKind, TRANSCRIPT_BATCH_COUNT_MAX, TRANSCRIPT_SEGMENT_TEXT_BYTES_MAX,
-    TRANSCRIPT_SPEAKER_COUNT_MAX, TRANSCRIPT_SPEAKER_NAME_CHARS_MAX, TRANSCRIPT_SPEAKER_UNASSIGNED,
-    TranscriptSegmentFact, TranscriptSegmentSpeakerSetBody, TranscriptSpeakerNamedBody,
-    TranscriptTextCorrectedBody,
+    CHUNK_BATCH_COUNT_MAX, CanaryLevel, ChunkEmbeddingFact, ChunkFact, ChunkKind,
+    EMBED_BATCH_COUNT_MAX, EvidenceAddedBody, EvidenceChunkedBody, EvidenceEmbeddedBody,
+    EvidenceReprocessRequestedBody, EvidenceShape, EvidenceStatus, EvidenceTranscribedBody,
+    ExternalRef, IngestStage, IngestStageDisposition, IngestStageFailedBody,
+    IngestStageFinishedBody, IngestStageOutput, IngestStageStartedBody, Locator, MediaKind,
+    TRANSCRIPT_BATCH_COUNT_MAX, TRANSCRIPT_SEGMENT_TEXT_BYTES_MAX, TRANSCRIPT_SPEAKER_COUNT_MAX,
+    TRANSCRIPT_SPEAKER_NAME_CHARS_MAX, TRANSCRIPT_SPEAKER_UNASSIGNED, TranscriptSegmentFact,
+    TranscriptSegmentSpeakerSetBody, TranscriptSpeakerNamedBody, TranscriptTextCorrectedBody,
 };
 pub use job_state::{
     CronRecord, JOB_LIST_ROW_COUNT_MAX, JobDurableState, JobListFilter, JobReadError, JobRecord,

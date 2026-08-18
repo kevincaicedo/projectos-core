@@ -6,21 +6,25 @@
 //! drift on failure semantics.
 
 mod anthropic;
+mod cloud_embed;
 mod cloud_stt;
 mod google;
+mod onnx_embed;
 mod openai_wire;
 mod whisper_local;
 
 pub use anthropic::AnthropicAdapter;
+pub use cloud_embed::CloudEmbedAdapter;
 pub use cloud_stt::CloudSttAdapter;
 pub use google::GoogleAdapter;
+pub use onnx_embed::{OnnxEmbedder, Pooling};
 pub use openai_wire::{
     EndpointProfile, EndpointServer, OpenAiAdapter, OpenAiCompatibleAdapter, OpenRouterAdapter,
     QualificationReport, list_models, qualify_openai_compatible,
 };
 pub use whisper_local::WhisperLocalTranscriber;
 
-use crate::transport::{HttpHead, TransportError};
+use crate::transport::{HttpHead, ResponseHandler, StreamAbort, TransportError};
 use crate::weather::Weather;
 
 /// Provider error bodies are diagnostics, not payloads: 64 KiB is generous
@@ -217,5 +221,55 @@ mod tests {
         assert_eq!(estimate_tokens(0), 0);
         assert_eq!(estimate_tokens(1), 1);
         assert_eq!(estimate_tokens(9), 3);
+    }
+}
+
+/// Response bytes a bounded JSON call may return. A verbose transcript of a
+/// two-minute window and a 64-row embedding batch are both comfortably inside
+/// it; the cap refuses a runaway peer rather than growing a buffer to fit it
+/// (L8).
+pub(crate) const RESPONSE_BYTES_MAX: usize = 4 * 1024 * 1024;
+
+/// Collects a bounded response body. These responses are small and arrive
+/// whole; there is nothing to stream, so the only discipline needed is the
+/// cap. Shared by the transcription and embedding adapters so one budget and
+/// one overflow behaviour cover both (m1-s04 moved it here from `cloud_stt`).
+#[derive(Default)]
+pub(crate) struct BoundedBody {
+    head: Option<HttpHead>,
+    body: Vec<u8>,
+    overflowed: bool,
+}
+
+impl BoundedBody {
+    pub(crate) fn head(&self) -> Option<HttpHead> {
+        self.head.clone()
+    }
+
+    pub(crate) fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// `true` when the peer sent more than [`RESPONSE_BYTES_MAX`]. Checked by
+    /// callers *before* parsing, so a truncated body is never decoded as a
+    /// short one — silent truncation reading as completeness is the L8 lie.
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+}
+
+impl ResponseHandler for BoundedBody {
+    fn on_head(&mut self, head: &HttpHead) -> Result<(), StreamAbort> {
+        self.head = Some(head.clone());
+        Ok(())
+    }
+
+    fn on_chunk(&mut self, chunk: &[u8]) -> Result<(), StreamAbort> {
+        if self.body.len().saturating_add(chunk.len()) > RESPONSE_BYTES_MAX {
+            self.overflowed = true;
+            return Err(StreamAbort);
+        }
+        self.body.extend_from_slice(chunk);
+        Ok(())
     }
 }

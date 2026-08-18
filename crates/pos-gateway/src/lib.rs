@@ -16,6 +16,7 @@
 mod adapter;
 mod credentials;
 mod dispatch;
+mod embed;
 mod eval;
 mod ledger;
 mod models;
@@ -27,16 +28,22 @@ mod tls;
 mod transcribe;
 mod transport;
 mod weather;
+mod wordpiece;
 
 pub use adapter::{
-    AnthropicAdapter, CloudSttAdapter, EndpointProfile, EndpointServer, GoogleAdapter,
-    OpenAiAdapter, OpenAiCompatibleAdapter, OpenRouterAdapter, QualificationReport,
-    WhisperLocalTranscriber, list_models, qualify_openai_compatible,
+    AnthropicAdapter, CloudEmbedAdapter, CloudSttAdapter, EndpointProfile, EndpointServer,
+    GoogleAdapter, OnnxEmbedder, OpenAiAdapter, OpenAiCompatibleAdapter, OpenRouterAdapter,
+    Pooling, QualificationReport, WhisperLocalTranscriber, list_models, qualify_openai_compatible,
 };
 pub use credentials::{
     CallAuth, CredentialClass, MemorySecretStore, SecretError, SecretRef, SecretStore, SecretValue,
 };
 pub use dispatch::{CALL_TIMEOUT_MS_DEFAULT, Gateway, GatewayConfig, PreflightReport};
+pub use embed::{
+    EMBED_ACTIVATION_BYTES_PER_PADDED_TOKEN, EMBED_BATCH_COUNT_MAX, EMBED_BATCH_PADDED_TOKENS_MAX,
+    EMBED_DIM_MAX, EMBED_SEQUENCE_TOKENS_MAX, ENRICHMENT_VERSION_CONTENT_ONLY, EmbedBatch,
+    EmbedBatchPlan, EmbedInput, EmbedRequest, EmbedUsage, Embedder,
+};
 pub use eval::{
     EVAL_CASES_MAX, EvalCase, EvalError, EvalOutcome, EvalReport, load_cases, run_suite,
 };
@@ -53,9 +60,8 @@ pub use policy::{
 };
 pub use prompts::{PROMPT_LOCK_FILE_NAME, PromptError, PromptFile, PromptRegistry};
 pub use provider::{
-    ChatMessage, CompletionEvent, CompletionRequest, CompletionSink, CompletionUsage, EmbedRequest,
-    MessageRole, OUTPUT_TOKENS_REQUEST_MAX, Provider, ProviderFamily, ReasoningEffort, SinkClosed,
-    VecSink,
+    ChatMessage, CompletionEvent, CompletionRequest, CompletionSink, CompletionUsage, MessageRole,
+    OUTPUT_TOKENS_REQUEST_MAX, Provider, ProviderFamily, ReasoningEffort, SinkClosed, VecSink,
 };
 pub use sse::{SseDecoder, SseEvent, SseParseError};
 pub use tls::TlsHttpTransport;
@@ -69,3 +75,6 @@ pub use transport::{
     ResponseHandler, StreamAbort, TransportError, TransportSelection, Transports,
 };
 pub use weather::Weather;
+pub use wordpiece::{
+    Encoding, VocabError, WORDPIECE_VOCAB_COUNT_MAX, WORDPIECE_WORD_CHARS_MAX, WordPiece,
+};

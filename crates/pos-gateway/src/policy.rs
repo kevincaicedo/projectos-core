@@ -242,17 +242,23 @@ pub struct ModelChoice {
 
 /// The per-tier routing table a project configures.
 ///
-/// Transcription is a field rather than a third tier because tiers are about
-/// *how hard the thinking is* and transcription is a different modality: an
-/// interview routes to whisper or to a cloud STT endpoint regardless of what
-/// synthesis costs. It is optional because most gateways never transcribe,
-/// and a `None` that refuses typed beats a placeholder route that dials
-/// something unexpected (m1-s03).
+/// Transcription and embedding are fields rather than extra tiers because
+/// tiers are about *how hard the thinking is* and these are different
+/// modalities: an interview routes to whisper or to a cloud STT endpoint, and
+/// a chunk routes to bge or to an embeddings endpoint, regardless of what
+/// synthesis costs. Both are optional because most gateways do neither, and a
+/// `None` that refuses typed beats a placeholder route that dials something
+/// unexpected (m1-s03, m1-s04).
 #[derive(Clone, Debug)]
 pub struct ModelRouting {
     pub frontier: ModelChoice,
     pub fast: ModelChoice,
     pub transcribe: Option<ModelChoice>,
+    /// Embeddings, for the same reason transcription is a field: it is a
+    /// different modality, not a harder tier. A chunk routes to the local
+    /// ONNX model or to an API endpoint regardless of what synthesis costs
+    /// (m1-s04).
+    pub embed: Option<ModelChoice>,
 }
 
 impl ModelRouting {
@@ -264,12 +270,19 @@ impl ModelRouting {
             frontier,
             fast,
             transcribe: None,
+            embed: None,
         }
     }
 
     #[must_use]
     pub fn with_transcribe(mut self, choice: ModelChoice) -> Self {
         self.transcribe = Some(choice);
+        self
+    }
+
+    #[must_use]
+    pub fn with_embed(mut self, choice: ModelChoice) -> Self {
+        self.embed = Some(choice);
         self
     }
 

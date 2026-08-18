@@ -47,6 +47,7 @@ mod audio;
 mod budget;
 mod captions;
 mod chunk;
+mod embed;
 mod identity;
 mod intake;
 mod normalize;
@@ -62,7 +63,12 @@ pub use budget::{
 };
 pub use captions::{CAPTION_BLOCK_BYTES_MAX, CAPTION_CUE_COUNT_MAX};
 pub use chunk::{
-    BoundaryRule, CHUNK_COUNT_MAX, ChunkParams, ChunkStage, TOKEN_BYTES_ESTIMATE, chunk_params_for,
+    BoundaryRule, CHUNK_COUNT_MAX, CHUNK_TOKENS_MAX_CEILING, ChunkParams, ChunkStage,
+    TOKEN_BYTES_ESTIMATE, chunk_params_for,
+};
+pub use embed::{
+    EMBED_CHUNK_COUNT_MAX, EMBED_DIM_DEFAULT, EMBED_MODEL_DEFAULT, EmbedRoute, EmbedSetup,
+    EmbedStage,
 };
 pub use identity::{ContentHasher, derive_chunk_id, derive_evidence_id, derive_source_id};
 pub use intake::{
@@ -72,9 +78,10 @@ pub use intake::{
 };
 pub use normalize::{NormalizeStage, RECORD_BYTES_MAX, sniff_media_kind};
 pub use pipeline::{
-    EvidenceSubmission, IngestPipeline, PipelineConfig, STAGE_RETRY_COUNT_MAX, StageContext,
-    StageFailure, StageHandler, StageJobHandler, StageOutcome, StageProduct, StageRegistry,
-    SubmitOutcome, stage_idempotency_key, stage_job_handlers, stage_registry_default,
+    CHUNK_TEXT_BYTES_MAX, EvidenceSubmission, IngestPipeline, PipelineConfig,
+    STAGE_RETRY_COUNT_MAX, StageContext, StageFailure, StageHandler, StageJobHandler, StageOutcome,
+    StageProduct, StageRegistry, SubmitOutcome, stage_idempotency_key, stage_job_handlers,
+    stage_registry_default,
 };
 pub use reprocess::{REPROCESS_ITEM_COUNT_MAX, ReprocessPlan, ReprocessRequest};
 pub use segment::{SEGMENT_COUNT_MAX, SEGMENT_RECORD_BYTES, Segment, SegmentReader, SegmentWriter};

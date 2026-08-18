@@ -312,6 +312,225 @@ pub fn list_chunks(
 const CHUNK_COLUMNS: &str = "chunk_id, evidence_id, ordinal, kind, byte_start, byte_end, \
      locator_kind, locator_start, locator_end, content_hash, token_count_estimate, pass";
 
+/// Where one chunk's vector lives, and what produced it (m1-s04).
+///
+/// Deliberately *not* the vector: the floats are a CAS blob, and a read that
+/// returned them would make "is this embedded?" cost a blob open. Retrieval
+/// asks this first and opens the blob once for a whole batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChunkEmbeddingRecord {
+    pub chunk_id: ChunkId,
+    pub evidence_id: EvidenceId,
+    pub model_id: String,
+    pub enrichment_version: u16,
+    pub dim: u16,
+    /// The packed batch this vector is row `row` of.
+    pub vectors_blob: [u8; 32],
+    pub row: u32,
+    pub content_hash: [u8; 32],
+    pub token_count: u32,
+    pub truncated: bool,
+    pub pass: u32,
+}
+
+impl ChunkEmbeddingRecord {
+    /// Byte range of this vector inside its CAS blob.
+    #[must_use]
+    pub const fn byte_range(&self) -> (u64, u64) {
+        let width = (self.dim as u64) * 4;
+        let start = (self.row as u64) * width;
+        (start, start + width)
+    }
+}
+
+/// Vectors an evidence item has under `model_id`, in chunk order.
+///
+/// # Errors
+///
+/// [`EvidenceReadError`] when the store refuses or a row is corrupt.
+pub fn list_chunk_embeddings(
+    log: &ProjectLog,
+    evidence_id: EvidenceId,
+    model_id: &str,
+    enrichment_version: u16,
+    row_count_max: u32,
+) -> Result<Vec<ChunkEmbeddingRecord>, EvidenceReadError> {
+    let limit = i64::from(row_count_max.min(EVIDENCE_LIST_ROW_COUNT_MAX));
+    let sql = format!(
+        "SELECT {EMBEDDING_COLUMNS} FROM proj_chunk_embedding \
+         WHERE evidence_id = ?1 AND model_id = ?2 AND enrichment_version = ?3 \
+         ORDER BY vectors_blob ASC, row ASC LIMIT ?4"
+    );
+    let raws = log
+        .store()
+        .db()
+        .with_reader("list chunk embeddings", |db| {
+            let mut statement = db.prepare_cached(&sql)?;
+            let rows = statement.query_map(
+                pos_store::rusqlite::params![
+                    evidence_id.into_bytes().to_vec(),
+                    model_id,
+                    i64::from(enrichment_version),
+                    limit
+                ],
+                embedding_raw,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?;
+    raws.into_iter().map(EmbeddingRaw::into_record).collect()
+}
+
+/// The vector already computed for this exact content under this exact model,
+/// if any — the F6 duplicate-embedding check, as one index lookup.
+///
+/// Two chunks with the same `content_hash` embed to the same vector by
+/// definition, so the second one costs a row rather than a model call. This
+/// is what makes "duplicate attachment across two sources embeds once (ledger
+/// shows one embed cost)" true rather than aspirational.
+///
+/// # Errors
+///
+/// [`EvidenceReadError`] when the store refuses or the row is corrupt.
+pub fn find_embedding_by_content(
+    log: &ProjectLog,
+    content_hash: [u8; 32],
+    model_id: &str,
+    enrichment_version: u16,
+) -> Result<Option<ChunkEmbeddingRecord>, EvidenceReadError> {
+    let sql = format!(
+        "SELECT {EMBEDDING_COLUMNS} FROM proj_chunk_embedding \
+         WHERE content_hash = ?1 AND model_id = ?2 AND enrichment_version = ?3 \
+         ORDER BY created_seq ASC LIMIT 1"
+    );
+    let raw = log
+        .store()
+        .db()
+        .with_reader("find embedding by content", |db| {
+            let mut statement = db.prepare_cached(&sql)?;
+            let mut rows = statement.query_map(
+                pos_store::rusqlite::params![
+                    content_hash.to_vec(),
+                    model_id,
+                    i64::from(enrichment_version)
+                ],
+                embedding_raw,
+            )?;
+            rows.next().transpose()
+        })?;
+    raw.map(EmbeddingRaw::into_record).transpose()
+}
+
+/// Every `(model_id, enrichment_version)` this project holds vectors under,
+/// with how many rows each has.
+///
+/// The mixed-model guard reads this: a query naming a model with no rows, or
+/// a project holding two models where a caller named none, is a typed error
+/// rather than a silently narrowed result set (the milestone's rule).
+///
+/// # Errors
+///
+/// [`EvidenceReadError`] when the store refuses.
+pub fn list_embedding_models(
+    log: &ProjectLog,
+) -> Result<Vec<EmbeddingModelRow>, EvidenceReadError> {
+    let rows = log
+        .store()
+        .db()
+        .with_reader("list embedding models", |db| {
+            let mut statement = db.prepare_cached(
+                "SELECT model_id, enrichment_version, dim, COUNT(*), MAX(created_seq) \
+             FROM proj_chunk_embedding GROUP BY model_id, enrichment_version, dim \
+             ORDER BY model_id ASC, enrichment_version ASC",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(EmbeddingModelRow {
+                    model_id: row.get(0)?,
+                    enrichment_version: enrichment_value(row.get(1)?),
+                    dim: dim_value(row.get(2)?),
+                    vector_count: non_negative(row.get(3)?),
+                    last_seq: non_negative(row.get(4)?),
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?;
+    Ok(rows)
+}
+
+/// One embedding model a project holds vectors under.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmbeddingModelRow {
+    pub model_id: String,
+    pub enrichment_version: u16,
+    pub dim: u16,
+    pub vector_count: u64,
+    pub last_seq: u64,
+}
+
+const EMBEDDING_COLUMNS: &str = "chunk_id, evidence_id, model_id, enrichment_version, dim, \
+     vectors_blob, row, content_hash, token_count, truncated, pass";
+
+struct EmbeddingRaw {
+    chunk_id: Vec<u8>,
+    evidence_id: Vec<u8>,
+    model_id: String,
+    enrichment_version: i64,
+    dim: i64,
+    vectors_blob: Vec<u8>,
+    row: i64,
+    content_hash: Vec<u8>,
+    token_count: i64,
+    truncated: i64,
+    pass: i64,
+}
+
+fn embedding_raw(row: &Row<'_>) -> Result<EmbeddingRaw, pos_store::rusqlite::Error> {
+    Ok(EmbeddingRaw {
+        chunk_id: row.get(0)?,
+        evidence_id: row.get(1)?,
+        model_id: row.get(2)?,
+        enrichment_version: row.get(3)?,
+        dim: row.get(4)?,
+        vectors_blob: row.get(5)?,
+        row: row.get(6)?,
+        content_hash: row.get(7)?,
+        token_count: row.get(8)?,
+        truncated: row.get(9)?,
+        pass: row.get(10)?,
+    })
+}
+
+impl EmbeddingRaw {
+    fn into_record(self) -> Result<ChunkEmbeddingRecord, EvidenceReadError> {
+        Ok(ChunkEmbeddingRecord {
+            chunk_id: ChunkId::from_bytes(id_bytes("proj_chunk_embedding", &self.chunk_id)?),
+            evidence_id: EvidenceId::from_bytes(id_bytes(
+                "proj_chunk_embedding",
+                &self.evidence_id,
+            )?),
+            model_id: self.model_id,
+            enrichment_version: enrichment_value(self.enrichment_version),
+            dim: dim_value(self.dim),
+            vectors_blob: hash_bytes("proj_chunk_embedding", &self.vectors_blob)?,
+            row: pass_value(self.row),
+            content_hash: hash_bytes("proj_chunk_embedding", &self.content_hash)?,
+            token_count: pass_value(self.token_count),
+            truncated: self.truncated != 0,
+            pass: pass_value(self.pass),
+        })
+    }
+}
+
+/// A dimension outside `u16` could only come from a write outside the apply
+/// path; clamping keeps the read total rather than inventing a panic path,
+/// and `EmbedBatch::new` refuses the value downstream anyway.
+fn dim_value(value: i64) -> u16 {
+    u16::try_from(value).unwrap_or(0)
+}
+
+fn enrichment_value(value: i64) -> u16 {
+    u16::try_from(value).unwrap_or(0)
+}
+
 /// One decoded segment of speech, with any correction over it (m1-s03).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscriptSegmentRecord {

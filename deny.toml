@@ -58,6 +58,13 @@ exceptions = [
     # licenses *data*, not code, and imposes no obligation on the binary that
     # embeds it. Pinned per version so a root-store change is a reviewed event.
     { crate = "webpki-roots@1.0.9", allow = ["CDLA-Permissive-2.0"] },
+    # m1-s04: the sibling crate that distributes the same Mozilla bundle as
+    # certificates rather than trust anchors. It reaches us only as a *build*
+    # dependency — `ort-sys`'s build script uses `ureq` to fetch the ONNX
+    # Runtime binary — so it is not in any shipped artifact at all. Same data,
+    # same license, same reasoning as the row above; pinned per version so a
+    # root-store change stays a reviewed event.
+    { crate = "webpki-root-certs@1.0.9", allow = ["CDLA-Permissive-2.0"] },
 ]
 
 [bans]

@@ -24,6 +24,7 @@ use pos_sched::{ClaimedJob, JobFailure, JobHandler, JobKind, JobQueue, JobSpec, 
 use pos_store::{BlobHash, BlobWriter};
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 /// Retries a stage takes before the DLQ. Deliberately below the scheduler's
@@ -259,6 +260,17 @@ impl StageRegistry {
         self
     }
 
+    /// Removes a stage this build owns but cannot currently run.
+    ///
+    /// Distinct from never registering it: the difference a caller sees is
+    /// `nextStageAvailable: false` with the owning story named, which is how
+    /// the pipeline says "not here, not yet" rather than "this item failed".
+    #[must_use]
+    pub fn without(mut self, stage: IngestStage) -> Self {
+        self.handlers.remove(&stage);
+        self
+    }
+
     #[must_use]
     pub fn get(&self, stage: IngestStage) -> Option<Arc<dyn StageHandler>> {
         self.handlers.get(&stage).cloned()
@@ -277,6 +289,35 @@ impl StageRegistry {
         stages.sort_by_key(|stage| stage.rank());
         stages
     }
+}
+
+/// Bytes one chunk's text may occupy, **derived** from the chunker's own
+/// ceiling rather than chosen.
+///
+/// `chunk_params_for` caps every shape at `tokens_max` tokens and estimates
+/// [`crate::TOKEN_BYTES_ESTIMATE`] bytes per token; the ×4 headroom covers a
+/// corpus whose bytes-per-token runs well above the estimate (CJK, dense
+/// markup). Deriving it means raising the chunker's ceiling without raising
+/// this one fails a test instead of silently truncating a chunk before the
+/// model ever sees it — the same coupling m1-s07 built between the intake cap
+/// and this chunker's own 4M-chunk ceiling.
+pub const CHUNK_TEXT_BYTES_MAX: u64 =
+    (crate::CHUNK_TOKENS_MAX_CEILING as u64) * crate::TOKEN_BYTES_ESTIMATE * 4;
+
+/// Reads until the buffer is full or the blob ends, returning how much landed.
+///
+/// `read_exact` would refuse a short read at the end of a blob, which is a
+/// legitimate outcome when a chunk's range runs to the last byte.
+fn read_fully(file: &mut File, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
+    let mut filled = 0usize;
+    while filled < buffer.len() {
+        let read = file.read(&mut buffer[filled..])?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(filled)
 }
 
 /// Everything a running stage is allowed to touch.
@@ -385,6 +426,60 @@ impl StageContext<'_> {
         Ok(SegmentReader::new(self.open_blob(hash)?))
     }
 
+    /// One chunk's text, by byte range into the normalized blob.
+    ///
+    /// Seeks rather than streaming from the start: EMBED reads chunks whose
+    /// ranges overlap (windowing has overlap by design), so a single forward
+    /// pass would either re-read or need a rewindable buffer of unbounded
+    /// size. The read is bounded by [`CHUNK_TEXT_BYTES_MAX`] — which is
+    /// *derived* from the chunker's own `tokens_max` ceiling, so raising one
+    /// without the other fails the build rather than truncating a chunk.
+    ///
+    /// # Errors
+    ///
+    /// [`IngestError::StageInputMissing`] when the item has no normalized
+    /// text, [`IngestError::LimitExceeded`] when the range is larger than a
+    /// chunk can be, and a store error when the blob cannot be read.
+    pub fn read_text_range(&self, byte_start: u64, byte_end: u64) -> Result<String, IngestError> {
+        let length = byte_end.saturating_sub(byte_start);
+        if length > CHUNK_TEXT_BYTES_MAX {
+            return Err(IngestError::LimitExceeded {
+                limit: "chunk text",
+                value: length,
+                limit_value: CHUNK_TEXT_BYTES_MAX,
+            });
+        }
+        let hash = self
+            .evidence
+            .text_blob
+            .ok_or(IngestError::StageInputMissing {
+                stage: self.stage,
+                missing: "the normalized text blob",
+            })?;
+        let mut file = self
+            .log
+            .store()
+            .blobs()
+            .open_blob(BlobHash::from_bytes(hash))?;
+        file.seek(SeekFrom::Start(byte_start))
+            .map_err(|source| IngestError::Io {
+                operation: "seek to a chunk's text",
+                source,
+            })?;
+        let mut buffer = vec![0_u8; usize::try_from(length).unwrap_or(0)];
+        let read = read_fully(&mut file, &mut buffer).map_err(|source| IngestError::Io {
+            operation: "read a chunk's text",
+            source,
+        })?;
+        buffer.truncate(read);
+        // Chunk boundaries are byte offsets into UTF-8 text the chunker placed
+        // at character boundaries; a lossy decode here would mean the offsets
+        // are wrong, and a replacement character is a better answer than a
+        // dead-lettered item — the m1-s12 locator sweep is what checks the
+        // offsets themselves.
+        Ok(String::from_utf8_lossy(&buffer).into_owned())
+    }
+
     fn open_blob(&self, hash: [u8; 32]) -> Result<BoundedStream<File>, IngestError> {
         let file = self
             .log
@@ -418,6 +513,47 @@ impl StageContext<'_> {
             evidence_id: self.evidence.evidence_id,
             pass: self.pass,
             batch_index,
+            chunks,
+        });
+        let request = event.into_request(self.device, Actor::System(self.job_id))?;
+        self.log.append(request, self.clock)?;
+        Ok(())
+    }
+
+    /// Commits one batch of vectors (m1-s04).
+    ///
+    /// Same shape and same reason as [`Self::emit_chunks`]: durable before
+    /// the next batch runs, which is what makes EMBED resumable. The floats
+    /// are already in the CAS under `vectors_blob` — this appends the fact
+    /// that says which chunks they cover.
+    pub fn emit_embeddings(
+        &self,
+        batch_index: u32,
+        model_id: &str,
+        dim: u16,
+        enrichment_version: u16,
+        vectors_blob: [u8; 32],
+        chunks: Vec<pos_domain::ChunkEmbeddingFact>,
+    ) -> Result<(), IngestError> {
+        if chunks.len() > pos_domain::EMBED_BATCH_COUNT_MAX {
+            return Err(IngestError::LimitExceeded {
+                limit: "embed batch",
+                value: chunks.len() as u64,
+                limit_value: pos_domain::EMBED_BATCH_COUNT_MAX as u64,
+            });
+        }
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let event = DomainEvent::EvidenceEmbedded(pos_domain::EvidenceEmbeddedBody::V1 {
+            evidence_id: self.evidence.evidence_id,
+            source_id: self.evidence.source_id,
+            pass: self.pass,
+            batch_index,
+            model_id: model_id.to_owned(),
+            dim,
+            enrichment_version,
+            vectors_blob,
             chunks,
         });
         let request = event.into_request(self.device, Actor::System(self.job_id))?;
@@ -831,11 +967,15 @@ fn blob_byte_size(log: &ProjectLog, hash: BlobHash) -> Result<u64, IngestError> 
 /// m1-s03/s04/s05/s11 land their stages they are added here, and every item
 /// already in a project resumes with `pos ingest reprocess --from-stage`.
 #[must_use]
-pub fn stage_registry_default(transcribe: &TranscribeSetup) -> StageRegistry {
+pub fn stage_registry_default(
+    transcribe: &TranscribeSetup,
+    embed: &crate::embed::EmbedSetup,
+) -> StageRegistry {
     StageRegistry::new()
         .with(Arc::new(crate::normalize::NormalizeStage))
         .with(Arc::new(TranscribeStage::new(transcribe.clone())))
         .with(Arc::new(crate::chunk::ChunkStage::new()))
+        .with(Arc::new(crate::embed::EmbedStage::new(embed.clone())))
 }
 
 /// Every registered stage as a `pos-sched` handler, ready for a pool's

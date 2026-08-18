@@ -20,21 +20,14 @@
 //! At the seam's stated 120 s cap one upload is ~3.8 MB of WAV, so the request
 //! body is bounded by the same constant that bounds the sample buffer (L8).
 
+use super::{BoundedBody, RESPONSE_BYTES_MAX};
 use crate::credentials::CallAuth;
 use crate::transcribe::{
     AUDIO_SAMPLE_RATE_HZ, SEGMENT_TEXT_BYTES_MAX, TranscribeRequest, TranscribeUsage, Transcriber,
     TranscriptSegment, TranscriptSink, mark_turns,
 };
-use crate::transport::{
-    HttpHead, HttpMethod, HttpRequestPlan, HttpTransport, ResponseHandler, StreamAbort,
-    TransportError,
-};
+use crate::transport::{HttpHead, HttpMethod, HttpRequestPlan, HttpTransport, TransportError};
 use crate::weather::Weather;
-
-/// Response bytes one transcription may return. A verbose transcript of a
-/// two-minute window is kilobytes; the cap refuses a runaway peer rather than
-/// growing a buffer to fit it (L8).
-const RESPONSE_BYTES_MAX: usize = 4 * 1024 * 1024;
 
 /// Fixed multipart boundary. Deterministic on purpose: a recorded-fixture
 /// conformance row must be able to compare request bytes, and the collision
@@ -100,21 +93,23 @@ impl Transcriber for CloudSttAdapter {
             headers,
             body: multipart_body(request, self.supports_segments),
             timeout_ms: request_timeout_ms(request),
+            // A provider answer is text; the transport default applies.
+            response_bytes_max: None,
         };
         let mut collector = BoundedBody::default();
         transport
             .execute(&plan, &mut collector)
             .map_err(map_transport_error)?;
-        let head = collector.head.ok_or_else(|| Weather::MalformedOutput {
+        let head = collector.head().ok_or_else(|| Weather::MalformedOutput {
             reason: "the endpoint returned no response head".to_owned(),
         })?;
-        if collector.overflowed {
+        if collector.overflowed() {
             return Err(Weather::MalformedOutput {
                 reason: format!("the transcript response exceeded {RESPONSE_BYTES_MAX} bytes"),
             });
         }
-        status_weather(&head, &collector.body)?;
-        let mut segments = parse_segments(&collector.body, request)?;
+        status_weather(&head, collector.body())?;
+        let mut segments = parse_segments(collector.body(), request)?;
         mark_turns(&mut segments);
         let mut emitted = 0_u64;
         for segment in &segments {
@@ -320,32 +315,6 @@ fn map_transport_error(error: TransportError) -> Weather {
         other => Weather::Transport {
             reason: other.to_string(),
         },
-    }
-}
-
-/// Collects a bounded response body. Transcription responses are small and
-/// arrive whole; there is nothing to stream, so the only discipline needed is
-/// the cap.
-#[derive(Default)]
-struct BoundedBody {
-    head: Option<HttpHead>,
-    body: Vec<u8>,
-    overflowed: bool,
-}
-
-impl ResponseHandler for BoundedBody {
-    fn on_head(&mut self, head: &HttpHead) -> Result<(), StreamAbort> {
-        self.head = Some(head.clone());
-        Ok(())
-    }
-
-    fn on_chunk(&mut self, chunk: &[u8]) -> Result<(), StreamAbort> {
-        if self.body.len().saturating_add(chunk.len()) > RESPONSE_BYTES_MAX {
-            self.overflowed = true;
-            return Err(StreamAbort);
-        }
-        self.body.extend_from_slice(chunk);
-        Ok(())
     }
 }
 

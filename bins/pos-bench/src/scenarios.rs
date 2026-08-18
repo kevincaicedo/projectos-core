@@ -6,8 +6,8 @@
 //! (master plan §24) exists to prevent.
 
 use pos_api::{
-    CommandName, LocalBootstrapConfig, ProjectCreateInput, ProjectPathInput, ProjectSeedInput,
-    bootstrap_local_runtime, input_json,
+    CommandName, IngestStage, LocalBootstrapConfig, ProjectCreateInput, ProjectPathInput,
+    ProjectSeedInput, StageState, bootstrap_local_runtime, input_json,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -295,6 +295,13 @@ const DATASET_SECTION_BYTES: usize = 4 * 1024;
 /// with a report rather than hanging (L8).
 const INGEST_DRAIN_MS_MAX: u64 = 60 * 60 * 1000;
 
+/// Drain budget for the embedding row. Longer than the ingest one because a
+/// million chunks is a million forward passes: at the ~17k tokens/s the model
+/// sustains on the reference laptop, ~1.2 KB per chunk is roughly four hours.
+/// A budget, not a promise — the harness reports what is left rather than
+/// waiting forever (L8).
+const EMBED_DRAIN_MS_MAX: u64 = 8 * 60 * 60 * 1000;
+
 /// How often the RSS sampler looks. One hertz is the §18 sampling rate and
 /// costs one `ps` call per second against a run measured in minutes.
 const RSS_SAMPLE_INTERVAL_MS: u64 = 1_000;
@@ -467,6 +474,210 @@ pub fn measure_ingest_buffers(
     })
 }
 
+/// Chunks the §18 embedding row states. One million is the milestone's own
+/// number, and it is a *corpus* size rather than a per-item one: the property
+/// is that memory does not grow with the corpus.
+pub const EMBED_CHUNK_COUNT: u64 = 1_000_000;
+
+/// Bytes of text that produce [`EMBED_CHUNK_COUNT`] chunks.
+///
+/// The chunker targets 300 tokens at ~4 bytes each, so ~1.2 KB per chunk. The
+/// dataset is written as one document per 4096 chunks rather than one giant
+/// file, because m1-s07's intake cap refuses a text item past 1 GiB — a limit
+/// *derived* from the chunker's own 4M-chunk ceiling, and one this gate must
+/// respect rather than route around.
+pub const EMBED_CHUNK_BYTES_ESTIMATE: u64 = 1_200;
+
+/// Chunks per document in the embedding corpus.
+const EMBED_CHUNKS_PER_DOCUMENT: u64 = 4_096;
+
+/// What one embedding replicate measured.
+pub struct EmbedMeasurement {
+    pub buffer_peak_bytes: u64,
+    pub rss_peak_bytes: u64,
+    pub wall_ms: u64,
+    pub chunk_count: u64,
+    pub vector_count: u64,
+}
+
+/// Builds (or reuses) the 1M-chunk corpus as a folder of documents.
+///
+/// # Errors
+///
+/// [`ScenarioError`] when the dataset cannot be written.
+pub fn ensure_embed_dataset(dataset: &Path, chunk_count: u64) -> Result<PathBuf, ScenarioError> {
+    let root = dataset.join("embed-corpus");
+    let marker = root.join(format!(".complete-{chunk_count}"));
+    if marker.is_file() {
+        return Ok(root);
+    }
+    std::fs::create_dir_all(&root)
+        .map_err(|error| fail(format!("create dataset directory: {error}")))?;
+    let document_count = chunk_count.div_ceil(EMBED_CHUNKS_PER_DOCUMENT);
+    let document_bytes = EMBED_CHUNKS_PER_DOCUMENT * EMBED_CHUNK_BYTES_ESTIMATE;
+    for index in 0..document_count {
+        write_document_file(&root.join(format!("corpus-{index:04}.md")), document_bytes)?;
+    }
+    std::fs::write(&marker, b"pos-bench embed dataset\n")
+        .map_err(|error| fail(format!("write dataset marker: {error}")))?;
+    Ok(root)
+}
+
+/// One replicate of the embedding memory gate: a fresh project, the corpus
+/// through the front door, and the meters read back afterwards.
+///
+/// The measurement that matters is **buffer residency**, and it is stated in
+/// [ADR-0008]'s terms: bound 1 is what fails a pull request, because a peak
+/// here means a stage stopped streaming. Bound 3 is the ceiling a user feels,
+/// and unlike the 8 GiB row this one *does* load model weights — 226 MiB of
+/// them — which is exactly why the two rows are separate.
+///
+/// # Errors
+///
+/// [`ScenarioError`] when the corpus is refused, the drain budget expires, or
+/// the health meter is absent — each of which would make the number a lie
+/// rather than a measurement.
+///
+/// [ADR-0008]: ../../../../docs/adr/0008-ingest-memory-budget-splits-buffers-from-model-weights.md
+pub fn measure_embed_memory(
+    dataset: &Path,
+    corpus: &Path,
+    replicate: u32,
+) -> Result<EmbedMeasurement, ScenarioError> {
+    let project = dataset
+        .join(format!("embed-run-{replicate:02}.pos"))
+        .display()
+        .to_string();
+    let _ = std::fs::remove_dir_all(&project);
+    let mut runtime = bootstrap_local_runtime(LocalBootstrapConfig::isolated(
+        dataset.join("packs").join(format!("embed-{replicate:02}")),
+    ));
+    command(
+        &runtime,
+        CommandName::ProjectCreate,
+        &input_json(&ProjectCreateInput {
+            path: project.clone(),
+            name: Some("pos-bench embed memory".to_owned()),
+            template: "generic".to_owned(),
+        })
+        .map_err(|error| fail(error.to_json()))?,
+    )?;
+    runtime
+        .start_background_workers(pos_api::WorkerConfig::default())
+        .map_err(|error| fail(error.to_json()))?;
+    command(
+        &runtime,
+        CommandName::ProjectOpen,
+        &input_json(&ProjectPathInput {
+            path: project.clone(),
+        })
+        .map_err(|error| fail(error.to_json()))?,
+    )?;
+
+    let sampler = RssSampler::start();
+    let started = Instant::now();
+    let report = command(
+        &runtime,
+        CommandName::IngestSubmit,
+        &input_json(&pos_api::IngestSubmitInput {
+            path: project.clone(),
+            file_path: Some(corpus.display().to_string()),
+            file_name: None,
+            source_scope: None,
+        })
+        .map_err(|error| fail(error.to_json()))?,
+    )?;
+    let drain = runtime.drain_background_workers(EMBED_DRAIN_MS_MAX);
+    let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let rss_peak_bytes = sampler.finish();
+    if !drain.quiescent {
+        return Err(fail(format!(
+            "the {EMBED_DRAIN_MS_MAX} ms drain budget expired with work still queued; \
+             the measurement would understate the corpus"
+        )));
+    }
+    let refused = number_field(&report, "refusedCount").unwrap_or(0);
+    if refused > 0 {
+        return Err(fail(format!("the corpus was not fully ingested: {report}")));
+    }
+    let health = runtime
+        .query(pos_api::QueryName::Health.as_str())
+        .map_err(|error| fail(error.to_json()))?;
+    let buffer_peak_bytes = number_field(&health, "peakBytes")
+        .ok_or_else(|| fail(format!("health carried no ingest buffer meter: {health}")))?;
+    let (chunk_count, vector_count) = embed_counts(&runtime, &project)?;
+    runtime.shutdown_background_workers();
+    if vector_count == 0 {
+        return Err(fail(
+            "no chunk was embedded — is bge-small-en-v1.5 pulled? \
+             (`pos models pull bge-small-en-v1.5`)"
+                .to_owned(),
+        ));
+    }
+    Ok(EmbedMeasurement {
+        buffer_peak_bytes,
+        rss_peak_bytes,
+        wall_ms,
+        chunk_count,
+        vector_count,
+    })
+}
+
+/// Chunks produced and vectors committed, read back through the same
+/// `evidence.list` a shell reads.
+///
+/// Both, rather than just the vector count: a run that embedded every chunk
+/// it produced and a run that produced no chunks at all would report the same
+/// zero, and the gate must be able to tell those apart.
+fn embed_counts(
+    runtime: &pos_api::LocalRuntime,
+    project: &str,
+) -> Result<(u64, u64), ScenarioError> {
+    let listing = runtime
+        .query_with_input(
+            pos_api::QueryName::EvidenceList.as_str(),
+            &input_json(&pos_api::EvidenceListInput {
+                path: project.to_owned(),
+                source_id: None,
+                status: None,
+                row_count_max: Some(pos_api::EVIDENCE_LIST_ROW_COUNT_MAX),
+                with_stages: true,
+            })
+            .map_err(|error| fail(error.to_json()))?,
+        )
+        .map_err(|error| fail(error.to_json()))?;
+    let parsed: serde_json::Value = serde_json::from_str(&listing)
+        .map_err(|error| fail(format!("evidence.list was not JSON: {error}")))?;
+    let rows = parsed
+        .get("evidence")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| fail(format!("evidence.list carried no rows: {listing}")))?;
+    let mut chunks = 0_u64;
+    let mut vectors = 0_u64;
+    for row in rows {
+        chunks += row
+            .get("chunkCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let Some(stages) = row.get("stages").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for stage in stages {
+            let embedded = stage.get("stage").and_then(serde_json::Value::as_str)
+                == Some(IngestStage::Embed.as_str())
+                && stage.get("state").and_then(serde_json::Value::as_str)
+                    == Some(StageState::Done.as_str());
+            if embedded {
+                vectors += stage
+                    .get("itemCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+            }
+        }
+    }
+    Ok((chunks, vectors))
+}
+
 /// What one transcription replicate measured, read back from the stage row
 /// the pipeline itself wrote.
 pub struct TranscribeMeasurement {
@@ -588,9 +799,13 @@ fn transcribe_stage(listing: &str) -> Result<serde_json::Value, ScenarioError> {
             continue;
         };
         for stage in stages {
+            // Compared against the domain vocabulary, never a literal: the
+            // first cut of this scenario looked for state `"ok"` and reported
+            // an 18.8x transcription as a missing model.
             let is_transcribe = stage.get("stage").and_then(serde_json::Value::as_str)
-                == Some("transcribe")
-                && stage.get("state").and_then(serde_json::Value::as_str) == Some("ok");
+                == Some(IngestStage::Transcribe.as_str())
+                && stage.get("state").and_then(serde_json::Value::as_str)
+                    == Some(StageState::Done.as_str());
             if is_transcribe {
                 return Ok(stage.clone());
             }
@@ -714,4 +929,53 @@ fn sum_u64_field(report: &str, field: &str) -> u64 {
                 .sum()
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IngestStage, StageState, transcribe_stage};
+
+    /// The listing the scenario actually reads, rendered by `pos-api` from a
+    /// `StageRecord`. Written through the same vocabulary the projection
+    /// writes, so a rename of either spelling fails here rather than on a
+    /// laptop three hours into a campaign.
+    fn listing(state: StageState) -> String {
+        let stage_row = pos_api::EvidenceStageRow {
+            stage: IngestStage::Transcribe.as_str().to_owned(),
+            state: state.as_str().to_owned(),
+            pass: 0,
+            attempt_index: 1,
+            wall_ms: Some(184_683),
+            bytes_read: Some(3_475_644),
+            item_count: Some(656),
+            last_error_code: None,
+            last_error_detail: None,
+        };
+        serde_json::json!({ "evidence": [{ "stages": [stage_row] }] }).to_string()
+    }
+
+    #[test]
+    fn a_finished_transcribe_row_is_the_row_the_gate_reads() {
+        let found = transcribe_stage(&listing(StageState::Done))
+            .expect("a done transcribe row is the measurement");
+        assert_eq!(
+            found.get("wallMs").and_then(serde_json::Value::as_u64),
+            Some(184_683)
+        );
+        assert_eq!(
+            found.get("bytesRead").and_then(serde_json::Value::as_u64),
+            Some(3_475_644)
+        );
+    }
+
+    #[test]
+    fn an_unfinished_transcribe_row_is_not_a_measurement() {
+        for state in [StageState::Running, StageState::Retrying, StageState::Dead] {
+            assert!(
+                transcribe_stage(&listing(state)).is_err(),
+                "{} is not a completed transcription",
+                state.as_str()
+            );
+        }
+    }
 }

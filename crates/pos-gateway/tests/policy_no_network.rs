@@ -232,6 +232,7 @@ fn the_selected_local_transport_refuses_cloud_hosts_and_the_tls_one_refuses_clea
         headers: vec![("authorization", "Bearer sk-never-leaves".to_owned())],
         body: b"{}".to_vec(),
         timeout_ms: 1_000,
+        response_bytes_max: None,
     };
     let mut buffered = BufferedResponse::default();
     let refused = LoopbackHttpTransport

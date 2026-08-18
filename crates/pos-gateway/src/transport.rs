@@ -69,6 +69,19 @@ pub struct HttpRequestPlan {
     pub headers: Vec<(&'static str, String)>,
     pub body: Vec<u8>,
     pub timeout_ms: u32,
+    /// Response bytes this call may stream before the transport refuses.
+    ///
+    /// Per-call rather than a transport constant, because the two things that
+    /// use this seam have budgets three orders of magnitude apart: a cloud
+    /// completion is text, and a model artifact is hundreds of megabytes.
+    /// A single constant sized for one silently breaks the other — which it
+    /// did, until m1-s04: every artifact in `models/manifest.json` is larger
+    /// than the 64 MiB completion cap, so no HTTPS pull could ever finish.
+    ///
+    /// `None` takes [`RESPONSE_BODY_BYTES_DEFAULT`]. A caller with a *declared*
+    /// size (the model manifest states exact byte counts) sets it from that,
+    /// so the cap is a reviewed number rather than a global guess (L8).
+    pub response_bytes_max: Option<u64>,
 }
 
 impl fmt::Debug for HttpRequestPlan {
@@ -89,6 +102,7 @@ impl fmt::Debug for HttpRequestPlan {
             )
             .field("body_len", &self.body.len())
             .field("timeout_ms", &self.timeout_ms)
+            .field("response_bytes_max", &self.response_bytes_max)
             .finish()
     }
 }
@@ -646,6 +660,7 @@ mod tests {
             headers: vec![("authorization", "Bearer sk-super-secret".to_owned())],
             body: b"{}".to_vec(),
             timeout_ms: 2_000,
+            response_bytes_max: None,
         }
     }
 

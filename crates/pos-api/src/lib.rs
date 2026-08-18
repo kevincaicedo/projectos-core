@@ -26,7 +26,7 @@ mod workers;
 
 pub use gateway_ops::{
     CostGroupRow, CostRollupInput, CostRollupReport, CostRollupRow, CostRollupTotals,
-    EventCostLedger, ModelsPullInput, ModelsPullReport,
+    EventCostLedger, ModelsPullFileReport, ModelsPullInput, ModelsPullReport,
 };
 pub use ingest_ops::{
     EvidenceListInput, EvidenceListReport, EvidenceRow, EvidenceStageRow, IngestReprocessInput,
@@ -45,6 +45,17 @@ pub use run_ops::{
 pub use sched_ops::{
     CronPreviewInput, CronPreviewReport, JobListInput, JobListReport, JobRow, job_live_state,
 };
+// The pipeline-stage vocabulary that `EvidenceStageRow` serializes as strings.
+// Re-exported so an api-only consumer (a shell, `pos-bench`) compares against
+// the canonical spelling instead of a literal — m1-s07 shipped a bench that
+// looked for state `"ok"` against a projection that writes `"done"`, which
+// reported a passing gate as a missing model.
+pub use ingest_runtime::{
+    EMBED_MODEL_ENV, MODELS_DIR_DEFAULT, MODELS_DIR_ENV, TRANSCRIBE_LANGUAGE_ENV,
+    WHISPER_MODEL_DEFAULT, WHISPER_MODEL_ENV, embed_setup, models_dir, set_embed_model,
+    stage_registry, transcribe_setup,
+};
+pub use pos_domain::{EVIDENCE_LIST_ROW_COUNT_MAX, IngestStage, StageState};
 // Shells construct runtimes and attribute actors through these foundation
 // types; re-exported so a shell needs no direct pos-foundation edge (L12).
 pub use pos_foundation::{ProjectId, RunId, SystemWallClock as FoundationClock, UserId, WallClock};
@@ -107,8 +118,15 @@ use std::task::{Context, Poll, Waker};
 /// browser's upload route), and `health` reports what the ingest buffers
 /// actually cost so [ADR-0008]'s bound 1 is readable rather than inferred.
 ///
+/// v13: m1-s04 makes a model artifact a *set* of files — an ONNX encoder is a
+/// graph and a vocabulary, and both must be present or neither is usable — so
+/// `models.pull` answers one row per file, each with its own verified hash and
+/// whether it was already on disk. "The pull succeeded" now means every file
+/// was verified rather than the last one. See [ADR-0009].
+///
 /// [ADR-0008]: ../../../docs/adr/0008-ingest-memory-budget-splits-buffers-from-model-weights.md
-pub const API_SURFACE_VERSION: u16 = 12;
+/// [ADR-0009]: ../../../docs/adr/0009-vectors-are-a-cas-backed-derived-index.md
+pub const API_SURFACE_VERSION: u16 = 13;
 
 /// Bounded item budget for the M0 connector-host liveness tick (L8). The socket
 /// itself caps this at 32; the runtime asks for less than it is allowed.

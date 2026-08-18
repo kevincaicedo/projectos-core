@@ -42,11 +42,14 @@ use std::time::Duration;
 /// buffers a whole response (L8).
 const STREAM_CHUNK_BYTES: usize = 16 * 1024;
 
-/// Response bytes one call may stream before the transport refuses. Cloud
-/// completions are text; 64 MiB is far past any legitimate answer and far
-/// below anything that could exhaust a laptop. A stated cap beats discovering
-/// the real one under memory pressure (L8).
-const RESPONSE_BODY_BYTES_MAX: u64 = 64 * 1024 * 1024;
+/// Response bytes a call may stream when its plan states no budget of its
+/// own. Cloud completions are text; 64 MiB is far past any legitimate answer
+/// and far below anything that could exhaust a laptop. A stated cap beats
+/// discovering the real one under memory pressure (L8).
+///
+/// A model pull overrides it from the manifest's declared size — see
+/// [`HttpRequestPlan::response_bytes_max`].
+pub const RESPONSE_BODY_BYTES_DEFAULT: u64 = 64 * 1024 * 1024;
 
 /// The cloud-capable transport. Construct one per runtime and share it: the
 /// agent owns a connection pool, and building one per call would pay a TLS
@@ -135,7 +138,13 @@ impl HttpTransport for TlsHttpTransport {
         if handler.on_head(&head).is_err() {
             return Err(TransportError::Aborted);
         }
-        stream_body(response, plan.timeout_ms, handler)
+        stream_body(
+            response,
+            plan.timeout_ms,
+            plan.response_bytes_max
+                .unwrap_or(RESPONSE_BODY_BYTES_DEFAULT),
+            handler,
+        )
     }
 }
 
@@ -181,6 +190,7 @@ fn require_https(url: &str) -> Result<String, TransportError> {
 fn stream_body(
     mut response: ureq::http::Response<ureq::Body>,
     timeout_ms: u32,
+    bytes_max: u64,
     handler: &mut dyn ResponseHandler,
 ) -> Result<(), TransportError> {
     use std::io::Read;
@@ -195,9 +205,9 @@ fn stream_body(
             return Ok(());
         }
         streamed = streamed.saturating_add(read as u64);
-        if streamed > RESPONSE_BODY_BYTES_MAX {
+        if streamed > bytes_max {
             return Err(TransportError::Protocol {
-                reason: format!("response body exceeds {RESPONSE_BODY_BYTES_MAX} bytes"),
+                reason: format!("response body exceeds {bytes_max} bytes"),
             });
         }
         if handler.on_chunk(&buffer[..read]).is_err() {
@@ -243,7 +253,7 @@ fn map_io(error: &std::io::Error, timeout_ms: u32) -> TransportError {
 
 #[cfg(test)]
 mod tests {
-    use super::{RESPONSE_BODY_BYTES_MAX, TlsHttpTransport, require_https};
+    use super::{RESPONSE_BODY_BYTES_DEFAULT, TlsHttpTransport, require_https};
     use crate::transport::{
         BufferedResponse, HttpMethod, HttpRequestPlan, HttpTransport, TransportError,
     };
@@ -258,6 +268,7 @@ mod tests {
             )],
             body: b"{}".to_vec(),
             timeout_ms: 2_000,
+            response_bytes_max: None,
         }
     }
 
@@ -297,6 +308,6 @@ mod tests {
         // The bound exists so an oversized response is a typed refusal, not a
         // memory event. Asserting it here keeps a future edit from quietly
         // removing the only limit on peer-controlled bytes (L8).
-        assert_eq!(RESPONSE_BODY_BYTES_MAX, 64 * 1024 * 1024);
+        assert_eq!(RESPONSE_BODY_BYTES_DEFAULT, 64 * 1024 * 1024);
     }
 }

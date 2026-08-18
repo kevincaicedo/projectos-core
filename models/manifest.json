@@ -11,6 +11,18 @@
       "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
       "blake3": "be283aece4a0efa1e4f2a74b0db6b9f7ca97d40ed71e6e3810293b0d11dd0955",
       "bytes": 147964211
+    },
+    {
+      "name": "bge-small-en-v1.5/model.onnx",
+      "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx",
+      "blake3": "a85e4bee6a35baf214890310353795aa2bd220484d6237db953e841d7b10cb20",
+      "bytes": 133093490
+    },
+    {
+      "name": "bge-small-en-v1.5/vocab.txt",
+      "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/vocab.txt",
+      "blake3": "29a772c92cf4b7bc8f4c52d801f03d36ad8528ef964f856dadc4c4e7cb14e451",
+      "bytes": 231508
     }
   ]
 }

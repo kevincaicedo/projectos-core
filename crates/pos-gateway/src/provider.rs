@@ -156,13 +156,6 @@ pub struct CompletionUsage {
     pub measured: bool,
 }
 
-/// Embedding request shape, reserved: the engine lands with m1-s04.
-#[derive(Clone, Debug)]
-pub struct EmbedRequest {
-    pub model: String,
-    pub inputs: Vec<String>,
-}
-
 /// The provider contract. `complete` is the only slot with an M0 engine;
 /// the reserved slots return typed weather naming their owning story, so a
 /// caller wired today keeps compiling when the engines land.
@@ -186,33 +179,12 @@ pub trait Provider {
         sink: &mut dyn CompletionSink,
     ) -> Result<CompletionUsage, Weather>;
 
-    /// Reserved: batched embeddings (local ONNX or API) land with m1-s04.
-    ///
-    /// # Errors
-    ///
-    /// Always [`Weather::NotYetSupported`] until the owning story lands.
-    fn embed(
-        &self,
-        _request: &EmbedRequest,
-        _transport: &dyn HttpTransport,
-    ) -> Result<(), Weather> {
-        Err(Weather::NotYetSupported {
-            capability: "embed",
-            arrives_with: "the m1-s04 embedding engine",
-        })
-    }
-
-    /// Reserved: local whisper.cpp + cloud STT land with m1-s03.
-    ///
-    /// # Errors
-    ///
-    /// Always [`Weather::NotYetSupported`] until the owning story lands.
-    fn transcribe(&self, _transport: &dyn HttpTransport) -> Result<(), Weather> {
-        Err(Weather::NotYetSupported {
-            capability: "transcribe",
-            arrives_with: "the m1-s03 transcription engine",
-        })
-    }
+    // The `embed` and `transcribe` slots were reserved here in M0 and are
+    // deliberately gone: both engines landed (m1-s03, m1-s04) as their own
+    // seams — `Transcriber` and `Embedder` — because neither is a *provider
+    // family*. An in-process ONNX model has no wire protocol for an adapter
+    // to be a codec over, and leaving a stub that answers "arrives with
+    // m1-s03" after m1-s03 shipped would be a lie the compiler cannot catch.
 
     /// Reserved: realtime voice sessions land with the M2 voice plane (§13).
     ///

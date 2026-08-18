@@ -24,6 +24,7 @@
 //!    hole (module doc in `ledger.rs`).
 
 use crate::credentials::{CallAuth, CredentialClass, SecretError, SecretStore};
+use crate::embed::{EmbedBatch, EmbedRequest, EmbedUsage, Embedder};
 use crate::ledger::{CallAttribution, CostLedger, ModelCallRecord, ProviderCostKind};
 use crate::policy::{ModelChoice, ModelPolicy, ModelRouting, RoutingTier};
 use crate::provider::{
@@ -55,6 +56,7 @@ pub struct Gateway<'runtime> {
     ledger: &'runtime dyn CostLedger,
     transports: Transports<'runtime>,
     transcriber: Option<&'runtime dyn Transcriber>,
+    embedder: Option<&'runtime dyn Embedder>,
     clock: &'runtime dyn WallClock,
 }
 
@@ -91,6 +93,7 @@ impl<'runtime> Gateway<'runtime> {
             ledger,
             transports,
             transcriber: None,
+            embedder: None,
             clock,
         }
     }
@@ -101,6 +104,16 @@ impl<'runtime> Gateway<'runtime> {
     #[must_use]
     pub const fn with_transcriber(mut self, transcriber: &'runtime dyn Transcriber) -> Self {
         self.transcriber = Some(transcriber);
+        self
+    }
+
+    /// Composes the embedding engine this gateway routes to (m1-s04). Same
+    /// shape and same reason as [`Self::with_transcriber`]: most gateways
+    /// never embed, and a `None` that refuses typed beats a stub that
+    /// silently answers nothing.
+    #[must_use]
+    pub const fn with_embedder(mut self, embedder: &'runtime dyn Embedder) -> Self {
+        self.embedder = Some(embedder);
         self
     }
 
@@ -282,6 +295,132 @@ impl<'runtime> Gateway<'runtime> {
         let selection = Self::transport_selection(choice);
         let transport = self.transports.resolve(selection)?;
         transcriber.transcribe(&auth, request, transport, sink)
+    }
+
+    /// Embeds one bounded batch through the frozen dispatch order (m1-s04).
+    ///
+    /// The same five steps as [`Self::complete`] and [`Self::transcribe`]:
+    /// policy, credential, transport selection, engine, exactly one ledger
+    /// record. Batching is the caller's — `EmbedBatchPlan` decides what one
+    /// call carries — because the memory budget is stated in padded tokens
+    /// and only the caller knows the token counts.
+    ///
+    /// # Errors
+    ///
+    /// Typed [`Weather`] for every failure class, and
+    /// [`Weather::LedgerFailure`] outranks a model success, because an
+    /// unmetered call is an accounting hole (invariant 4).
+    pub fn embed(
+        &self,
+        attribution: &CallAttribution,
+        request: &EmbedRequest<'_>,
+    ) -> Result<(EmbedBatch, EmbedUsage), Weather> {
+        let Some(choice) = self.config.routing.embed.as_ref() else {
+            return Err(Weather::InvalidRequest {
+                reason: "this project has no embedding route configured".to_owned(),
+            });
+        };
+        let engine = self
+            .embedder
+            .map_or_else(|| choice.family.as_str(), Embedder::label);
+        let span = Span::open(
+            SpanName::GatewayCall,
+            SpanDetail::from_static(engine),
+            Parent::Current,
+        );
+        span.set(
+            SpanField::Project,
+            SpanValue::Id(attribution.project.into_bytes()),
+        );
+        span.set(
+            SpanField::CredentialClass,
+            SpanValue::Label(choice.credential.label()),
+        );
+        let started_ts_ms = self.clock.now_ms();
+        let outcome = self.run_embed(choice, request);
+        let wall_ms = self.clock.now_ms().saturating_sub(started_ts_ms);
+        span.set(SpanField::DurationMs, SpanValue::Millis(wall_ms));
+        if let Err(weather) = &outcome {
+            span.set(SpanField::Outcome, SpanValue::Label(weather.code()));
+        }
+        let ledgered = self.record_embed(
+            attribution,
+            choice,
+            engine,
+            &outcome,
+            wall_ms,
+            started_ts_ms,
+        );
+        match &ledgered {
+            Ok(()) if outcome.is_ok() => span.finish("ok"),
+            Err(weather) => span.finish(weather.code()),
+            Ok(()) => drop(span),
+        }
+        ledgered?;
+        outcome
+    }
+
+    fn run_embed(
+        &self,
+        choice: &ModelChoice,
+        request: &EmbedRequest<'_>,
+    ) -> Result<(EmbedBatch, EmbedUsage), Weather> {
+        // Invariant 1: policy first — ahead of the engine check too, so a
+        // `local_only` project routed at an embeddings API is refused for the
+        // reason that matters rather than for whatever wiring is missing.
+        self.config.policy.authorize(choice)?;
+        let Some(embedder) = self.embedder else {
+            return Err(Weather::NotYetSupported {
+                capability: "embed",
+                arrives_with: "an embedding engine composed into this gateway",
+            });
+        };
+        let auth = self.resolve_auth(&choice.credential)?;
+        let selection = Self::transport_selection(choice);
+        let transport = self.transports.resolve(selection)?;
+        embedder.embed(&auth, request, transport)
+    }
+
+    /// Invariant 2, for the embedding path.
+    ///
+    /// Unlike transcription, embedding *does* have an honest token count on
+    /// both routes — a local forward pass and API pricing are both measured
+    /// in tokens — so `tokens_in` is real here rather than zero. `tokens_out`
+    /// is zero because an embedding produces no tokens; the vectors it does
+    /// produce are counted by the pipeline's own `IngestStageFinished`.
+    fn record_embed(
+        &self,
+        attribution: &CallAttribution,
+        choice: &ModelChoice,
+        engine: &'static str,
+        outcome: &Result<(EmbedBatch, EmbedUsage), Weather>,
+        wall_ms: u64,
+        ts_ms: u64,
+    ) -> Result<(), Weather> {
+        let (outcome_code, tokens_in) = match outcome {
+            Ok((_batch, usage)) => ("ok".to_owned(), usage.tokens_in),
+            Err(weather) => (weather.code().to_owned(), 0),
+        };
+        let record = ModelCallRecord {
+            project: attribution.project,
+            feature: attribution.feature.clone(),
+            agent: attribution.agent.clone(),
+            provider: engine,
+            credential_class: choice.credential.label(),
+            model: choice.model.clone(),
+            tokens_in,
+            tokens_out: 0,
+            wall_ms,
+            provider_cost_kind: ModelCallRecord::cost_kind_for(&choice.credential, false),
+            usd_micros: 0,
+            outcome: outcome_code,
+            ts_ms,
+        };
+        self.ledger
+            .record(&record)
+            .map_err(|error| Weather::LedgerFailure {
+                reason: error.reason,
+            })
     }
 
     /// Invariant 2, for the transcription path.

@@ -5,7 +5,7 @@
 //! newer project opens under an older build instead of failing closed.
 
 use crate::ingest::{
-    EvidenceAddedBody, EvidenceChunkedBody, EvidenceReprocessRequestedBody,
+    EvidenceAddedBody, EvidenceChunkedBody, EvidenceEmbeddedBody, EvidenceReprocessRequestedBody,
     EvidenceTranscribedBody, IngestStageFailedBody, IngestStageFinishedBody,
     IngestStageStartedBody, TranscriptSegmentSpeakerSetBody, TranscriptSpeakerNamedBody,
     TranscriptTextCorrectedBody,
@@ -782,6 +782,7 @@ pub enum DomainEvent {
     IngestStageFinished(IngestStageFinishedBody),
     IngestStageFailed(IngestStageFailedBody),
     EvidenceChunked(EvidenceChunkedBody),
+    EvidenceEmbedded(EvidenceEmbeddedBody),
     EvidenceReprocessRequested(EvidenceReprocessRequestedBody),
     EvidenceTranscribed(EvidenceTranscribedBody),
     TranscriptSpeakerNamed(TranscriptSpeakerNamedBody),
@@ -824,6 +825,7 @@ impl DomainEvent {
             Self::IngestStageFinished(_) => "IngestStageFinished",
             Self::IngestStageFailed(_) => "IngestStageFailed",
             Self::EvidenceChunked(_) => "EvidenceChunked",
+            Self::EvidenceEmbedded(_) => "EvidenceEmbedded",
             Self::EvidenceReprocessRequested(_) => "EvidenceReprocessRequested",
             Self::EvidenceTranscribed(_) => "EvidenceTranscribed",
             Self::TranscriptSpeakerNamed(_) => "TranscriptSpeakerNamed",
@@ -1071,6 +1073,21 @@ impl DomainEvent {
                 }
                 refs
             }
+            // Same reason as a chunk batch: a citation walks the why-chain
+            // backwards, and "which vector covers this chunk" is a link in it.
+            // Bounded by `EMBED_BATCH_COUNT_MAX`, so the ref list is too.
+            Self::EvidenceEmbedded(EvidenceEmbeddedBody::V1 {
+                evidence_id,
+                chunks,
+                ..
+            }) => {
+                let mut refs = Vec::with_capacity(chunks.len() + 1);
+                refs.push(entity_ref("evidence", evidence_id.into_bytes()));
+                for chunk in chunks {
+                    refs.push(entity_ref("chunk", chunk.chunk_id.into_bytes()));
+                }
+                refs
+            }
         }
     }
 
@@ -1110,6 +1127,7 @@ impl DomainEvent {
             Self::IngestStageFinished(inner) => ciborium::into_writer(inner, &mut body),
             Self::IngestStageFailed(inner) => ciborium::into_writer(inner, &mut body),
             Self::EvidenceChunked(inner) => ciborium::into_writer(inner, &mut body),
+            Self::EvidenceEmbedded(inner) => ciborium::into_writer(inner, &mut body),
             Self::EvidenceTranscribed(inner) => ciborium::into_writer(inner, &mut body),
             Self::TranscriptSpeakerNamed(inner) => ciborium::into_writer(inner, &mut body),
             Self::TranscriptSegmentSpeakerSet(inner) => ciborium::into_writer(inner, &mut body),
@@ -1169,6 +1187,7 @@ impl DomainEvent {
             "IngestStageFinished" => Self::IngestStageFinished(read("IngestStageFinished", body)?),
             "IngestStageFailed" => Self::IngestStageFailed(read("IngestStageFailed", body)?),
             "EvidenceChunked" => Self::EvidenceChunked(read("EvidenceChunked", body)?),
+            "EvidenceEmbedded" => Self::EvidenceEmbedded(read("EvidenceEmbedded", body)?),
             "EvidenceTranscribed" => Self::EvidenceTranscribed(read("EvidenceTranscribed", body)?),
             "TranscriptSpeakerNamed" => {
                 Self::TranscriptSpeakerNamed(read("TranscriptSpeakerNamed", body)?)

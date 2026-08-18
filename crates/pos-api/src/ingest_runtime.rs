@@ -19,7 +19,9 @@
 use crate::gateway_ops::EventCostLedger;
 use pos_foundation::{DeviceId, WallClock};
 use pos_gateway::CostLedger;
-use pos_ingest::{StageLedgers, StageRegistry, TranscribeSetup, stage_registry_default};
+use pos_ingest::{
+    EmbedSetup, StageLedgers, StageRegistry, TranscribeSetup, stage_registry_default,
+};
 use pos_log::{Actor, ProjectLog};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,6 +45,33 @@ pub const WHISPER_MODEL_DEFAULT: &str = "whisper-small";
 /// Optional BCP-47 language hint. Absent means the model detects it.
 pub const TRANSCRIBE_LANGUAGE_ENV: &str = "POS_TRANSCRIBE_LANGUAGE";
 
+/// Overrides which ONNX artifact EMBED loads.
+pub const EMBED_MODEL_ENV: &str = "POS_EMBED_MODEL";
+
+/// A process-local override for the embedding model, set before any worker
+/// starts.
+///
+/// A `OnceLock` rather than `std::env::set_var`, which is `unsafe` for a real
+/// reason — it mutates a process-global another thread may be reading — and
+/// which core forbids outright. `pos ingest reembed --model X` needs to say
+/// which model *this invocation* embeds under, and this is the safe way to
+/// say it: written once, before `start_background_workers`, and read by every
+/// surface through [`embed_setup`].
+static EMBED_MODEL_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Pins the embedding model for this process.
+///
+/// # Errors
+///
+/// The model already chosen, when something set it first. A second answer to
+/// "which model does this process embed under" is a bug worth surfacing
+/// rather than a value to overwrite.
+pub fn set_embed_model(model: String) -> Result<(), String> {
+    EMBED_MODEL_OVERRIDE
+        .set(model)
+        .map_err(|rejected| EMBED_MODEL_OVERRIDE.get().cloned().unwrap_or(rejected))
+}
+
 #[must_use]
 pub fn models_dir() -> PathBuf {
     std::env::var_os(MODELS_DIR_ENV)
@@ -63,10 +92,77 @@ pub fn transcribe_setup() -> TranscribeSetup {
     setup
 }
 
+/// The embedding setup every surface in this process shares.
+///
+/// Local by default and `local_only` by policy: a default that sent every
+/// chunk of a project to an API would be a privacy decision made by a
+/// constant (L9/F7). The API route is composed by configuration, and needs
+/// m1-s06's credential store before a user can reach it.
+#[must_use]
+pub fn embed_setup() -> EmbedSetup {
+    let mut setup = EmbedSetup::local(models_dir());
+    // The explicit override wins over the environment: a command that named a
+    // model is a stronger statement than a variable in a shell profile.
+    let chosen = EMBED_MODEL_OVERRIDE.get().cloned().or_else(|| {
+        std::env::var(EMBED_MODEL_ENV)
+            .ok()
+            .filter(|model| !model.trim().is_empty())
+    });
+    if let Some(model) = chosen
+        && let pos_ingest::EmbedRoute::LocalOnnx { model_name, .. } = &mut setup.route
+    {
+        *model_name = model;
+    }
+    setup
+}
+
 /// The stages this build can run. One answer, shared by every surface.
+///
+/// **EMBED registers only when its artifact is on disk**, and that is a
+/// deliberate difference from every other stage. The distinction it preserves
+/// is between two things the pipeline must never conflate:
+///
+/// - *this content failed* — a corrupt PDF, an unsupported codec. That is a
+///   dead-letter, and the source-health card exists to show it.
+/// - *this installation cannot run this stage* — no model has been pulled.
+///   That is `nextStageAvailable: false` with the owning story named, which is
+///   the vocabulary m1-s01 built for exactly this and which every shell
+///   already renders.
+///
+/// Registering unconditionally would put a fresh install's entire corpus in
+/// the DLQ for a reason that is not about the corpus. TRANSCRIBE does register
+/// unconditionally, and the asymmetry is intentional rather than an
+/// oversight: it applies only to audio and video, so a missing whisper model
+/// parks the handful of items that need it, while EMBED applies to
+/// *everything*.
+///
+/// The cost, stated: the worker pool composes its handlers once, so a model
+/// pulled while a shell is running is picked up at next start. m1-s15's
+/// onboarding is where pulling becomes part of first run.
 #[must_use]
 pub fn stage_registry() -> StageRegistry {
-    stage_registry_default(&transcribe_setup())
+    let embed = embed_setup();
+    let registry = stage_registry_default(&transcribe_setup(), &embed);
+    if embed_artifact_present(&embed) {
+        return registry;
+    }
+    registry.without(pos_domain::IngestStage::Embed)
+}
+
+/// Whether the local ONNX artifact this setup names is on disk.
+///
+/// A cloud route is always "present": its artifact is somebody else's, and
+/// whether the credential resolves is the gateway's answer to give, not a
+/// file check's.
+fn embed_artifact_present(setup: &pos_ingest::EmbedSetup) -> bool {
+    match &setup.route {
+        pos_ingest::EmbedRoute::LocalOnnx {
+            models_dir,
+            model_name,
+            ..
+        } => models_dir.join(model_name).join("model.onnx").is_file(),
+        pos_ingest::EmbedRoute::Cloud { .. } => true,
+    }
 }
 
 /// Opens an [`EventCostLedger`] per stage attempt.

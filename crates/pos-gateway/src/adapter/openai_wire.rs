@@ -131,6 +131,8 @@ fn chat_completions_plan(
         headers,
         body: body.to_string().into_bytes(),
         timeout_ms: request.timeout_ms,
+        // A provider answer is text; the transport default applies.
+        response_bytes_max: None,
     })
 }
 
@@ -435,6 +437,8 @@ pub fn list_models(
         headers,
         body: Vec::new(),
         timeout_ms,
+        // A provider answer is text; the transport default applies.
+        response_bytes_max: None,
     };
     let mut buffered = BufferedResponse::default();
     transport

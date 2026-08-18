@@ -75,6 +75,8 @@ fn messages_plan(
         headers,
         body: body.to_string().into_bytes(),
         timeout_ms: request.timeout_ms,
+        // A provider answer is text; the transport default applies.
+        response_bytes_max: None,
     })
 }
 
